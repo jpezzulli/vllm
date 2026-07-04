@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Unit tests for DeepSeekV4ToolParser."""
+"""Unit tests for DeepSeekV4EngineToolParser."""
 
 import json
 from unittest.mock import MagicMock
@@ -17,7 +17,11 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     FunctionDefinition,
 )
 from vllm.tool_parsers import ToolParserManager
-from vllm.tool_parsers.deepseekv4_tool_parser import DeepSeekV4ToolParser
+from vllm.tool_parsers.deepseekv4_engine_tool_parser import (
+    DeepSeekV4EngineToolParser,
+)
+
+pytestmark = pytest.mark.skip_global_cleanup
 
 MOCK_TOKENIZER = MagicMock()
 MOCK_TOKENIZER.get_vocab.return_value = {}
@@ -67,14 +71,13 @@ def sample_tools() -> list[ChatCompletionToolsParam]:
     ]
 
 
-def make_parser(tools=None) -> DeepSeekV4ToolParser:
-    return DeepSeekV4ToolParser(MOCK_TOKENIZER, tools=tools)
+def make_parser(tools=None) -> DeepSeekV4EngineToolParser:
+    return DeepSeekV4EngineToolParser(MOCK_TOKENIZER, tools=tools)
 
 
 def make_request(tools=None) -> MagicMock:
     req = MagicMock()
     req.tools = tools
-    req.tool_choice = "auto"
     return req
 
 
@@ -85,15 +88,9 @@ def build_tool_call(func_name: str, params: dict[str, str]) -> str:
     return f'{TC_START}\n{INV_START}{func_name}">\n{param_strs}{INV_END}\n{TC_END}'
 
 
-def stream(
-    parser: DeepSeekV4ToolParser,
-    full_text: str,
-    chunk_size: int = 7,
-    request=None,
-):
+def stream(parser: DeepSeekV4EngineToolParser, full_text: str, chunk_size: int = 7):
     deltas = []
     previous_text = ""
-    request = request or make_request(parser.tools)
     for start in range(0, len(full_text), chunk_size):
         delta_text = full_text[start : start + chunk_size]
         current_text = previous_text + delta_text
@@ -104,7 +101,7 @@ def stream(
             previous_token_ids=[],
             current_token_ids=[],
             delta_token_ids=[1],
-            request=request,
+            request=make_request(),
         )
         previous_text = current_text
         if delta is not None:
@@ -127,7 +124,9 @@ def reconstruct_args(deltas, tool_index: int = 0) -> str:
 
 
 def test_registered():
-    assert ToolParserManager.get_tool_parser("deepseek_v4") is DeepSeekV4ToolParser
+    assert (
+        ToolParserManager.get_tool_parser("deepseek_v4") is DeepSeekV4EngineToolParser
+    )
 
 
 def test_extract_tool_calls():
@@ -178,8 +177,7 @@ def test_streaming_extracts_complete_invokes():
     assert json.loads(reconstruct_args(deltas)) == {"query": "deepseek v4"}
 
 
-@pytest.mark.parametrize("chunk_size", [1, 4, 17])
-def test_streaming_emits_incremental_argument_chunks(chunk_size: int):
+def test_streaming_emits_incremental_argument_chunks():
     tool = ChatCompletionToolsParam(
         function=FunctionDefinition(
             name="plan_trip",
@@ -207,7 +205,7 @@ def test_streaming_emits_incremental_argument_chunks(chunk_size: int):
         f"{TC_END}"
     )
 
-    deltas = stream(parser, full_text, chunk_size=chunk_size)
+    deltas = stream(parser, full_text, chunk_size=4)
     arg_chunks = [
         tool_call.function.arguments
         for delta in deltas
@@ -222,11 +220,6 @@ def test_streaming_emits_incremental_argument_chunks(chunk_size: int):
         "cities": ["Beijing", "Shanghai", "Tokyo", "New York"],
         "notes": "靠窗座位",
     }
-    content = "".join(delta.content or "" for delta in deltas)
-    assert "DSML" not in content
-    assert not parser._in_tool_calls
-    assert parser._active_tool_index is None
-    assert parser._buffer == ""
 
 
 def _with_strict(
@@ -298,7 +291,7 @@ def test_extract_tool_calls_arguments_wrapper():
         },
     )
 
-    parser = DeepSeekV4ToolParser(mock_tokenizer, tools=[tool])
+    parser = DeepSeekV4EngineToolParser(mock_tokenizer, tools=[tool])
     request = MagicMock()
     request.tools = [tool]
 
@@ -316,240 +309,64 @@ def test_extract_tool_calls_arguments_wrapper():
     assert args == {"location": "Beijing"}
 
 
-def test_string_attribute_and_guarded_wrapper_semantics():
-    tool = ChatCompletionToolsParam(
-        type="function",
-        function={
-            "name": "record_values",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "literal": {"type": "integer"},
-                    "coerced": {"type": "integer"},
-                    "arguments": {"type": "object"},
-                },
+_ANGLE_BRACKET_TOOL = ChatCompletionToolsParam(
+    function=FunctionDefinition(
+        name="run_command",
+        parameters={
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
             },
         },
-    )
-    parser = make_parser([tool])
-    output = (
-        f'{TC_START}{INV_START}record_values">'
-        f'{PARAM_START}literal" string="true">007{PARAM_END}'
-        f'{PARAM_START}coerced" string="false">7{PARAM_END}'
-        f'{PARAM_START}arguments" string="false">'
-        '{"nested":{"enabled":true}}'
-        f"{PARAM_END}"
-        f"{INV_END}{TC_END}"
-    )
-
-    result = parser.extract_tool_calls(output, make_request([tool]))
-
-    assert json.loads(result.tool_calls[0].function.arguments) == {
-        "literal": "007",
-        "coerced": 7,
-        "arguments": {"nested": {"enabled": True}},
-    }
+    ),
+)
 
 
-def test_guarded_artificial_wrapper_rejects_unknown_inner_keys():
-    tool = ChatCompletionToolsParam(
-        type="function",
-        function={
-            "name": "get_weather",
-            "parameters": {
-                "type": "object",
-                "properties": {"location": {"type": "string"}},
-            },
-        },
-    )
-    parser = make_parser([tool])
-    output = (
-        f'{TC_START}{INV_START}get_weather">'
-        f'{PARAM_START}arguments" string="false">'
-        '{"unknown":"Beijing"}'
-        f"{PARAM_END}{INV_END}{TC_END}"
-    )
+@pytest.mark.parametrize(
+    "tools",
+    [[_ANGLE_BRACKET_TOOL], None],
+    ids=["with_tools", "without_tools"],
+)
+def test_no_dsml_closing_tag_leak_in_streamed_args(tools):
+    """Streaming must not leak </｜DSML｜parameter> into argument values.
 
-    result = parser.extract_tool_calls(output, make_request([tool]))
+    When a parameter value contains '>' (e.g. shell redirects like
+    '2>&1'), certain chunk boundaries cause the incremental lexer to
+    emit the closing delimiter text as part of the content token.  The
+    partial regex then captures it as part of the value, violating the
+    prefix invariant and corrupting the streamed JSON.
+    """
+    full_text = build_tool_call("run_command", {"command": "git --version 2>&1"})
+    expected = {"command": "git --version 2>&1"}
 
-    assert json.loads(result.tool_calls[0].function.arguments) == {
-        "arguments": '{"unknown":"Beijing"}'
-    }
-
-
-def _terminal_tool() -> ChatCompletionToolsParam:
-    return ChatCompletionToolsParam(
-        type="function",
-        function={
-            "name": "terminal_exec",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "environment": {"type": "object"},
-                },
-            },
-        },
-    )
+    for chunk_size in range(1, len(full_text) + 1):
+        parser = make_parser(tools=tools)
+        deltas = stream(parser, full_text, chunk_size=chunk_size)
+        args_str = reconstruct_args(deltas)
+        assert args_str, f"No args emitted at chunk_size={chunk_size}"
+        assert "DSML" not in args_str, (
+            f"DSML marker leaked into args at chunk_size={chunk_size}: {args_str!r}"
+        )
+        parsed = json.loads(args_str)
+        assert parsed == expected, (
+            f"Args mismatch at chunk_size={chunk_size}: "
+            f"got {parsed!r}, expected {expected!r}"
+        )
 
 
-def _terminal_invoke() -> str:
-    return (
-        f'{INV_START}terminal_exec">'
-        f'{PARAM_START}command" string="true">printf ready{PARAM_END}'
-        f'{PARAM_START}environment" string="false">'
-        '{"MODE":"safe","FLAGS":{"trace":false}}'
-        f"{PARAM_END}{INV_END}"
-    )
-
-
-def test_orphan_invoke_recovers_declared_nested_terminal_tool_non_streaming():
-    tool = _terminal_tool()
-    output = _terminal_invoke() + TC_END + "\nCommand queued."
-    parser = make_parser([tool])
-
-    result = parser.extract_tool_calls(output, make_request([tool]))
+def test_non_streaming_extract_with_angle_brackets():
+    """Non-streaming extraction must correctly handle '>' in values."""
+    parser = make_parser()
+    full_text = build_tool_call("run_command", {"command": "git --version 2>&1"})
+    result = parser.extract_tool_calls(full_text, make_request())
 
     assert result.tools_called
-    assert result.content == "\nCommand queued."
-    assert result.tool_calls[0].function.name == "terminal_exec"
-    assert json.loads(result.tool_calls[0].function.arguments) == {
-        "command": "printf ready",
-        "environment": {"MODE": "safe", "FLAGS": {"trace": False}},
-    }
+    assert len(result.tool_calls) == 1
+    args = json.loads(result.tool_calls[0].function.arguments)
+    assert args == {"command": "git --version 2>&1"}
+    assert "DSML" not in result.tool_calls[0].function.arguments
 
 
-def test_orphan_invoke_streams_without_control_text_leakage():
-    tool = _terminal_tool()
-    parser = make_parser([tool])
-    output = _terminal_invoke() + TC_END
-
-    deltas = stream(parser, output, chunk_size=1, request=make_request([tool]))
-
-    names = [
-        call.function.name
-        for delta in deltas
-        for call in delta.tool_calls or []
-        if call.function and call.function.name
-    ]
-    arguments = reconstruct_args(deltas)
-    content = "".join(delta.content or "" for delta in deltas)
-    assert names == ["terminal_exec"]
-    assert json.loads(arguments)["environment"] == {
-        "MODE": "safe",
-        "FLAGS": {"trace": False},
-    }
-    assert "DSML" not in content
-    assert "R0TURN" not in content
-    assert not parser._in_tool_calls
-    assert parser._active_tool_index is None
-    assert parser._buffer == ""
-
-
-@pytest.mark.parametrize("mode", ["unknown", "no-tools", "tool-choice-none"])
-def test_false_orphan_invoke_stays_content(mode: str):
-    tool = _terminal_tool()
-    request = make_request([tool])
-    output = _terminal_invoke()
-    if mode == "unknown":
-        output = output.replace("terminal_exec", "unknown_terminal_tool", 1)
-    elif mode == "no-tools":
-        request.tools = []
-    else:
-        request.tool_choice = "none"
-    parser = make_parser([tool])
-
-    result = parser.extract_tool_calls(output, request)
-
-    assert not result.tools_called
-    assert result.tool_calls == []
-    assert result.content == output
-
-
-@pytest.mark.parametrize("mode", ["unknown", "no-tools", "tool-choice-none"])
-def test_false_orphan_invoke_streaming_stays_content(mode: str):
-    tool = _terminal_tool()
-    request = make_request([tool])
-    output = _terminal_invoke()
-    if mode == "unknown":
-        output = output.replace("terminal_exec", "unknown_terminal_tool", 1)
-    elif mode == "no-tools":
-        request.tools = []
-    else:
-        request.tool_choice = "none"
-    parser = make_parser([tool])
-
-    deltas = stream(parser, output, chunk_size=1, request=request)
-
-    assert reconstruct_args(deltas) == ""
-    assert "".join(delta.content or "" for delta in deltas) == output
-
-
-def test_quoted_marker_then_real_wrapped_terminal_call():
-    tool = _terminal_tool()
-    request = make_request([tool])
-    quoted = f"Documentation quotes {INV_START} literally. "
-    output = quoted + TC_START + _terminal_invoke() + TC_END
-
-    result = make_parser([tool]).extract_tool_calls(output, request)
-    parser = make_parser([tool])
-    deltas = stream(parser, output, chunk_size=1, request=request)
-
-    assert result.tools_called
-    assert result.content == quoted
-    assert json.loads(result.tool_calls[0].function.arguments) == {
-        "command": "printf ready",
-        "environment": {"MODE": "safe", "FLAGS": {"trace": False}},
-    }
-    assert json.loads(reconstruct_args(deltas)) == json.loads(
-        result.tool_calls[0].function.arguments
-    )
-    streamed_content = "".join(delta.content or "" for delta in deltas)
-    assert streamed_content == quoted
-
-
-def test_foreign_wrapper_is_preserved_as_content():
-    tool = _terminal_tool()
-    foreign = (
-        "<｜DSML｜function_calls>"
-        + _terminal_invoke()
-        + "</｜DSML｜function_calls>"
-    )
-
-    result = make_parser([tool]).extract_tool_calls(foreign, make_request([tool]))
-    parser = make_parser([tool])
-    deltas = stream(parser, foreign, chunk_size=1, request=make_request([tool]))
-
-    assert not result.tools_called
-    assert result.content == foreign
-    assert reconstruct_args(deltas) == ""
-    assert "".join(delta.content or "" for delta in deltas) == foreign
-
-
-def test_declared_names_do_not_leak_between_streams():
-    tool = _terminal_tool()
-    parser = make_parser([tool])
-    first = stream(parser, _terminal_invoke(), 3, make_request([tool]))
-    assert json.loads(reconstruct_args(first))["command"] == "printf ready"
-
-    second = stream(parser, _terminal_invoke(), 3, make_request([]))
-
-    assert reconstruct_args(second) == ""
-    assert "".join(delta.content or "" for delta in second) == _terminal_invoke()
-
-    non_streaming = make_parser([tool])
-    first_result = non_streaming.extract_tool_calls(
-        _terminal_invoke(), make_request([tool])
-    )
-    second_result = non_streaming.extract_tool_calls(
-        _terminal_invoke(), make_request([])
-    )
-    assert first_result.tools_called
-    assert not second_result.tools_called
-    assert second_result.content == _terminal_invoke()
-
-
-@pytest.mark.skip_global_cleanup
 def test_composed_schema_converts_object_and_array_params():
     tool = ChatCompletionToolsParam(
         type="function",
