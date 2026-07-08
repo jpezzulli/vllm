@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -21,6 +22,14 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
+
+# VLLM_MOE_W2 confidence gate (opt-in FP4 re-forward for low-confidence decode
+# tokens). Guarded so serving still boots if only part of the moe_w2 stack is
+# deployed; None => no gate, prod path unchanged.
+try:
+    from vllm.model_executor.layers.quantization.utils import moe_w2_gate
+except Exception:  # noqa: BLE001
+    moe_w2_gate = None
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -898,6 +907,12 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
+        # Confidence-gate (moe_w2) PP support: the full re-forward under PP is a
+        # collective driven by the WORKER (every rank must replay its stage), so
+        # execute_model caches this step's forward context + the last rank's
+        # fire decision here. TP/single-GPU re-forwards inline instead.
+        self._gate_ctx: dict | None = None
+        self._gate_fire: bool = False
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
@@ -4337,6 +4352,40 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
+        # moe_w2 confidence gate under PP: cache this step's forward context so
+        # the worker can drive a FULL second pipeline pass (gate_reforward) when
+        # the last rank flags low confidence. A partial last-stage-only inline
+        # re-forward (the only thing reachable on the last rank alone) corrupts
+        # output, so under PP every rank must replay its stage. Bounded to
+        # gate+PP; TP/single re-forwards inline below. Stored BEFORE the
+        # non-last early-return so all ranks have it. ARMED only on PURE-DECODE
+        # steps (spec/MTP verify re-run is not idempotent under PP); the
+        # condition is identical on every PP rank (spec_decode_metadata + token
+        # counts come from the shared scheduler output), so the worker can
+        # decide to run the barrier collective purely from `_gate_ctx is not
+        # None` without another collective.
+        self._gate_fire = False
+        self._gate_ctx = None
+        if (
+            moe_w2_gate is not None
+            and moe_w2_gate.enabled()
+            and get_pp_group().world_size > 1
+            and not self.is_pooling_model
+            and spec_decode_metadata is None
+            and max_num_scheduled_tokens <= 1
+        ):
+            self._gate_ctx = dict(
+                input_ids=input_ids, positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds, model_kwargs=model_kwargs,
+                attn_metadata=attn_metadata, num_tokens_padded=num_tokens_padded,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_mode=cudagraph_mode, batch_desc=batch_desc,
+                ubatch_slices_padded=ubatch_slices_padded,
+                slot_mappings=slot_mappings, has_encoder_input=has_encoder_input,
+                logits_indices=logits_indices,
+            )
+
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -4395,6 +4444,92 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        # Confidence-gated FP4 re-forward (VLLM_MOE_W2_GATE=1; default OFF, so
+        # the serving path is byte-for-byte unchanged). When this step's 2-bit
+        # top-1 is low-confidence, pull its routed COLD experts up to FP4
+        # (force_promote) and replay the graph ONCE so the step is re-decided
+        # at FP4. Fires on real DECODE: a SPEC-DECODE verify step (MTP on) OR a
+        # pure single-token decode (MTP off); prefill is excluded (it has
+        # spec_decode_metadata None AND many scheduled tokens). Under MTP
+        # `logits` covers the base+draft positions; should_reforward fires if
+        # ANY is low-conf, the replay recomputes ALL of them at FP4, and the
+        # downstream draft verification then accepts against the FP4 target.
+        # Last PP rank only. Fail-safe: any error keeps the 2-bit logits.
+        if (
+            moe_w2_gate is not None
+            and moe_w2_gate.enabled()
+            and logits is not None
+            and not self.is_pooling_model
+            and get_pp_group().is_last_rank
+            and (spec_decode_metadata is not None or max_num_scheduled_tokens <= 1)
+        ):
+            try:
+                # The re-forward is a COLLECTIVE (TP: all-reduce per layer; PP:
+                # a full pipeline pass), so all participating ranks must replay
+                # together or it desyncs/hangs, and a PARTIAL (last-stage-only)
+                # replay corrupts output.
+                #   - PP (world_size>1): only RECORD the decision here; the
+                #     worker broadcasts it and drives gate_reforward() on EVERY
+                #     rank. MTP+PP stays fail-safed to the 2-bit logits (the
+                #     sparse-MLA verify re-run is not idempotent).
+                #   - TP / single GPU: re-forward INLINE. OR-reduce `fire`
+                #     across TP so every rank agrees (logits are replicated
+                #     post lm_head all-gather).
+                if get_pp_group().world_size > 1:
+                    self._gate_fire = (
+                        spec_decode_metadata is None
+                        and moe_w2_gate.should_reforward(logits)
+                        and moe_w2_gate.reforward_enabled()
+                    )
+                else:
+                    fire = moe_w2_gate.should_reforward(logits)
+                    _tp = get_tp_group()
+
+                    def _or_tp(flag: bool) -> bool:
+                        if _tp.world_size <= 1:
+                            return flag
+                        t = torch.tensor([1 if flag else 0], device=logits.device)
+                        torch.distributed.all_reduce(
+                            t, op=torch.distributed.ReduceOp.MAX,
+                            group=_tp.device_group)
+                        return bool(t.item())
+
+                    fire = _or_tp(fire)
+                    if fire:
+                        # Promote this rank's COLD routed experts (per-rank
+                        # shard side effect, never a per-rank replay gate).
+                        n_promoted = moe_w2_gate.force_promote_step()
+                        # Replay only if SOME rank upgraded a cold expert ->
+                        # the result can actually change; if everything routed
+                        # was already FP4 the replay is wasted HBM bandwidth.
+                        if _or_tp(n_promoted > 0) and moe_w2_gate.reforward_enabled():
+                            with set_forward_context(
+                                attn_metadata,
+                                self.vllm_config,
+                                num_tokens=num_tokens_padded,
+                                num_tokens_across_dp=num_tokens_across_dp,
+                                cudagraph_runtime_mode=cudagraph_mode,
+                                batch_descriptor=batch_desc,
+                                ubatch_slices=ubatch_slices_padded,
+                                slot_mapping=slot_mappings,
+                                skip_compiled=has_encoder_input,
+                            ):
+                                regated_output = self._model_forward(
+                                    input_ids=input_ids,
+                                    positions=positions,
+                                    intermediate_tensors=intermediate_tensors,
+                                    inputs_embeds=inputs_embeds,
+                                    **model_kwargs,
+                                )
+                            if self.use_aux_hidden_state_outputs:
+                                hidden_states, aux_hidden_states = regated_output
+                            else:
+                                hidden_states = regated_output
+                            sample_hidden_states = hidden_states[logits_indices]
+                            logits = self.model.compute_logits(sample_hidden_states)
+            except Exception as e:  # noqa: BLE001 - gate must never crash serving
+                logger.warning("moe_w2 confidence gate re-forward skipped: %s", e)
+
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -4415,6 +4550,95 @@ class GPUModelRunner(
             deferred_state_corrections_fn()
 
         return None
+
+    @torch.inference_mode
+    def gate_reforward(self) -> None:
+        """Full-pipeline FP4 re-forward for the confidence gate under PP.
+
+        Driven by the worker AFTER it has broadcast the last rank's `fire`
+        decision (so all ranks agree). Every rank re-runs ITS stage at FP4
+        using the forward context cached by execute_model(): a non-first rank
+        receives the upgraded activation from the previous stage, runs its
+        layers (with its routed experts force-promoted to FP4), and a non-last
+        rank sends the result onward; the last rank recomputes logits and
+        overwrites execute_model_state for sample_tokens(). This is the PP
+        analogue of the inline TP/single-GPU re-forward and the only correct
+        way to re-decide under PP (a last-stage-only replay corrupts output).
+        Fail-safe: on any error the 2-bit logits already stored in
+        execute_model_state are kept.
+        """
+        ctx = self._gate_ctx
+        self._gate_ctx = None
+        if ctx is None or moe_w2_gate is None:
+            return
+        pp = get_pp_group()
+        tp = get_tp_group()
+        # Only the LAST rank carries execute_model_state (non-last ranks
+        # returned their intermediate tensors early in execute_model and never
+        # set it). They still MUST replay their stage to keep the pipeline
+        # collective balanced.
+        if pp.is_last_rank and self.execute_model_state is None:
+            return
+        _trace = os.getenv("VLLM_MOE_W2_GATE_TRACE", "0") == "1"
+        try:
+            # Promote THIS stage's routed cold experts to FP4 (rank-local, no
+            # collective) so this stage's replay runs at FP4.
+            moe_w2_gate.force_promote_step()
+            intermediate = ctx["intermediate_tensors"]
+            if not pp.is_first_rank:
+                recv = pp.recv_tensor_dict(all_gather_group=tp)
+                intermediate = IntermediateTensors(recv)
+            with set_forward_context(
+                ctx["attn_metadata"],
+                self.vllm_config,
+                num_tokens=ctx["num_tokens_padded"],
+                num_tokens_across_dp=ctx["num_tokens_across_dp"],
+                cudagraph_runtime_mode=ctx["cudagraph_mode"],
+                batch_descriptor=ctx["batch_desc"],
+                ubatch_slices=ctx["ubatch_slices_padded"],
+                slot_mapping=ctx["slot_mappings"],
+                skip_compiled=ctx["has_encoder_input"],
+            ):
+                out = self._model_forward(
+                    input_ids=ctx["input_ids"],
+                    positions=ctx["positions"],
+                    intermediate_tensors=intermediate,
+                    inputs_embeds=ctx["inputs_embeds"],
+                    **ctx["model_kwargs"],
+                )
+            if self.use_aux_hidden_state_outputs:
+                hidden_states, aux_hidden_states = out
+            else:
+                hidden_states, aux_hidden_states = out, None
+            if not pp.is_last_rank:
+                # Forward the FP4-upgraded activation to the next stage's
+                # replay. Clone out of any cudagraph-pool aliasing before the
+                # send (mirrors the worker's first-pass send guard).
+                assert isinstance(hidden_states, IntermediateTensors)
+                send = {
+                    k: (v.clone() if v.is_cuda else v)
+                    for k, v in hidden_states.tensors.items()
+                }
+                pp.send_tensor_dict(send, all_gather_group=tp)
+                if _trace:
+                    logger.info("[gate-pp] rank=%d replayed stage at FP4 -> sent",
+                                pp.rank_in_group)
+            else:
+                sample_hidden_states = hidden_states[ctx["logits_indices"]]
+                new_logits = self.model.compute_logits(sample_hidden_states)
+                # Overwrite the cached (2-bit) state with the FP4 re-decided
+                # state so sample_tokens() / the MTP drafter run against FP4.
+                self.execute_model_state = self.execute_model_state._replace(
+                    logits=new_logits,
+                    hidden_states=hidden_states,
+                    sample_hidden_states=sample_hidden_states,
+                    aux_hidden_states=aux_hidden_states,
+                )
+                if _trace:
+                    logger.info("[gate-pp] rank=%d (last) replayed -> FP4 logits",
+                                pp.rank_in_group)
+        except Exception as e:  # noqa: BLE001 - gate must never crash serving
+            logger.warning("moe_w2 PP gate re-forward skipped: %s", e)
 
     def _input_fits_in_drafter(
         self, common_attn_metadata: CommonAttentionMetadata | None

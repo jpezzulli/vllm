@@ -905,6 +905,8 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
+                # Last PP rank: re-decide at FP4 (full pipeline) before sampling.
+                self._gate_pp_barrier(forward_pass)
                 return output
 
         assert isinstance(output, IntermediateTensors)
@@ -921,7 +923,48 @@ class Worker(WorkerBase):
             all_gather_tensors=all_gather_tensors,
         )
 
+        # Non-last PP rank: participate in the gate barrier + (if fired) re-run
+        # this stage at FP4 for the full-pipeline re-decide.
+        self._gate_pp_barrier(forward_pass)
         return None
+
+    def _gate_pp_barrier(self, forward_pass: bool) -> None:
+        """Confidence-gate full re-forward under PP (opt-in, VLLM_MOE_W2_GATE).
+
+        Called on EVERY rank after the first-pass forward+send. Broadcasts the
+        last rank's `fire` decision over the PP group so all ranks agree, then
+        (if fire) runs a full second pipeline pass via
+        model_runner.gate_reforward() on every rank. Single-stream PP: by here
+        the first pass has fully drained (the last rank already has logits), so
+        the broadcast cannot deadlock. No-op unless the gate is on AND
+        pp_world_size>1; the barrier collective runs only when the gate is
+        ARMED this step (`_gate_ctx` set identically on every rank by
+        execute_model: gate+PP+pure-decode) — on MTP/prefill steps every rank
+        skips together, so the base pipeline keeps its exact send/recv order.
+        """
+        if not forward_pass or os.getenv("VLLM_MOE_W2_GATE", "0") != "1":
+            return
+        pp = get_pp_group()
+        if pp.world_size <= 1:
+            return
+        if getattr(self.model_runner, "_gate_ctx", None) is None:
+            return
+        dev = self.model_runner.device
+        if pp.is_last_rank:
+            f = 1 if getattr(self.model_runner, "_gate_fire", False) else 0
+            data: dict = {"gate_fire": torch.tensor([f], device=dev)}
+        else:
+            data = {}
+        bcast = pp.broadcast_tensor_dict(data, src=pp.world_size - 1)
+        if bcast is None or not bool(bcast["gate_fire"].item()):
+            return
+        # Make sure the first-pass async send has landed before the 2nd pass
+        # reuses buffers / sends again.
+        if self._pp_send_work:
+            for handle in self._pp_send_work:
+                handle.wait()
+            self._pp_send_work = []
+        self.model_runner.gate_reforward()
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
