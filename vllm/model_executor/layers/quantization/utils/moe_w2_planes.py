@@ -106,34 +106,20 @@ _E2M1_MID = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
                          dtype=torch.float64)
 
 
-def fp8_block_to_codes_scales(
-    w_fp8: torch.Tensor,
-    s_block: torch.Tensor,
-    block: int = 128,
+def _f64_to_codes_scales(
+    w: torch.Tensor,
     want_nibbles: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """FP8 block-quant checkpoint expert -> (2-bit codes, UE8M0 scale bytes).
+    """Dequantized f64 weights [N, K] -> (2-bit codes, UE8M0 scale bytes).
 
-    GLM-5.2 / DS4-FP8 checkpoints carry float8_e4m3fn weights with f32
-    block-128x128 scales instead of the mxfp4 codes the mxfp4 loader feeds
-    the plane packers. Re-quantize on GPU with the sweep-validated pipeline
-    (internal/glm52-sweep/sweep.py): dequant -> per-block-32 UE8M0 scale
-    along K -> e2m1 snap -> tensor-sym {-4,-1,1,4} via _NIBBLE_TO_CODE.
-
-    All math is float64 (load-time only): the fp8 x f32-scale products and
-    midpoint comparisons then match the f64 numpy prototype the sweep
-    validated exactly, so ties break identically.
-
-    Returns (codes [N, K] u8 0..3, scale_bytes [N, K/32] u8 e8m0,
-    nibbles [N, K] u8 e2m1 | None). `nibbles` (the FP4 "baseline" of the
-    sweep) feeds the optional delta tier's FP4 planes.
+    The sweep-validated requant pipeline (internal/glm52-sweep/sweep.py):
+    per-block-32 UE8M0 scale along K -> e2m1 snap -> tensor-sym {-4,-1,1,4}
+    via _NIBBLE_TO_CODE. Load-time-only f64 math so midpoint comparisons and
+    tie-breaks match the numpy prototype the sweep validated exactly.
     """
-    N, K = w_fp8.shape
+    assert w.dtype == torch.float64
+    N, K = w.shape
     assert K % 32 == 0
-    w = w_fp8.double()
-    sb = s_block.double()
-    s = sb.repeat_interleave(block, 0)[:N].repeat_interleave(block, 1)[:, :K]
-    w = w * s
     wb = w.view(N, K // 32, 32)
     amax = wb.abs().amax(dim=2)
     # UE8M0: power-of-2 scale mapping block amax onto e2m1 max (6.0). All-zero
@@ -146,11 +132,78 @@ def fp8_block_to_codes_scales(
     scale_bytes = (exp + 127.0).to(torch.uint8)
     u = wb / torch.exp2(exp).unsqueeze(2)     # exact: power-of-2 division
     mag = torch.bucketize(u.abs().reshape(N, K),
-                          _E2M1_MID.to(w_fp8.device)).to(torch.uint8)
+                          _E2M1_MID.to(w.device)).to(torch.uint8)
     neg = torch.signbit(u).reshape(N, K)
     nibbles = mag | (neg.to(torch.uint8) << 3)
-    codes = _NIBBLE_TO_CODE.to(w_fp8.device)[nibbles.long()]
+    codes = _NIBBLE_TO_CODE.to(w.device)[nibbles.long()]
     return codes, scale_bytes, (nibbles if want_nibbles else None)
+
+
+def fp8_block_to_codes_scales(
+    w_fp8: torch.Tensor,
+    s_block: torch.Tensor,
+    block: int = 128,
+    want_nibbles: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """FP8 block-quant checkpoint expert -> (2-bit codes, UE8M0 scale bytes).
+
+    GLM-5.2 / DS4-FP8 checkpoints carry float8_e4m3fn weights with f32
+    block-128x128 scales instead of the mxfp4 codes the mxfp4 loader feeds
+    the plane packers. Dequantize to f64 and re-quantize with the
+    sweep-validated pipeline (_f64_to_codes_scales).
+
+    Returns (codes [N, K] u8 0..3, scale_bytes [N, K/32] u8 e8m0,
+    nibbles [N, K] u8 e2m1 | None). `nibbles` (the FP4 "baseline" of the
+    sweep) feeds the optional delta tier's FP4 planes.
+    """
+    N, K = w_fp8.shape
+    w = w_fp8.double()
+    sb = s_block.double()
+    s = sb.repeat_interleave(block, 0)[:N].repeat_interleave(block, 1)[:, :K]
+    return _f64_to_codes_scales(w * s, want_nibbles)
+
+
+# e2m1 nibble -> value (f64), for NVFP4 dequant: +[0,.5,1,1.5,2,3,4,6], then
+# the same magnitudes negated (nibble bit 3 = sign).
+_E2M1_VALS = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=torch.float64)
+
+
+def nvfp4_to_codes_scales(
+    w_packed: torch.Tensor,
+    s_block: torch.Tensor,
+    s2: torch.Tensor,
+    group: int = 16,
+    want_nibbles: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """NVFP4 (modelopt) checkpoint expert -> (2-bit codes, UE8M0 scale bytes).
+
+    nvidia/GLM-5.2-NVFP4-style tensors: `weight` [N, K/2] u8 packed e2m1
+    pairs (low nibble = even k, same packing as mxfp4), `weight_scale`
+    [N, K/16] float8_e4m3fn block-16 scales, `weight_scale_2` per-tensor f32
+    (scalar, or [N] when the fused w13 carries distinct w1/w3 scale_2 —
+    pass it expanded per row). True weight = e2m1 * e4m3_scale * scale_2.
+
+    Dequantize to f64 (exact: all three factors are exactly representable)
+    and re-quantize with the sweep-validated pipeline (_f64_to_codes_scales).
+    The returned UE8M0 block-32 scales absorb scale_2, so the serving path
+    needs no extra per-tensor factor.
+    """
+    N, K2 = w_packed.shape
+    K = K2 * 2
+    assert s_block.shape == (N, K // group), (s_block.shape, N, K, group)
+    nib = mxfp4_to_nibbles(w_packed)                     # [N, K] u8
+    w = _E2M1_VALS.to(w_packed.device)[nib.long()]      # f64
+    s = s_block.double().repeat_interleave(group, dim=1)
+    w = w * s
+    s2 = s2.double().to(w.device)
+    if s2.dim() == 0 or s2.numel() == 1:
+        w = w * s2.reshape(())
+    else:
+        assert s2.shape == (N,), s2.shape
+        w = w * s2.view(N, 1)
+    return _f64_to_codes_scales(w, want_nibbles)
 
 
 def pack_scales(scales: torch.Tensor) -> torch.Tensor:

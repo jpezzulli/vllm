@@ -1548,10 +1548,31 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
+        # VLLM_MOE_W2: the raw NVFP4 checkpoint experts of all layers do not
+        # fit the GPU during load (GLM-5.2-NVFP4 ~380 GiB); move the big
+        # tensors' storage to host RAM until the 2-bit planes are built in
+        # process_weights_after_loading. Mutating .data keeps the vLLM
+        # parameter classes and their loader attributes intact (scale_2 /
+        # input_scale are tiny and stay put).
+        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
+        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
+            for pname in ("w13_weight", "w13_weight_scale",
+                          "w2_weight", "w2_weight_scale"):
+                p_ = getattr(layer, pname)
+                p_.data = p_.data.cpu()
+
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
+        # VLLM_MOE_W2: re-quantize the host-staged NVFP4 experts to 2-bit
+        # tensor-sym planes; skip the stock kernel setup entirely.
+        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
+        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
+            key = len(moe_w2_cubit._LAYERS)
+            moe_w2_cubit.build_layer_planes_nvfp4(layer, key)
+            layer._moe_w2_key = key
+            return
 
         # Use a single gscale for w13.
         if self.moe.is_act_and_mul and not torch.allclose(
@@ -1655,6 +1676,19 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
+        # VLLM_MOE_W2 routed-expert path (cubit moe_w2_mm, 2-bit planes).
+        # Shared experts are orchestrated by the MoE runner (pre/post
+        # _maybe_apply_shared_experts); the non-modular w2 path returns only
+        # the routed-expert output, matching the other non-modular applies.
+        w2_key = getattr(layer, "_moe_w2_key", None)
+        if w2_key is not None:
+            from vllm.model_executor.layers.quantization.utils import (
+                moe_w2_cubit)
+            assert layer.expert_map is None and \
+                not layer.apply_router_weight_on_input
+            return moe_w2_cubit.moe_w2_forward(x, topk_weights, topk_ids,
+                                               w2_key)
+
         assert not self.is_monolithic
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(

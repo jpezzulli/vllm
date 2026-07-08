@@ -367,6 +367,92 @@ def build_layer_planes_fp8(layer, layer_key: int,
                    f"w2_{scale_suffix}"))
 
 
+def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
+    """NVFP4 (modelopt) checkpoint variant of build_layer_planes
+    (ModelOptNvFp4FusedMoE: nvidia/GLM-5.2-NVFP4 — e2m1 codes + e4m3
+    block-16 scales + per-tensor scale_2).
+
+    Reads the CPU-staged params (w13_weight [E,2I,H/2] u8 packed +
+    w13_weight_scale [E,2I,H/16] e4m3 + w13_weight_scale_2 [E,2] f32 etc.),
+    dequantizes each expert to f64 on GPU (exact) and re-quantizes to the
+    sweep-validated sign-symmetric 2-bit pipeline; the e2m1 nibbles of the
+    same requant feed the optional FP4 delta tier. The UE8M0 block-32 output
+    scales absorb scale_2, so serving needs no extra per-tensor factor.
+    """
+    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
+        nvfp4_to_codes_scales, pack_fp4_fragment_major)
+
+    assert _ensure_ready(), "moe_w2 cubins missing"
+    dev = torch.device("cuda")
+    w13 = layer.w13_weight.data                 # [E, 2I, H/2] u8 (cpu)
+    s13 = layer.w13_weight_scale.data           # [E, 2I, H/16] e4m3
+    s13_2 = layer.w13_weight_scale_2.data       # [E, 2] f32 (w1, w3)
+    w2 = layer.w2_weight.data                   # [E, H, I/2] u8
+    s2 = layer.w2_weight_scale.data             # [E, H, I/16] e4m3
+    s2_2 = layer.w2_weight_scale_2.data         # [E] f32
+    assert w13.dtype == torch.uint8 and s13.dtype == torch.float8_e4m3fn, (
+        w13.dtype, s13.dtype)
+    E, N13, K13h = w13.shape
+    K13 = K13h * 2
+    _, N2, K2h = w2.shape
+    K2 = K2h * 2
+    group = K13 // s13.shape[2]                 # 16 for NVFP4
+    _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
+
+    planes13 = torch.empty(E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
+    sc13 = torch.empty(E, N13 * K13 // 32, dtype=torch.uint8, device=dev)
+    planes2 = torch.empty(E, N2 * K2 // 4, dtype=torch.uint8, device=dev)
+    sc2 = torch.empty(E, N2 * K2 // 32, dtype=torch.uint8, device=dev)
+
+    tier = moe_w2_delta.get_tier(n_experts=E, dev=dev,
+                                 w13_bytes=N13 * K13 // 2,
+                                 w2_bytes=N2 * K2 // 2)
+    fp13 = fp2 = None
+    if tier is not None:
+        fp13 = torch.empty(E, N13 * K13 // 2, dtype=torch.uint8, device=dev)
+        fp2 = torch.empty(E, N2 * K2 // 2, dtype=torch.uint8, device=dev)
+
+    # f64 temporaries are 16x the packed nibbles -> small H2D chunks,
+    # per-expert quantize (mirrors the fp8 loader).
+    chunk = 8
+    for e0 in range(0, E, chunk):
+        e1 = min(e0 + chunk, E)
+        wg = w13[e0:e1].to(dev, non_blocking=True)
+        sg = s13[e0:e1].to(dev, non_blocking=True)
+        s2g = s13_2[e0:e1].to(dev, non_blocking=True)
+        half = N13 // 2                          # rows [0:I]=w1, [I:2I]=w3
+        for i in range(e1 - e0):
+            s2_row = torch.cat((s2g[i, 0].expand(half), s2g[i, 1].expand(half)))
+            codes, sbytes, nib = nvfp4_to_codes_scales(
+                wg[i], sg[i], s2_row, group=group,
+                want_nibbles=fp13 is not None)
+            planes13[e0 + i] = pack_fragment_major(codes)
+            sc13[e0 + i] = pack_scales(sbytes)
+            if fp13 is not None:
+                fp13[e0 + i] = pack_fp4_fragment_major(nib)
+        wg = w2[e0:e1].to(dev, non_blocking=True)
+        sg = s2[e0:e1].to(dev, non_blocking=True)
+        s2g = s2_2[e0:e1].to(dev, non_blocking=True)
+        for i in range(e1 - e0):
+            codes, sbytes, nib = nvfp4_to_codes_scales(
+                wg[i], sg[i], s2g[i], group=group,
+                want_nibbles=fp2 is not None)
+            planes2[e0 + i] = pack_fragment_major(codes)
+            sc2[e0 + i] = pack_scales(sbytes)
+            if fp2 is not None:
+                fp2[e0 + i] = pack_fp4_fragment_major(nib)
+
+    if tier is not None:
+        tier.add_layer_host_planes(layer_key, fp13, fp2)
+        del fp13, fp2
+
+    _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
+                  N13, K13, N2, K2, E,
+                  ("w13_weight", "w13_weight_scale", "w2_weight",
+                   "w2_weight_scale"))
+
+
 def _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
                   N13, K13, N2, K2, E, param_names) -> None:
     _LAYERS[layer_key] = dict(
