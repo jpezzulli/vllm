@@ -314,6 +314,10 @@ class CUDAGraphWrapper:
                     cudagraph,
                     pool=self.graph_pool,
                     stream=current_stream(),
+                    # thread_local: the moe_w2 delta-tier manager thread does
+                    # CUDA work (side-stream H2D + slot-table writes) that must
+                    # not invalidate captures running on this thread.
+                    capture_error_mode="thread_local",
                 ):
                     # `output` is managed by pytorch's cudagraph pool
                     output = self.runnable(*args, **kwargs)

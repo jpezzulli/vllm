@@ -175,10 +175,13 @@ class BreakableCUDAGraphCapture:
     def _begin_segment(self) -> None:
         assert not self._capturing
         g = torch.cuda.CUDAGraph()
+        # thread_local: side-stream CUDA work from helper threads (e.g. the
+        # VLLM_MOE_W2 delta-manager tick) must not invalidate this capture —
+        # same rationale as the capture_error_mode in compilation/cuda_graph.py.
         if self.pool is not None:
-            g.capture_begin(pool=self.pool)
+            g.capture_begin(pool=self.pool, capture_error_mode="thread_local")
         else:
-            g.capture_begin()
+            g.capture_begin(capture_error_mode="thread_local")
         self._current_graph = g
         self._capturing = True
 

@@ -15,13 +15,16 @@ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
 
     SM90: FP32 block scales stay [g, r/128, d/128] → sfb_gran_mn=128.
     SM100: INT32 packed scales become [g, r, ...] → sfb_gran_mn=1.
+    SM12x: like SM90 — RAW row-major FP32 block scales + the (1,128,128)
+    default recipe, matching DeepGEMM nv-dev's own SM120 einsum tests; the
+    SM100 packed/TMA-aligned layout NaNs there (see fp8_utils SM12x notes).
 
     Returns ``(einsum_recipe, tma_aligned_scales)`` for ``deep_gemm_fp8_o_proj``.
     """
     cap = current_platform.get_device_capability()
     assert cap is not None, "DeepseekV4 attention requires a CUDA device"
-    einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
-    tma_aligned_scales = cap.major >= 10
+    einsum_recipe = (1, 128, 128) if cap.major <= 9 or cap.major == 12 else (1, 1, 128)
+    tma_aligned_scales = cap.major >= 10 and cap.major != 12
     return einsum_recipe, tma_aligned_scales
 
 

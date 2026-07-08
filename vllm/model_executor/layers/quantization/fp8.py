@@ -671,6 +671,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
+        # VLLM_MOE_W2: the raw fp8 checkpoint experts of all layers do not fit
+        # the GPU during load; stage them in host RAM until the 2-bit planes
+        # are built in process_weights_after_loading. Block-quant models only
+        # (DS4-Flash-FP8, GLM-5.2-FP8).
+        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
+        if self.block_quant and moe_w2_cubit.is_w2_layer(
+                getattr(layer, "layer_name", "")):
+            for pname in ("w13_weight", f"w13_{self.weight_scale_name}",
+                          "w2_weight", f"w2_{self.weight_scale_name}"):
+                p_ = getattr(layer, pname)
+                attrs = dict(p_.__dict__)  # weight_loader, quant_method, ...
+                newp = torch.nn.Parameter(p_.data.cpu(), requires_grad=False)
+                layer.register_parameter(pname, newp)
+                set_weight_attrs(newp, attrs)
+
     def _setup_kernel(
         self,
         layer: RoutedExperts,
@@ -717,6 +732,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        # VLLM_MOE_W2: re-quantize the host-staged fp8 experts to 2-bit
+        # tensor-sym planes; skip the stock kernel setup entirely.
+        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
+        if self.block_quant and moe_w2_cubit.is_w2_layer(
+                getattr(layer, "layer_name", "")):
+            key = len(moe_w2_cubit._LAYERS)
+            moe_w2_cubit.build_layer_planes_fp8(
+                layer, key, scale_suffix=self.weight_scale_name)
+            layer._moe_w2_key = key
+            return
+
         # Allow for accessing weights and scales in standard way.
         w13 = layer.w13_weight
         w2 = layer.w2_weight
@@ -837,6 +863,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
+        # VLLM_MOE_W2 routed-expert path (cubit moe_w2_mm, 2-bit planes).
+        # Shared experts are orchestrated by the MoE runner (pre/post
+        # _maybe_apply_shared_experts); the non-modular w2 path returns only
+        # the routed-expert output, matching the other non-modular applies.
+        w2_key = getattr(layer, "_moe_w2_key", None)
+        if w2_key is not None:
+            from vllm.model_executor.layers.quantization.utils import (
+                moe_w2_cubit)
+            assert layer.expert_map is None and \
+                not layer.apply_router_weight_on_input
+            return moe_w2_cubit.moe_w2_forward(x, topk_weights, topk_ids,
+                                               w2_key)
+
         assert not self.is_monolithic
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(

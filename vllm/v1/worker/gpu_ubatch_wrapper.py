@@ -278,6 +278,9 @@ class UBatchWrapper:
                 cudagraph_metadata.cudagraph,
                 stream=compute_stream,
                 pool=self.graph_pool,
+                # cf. compilation/cuda_graph.py: helper threads (VLLM_MOE_W2
+                # delta ticks) must not invalidate the capture
+                capture_error_mode="thread_local",
             ):
                 ubatch_metadata[0].context.cpu_wait_event.set()
                 for thread in ubatch_threads:

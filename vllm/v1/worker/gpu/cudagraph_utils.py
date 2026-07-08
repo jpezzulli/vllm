@@ -317,7 +317,12 @@ class CudaGraphManager:
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
-                        with torch.cuda.graph(graph, self.pool):
+                        # thread_local: helper threads' side-stream CUDA work
+                        # (e.g. VLLM_MOE_W2 delta ticks) must not invalidate
+                        # the capture (cf. compilation/cuda_graph.py).
+                        with torch.cuda.graph(
+                            graph, self.pool, capture_error_mode="thread_local"
+                        ):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch

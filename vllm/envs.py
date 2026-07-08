@@ -179,6 +179,9 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+    # Opt-in: fused hand-written SASS (cubit) sparse-MLA on SM120 (experimental,
+    # eager only). See vllm/v1/attention/backends/mla/cubit_sparse_mla.py.
+    VLLM_SPARSE_MLA_CUBIT: bool | None = None
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -1443,6 +1446,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to create TMA-aligned scale tensor when DeepGEMM is used.
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
+    ),
+    # Opt-in: fused hand-written SASS (cubit) sparse-MLA decode on SM120,
+    # replacing the Triton accumulate+finish pair for supported decode shapes.
+    # Experimental; requires eager mode. See
+    # vllm/v1/attention/backends/mla/cubit_sparse_mla.py.
+    "VLLM_SPARSE_MLA_CUBIT": lambda: (
+        None
+        if os.getenv("VLLM_SPARSE_MLA_CUBIT") is None
+        else os.getenv("VLLM_SPARSE_MLA_CUBIT", "").lower()
+        in ("1", "true", "yes", "on")
     ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
