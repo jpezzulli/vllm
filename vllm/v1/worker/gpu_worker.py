@@ -616,6 +616,19 @@ class Worker(WorkerBase):
         ):
             self.model_runner._init_kv_zero_meta()
 
+        # moe_w2 FP4 delta tier, auto pool sizing (VLLM_MOE_W2_DELTA_GB=auto):
+        # the KV cache now exists, so size the pool from the VRAM actually
+        # left over. Must run BEFORE compile_or_warm_up_model — cudagraph
+        # capture bakes the pool pointer into the graphs. No-op unless the
+        # tier exists with auto sizing pending.
+        try:
+            from vllm.model_executor.layers.quantization.utils import (
+                moe_w2_delta)
+            if moe_w2_delta._TIER is not None:
+                moe_w2_delta._TIER.finalize_auto()
+        except Exception as e:  # noqa: BLE001 - opt-in path, never fatal
+            logger.warning("moe_w2 delta auto-sizing failed: %s", e)
+
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         warmup_sizes: list[int] = []

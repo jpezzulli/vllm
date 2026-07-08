@@ -34,7 +34,19 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-_GB = float(os.getenv("VLLM_MOE_W2_DELTA_GB", "2.0"))
+# Pool size: a number in GiB, or "auto" (also accepts -1) to defer the pool
+# allocation until AFTER the KV cache is allocated and size it from the VRAM
+# actually free then (minus a reserve for cudagraph capture + workspaces).
+# Auto resolves the delta-vs-KV headroom trade at extreme context lengths:
+# at 512K the KV eats the whole card and auto lands at 0 slots (the manual
+# DELTA_GB=0 rule); at short context it recovers the usual 1-2 GiB pool.
+_GB_RAW = os.getenv("VLLM_MOE_W2_DELTA_GB", "2.0").strip().lower()
+_AUTO = _GB_RAW in ("auto", "-1", "-1.0")
+_GB = 0.0 if _AUTO else float(_GB_RAW)
+# Auto-mode knobs: VRAM to leave free for capture/workspaces, and an optional
+# cap on the auto-sized pool (0 = uncapped).
+_RESERVE_GB = float(os.getenv("VLLM_MOE_W2_DELTA_RESERVE_GB", "3.0"))
+_MAX_GB = float(os.getenv("VLLM_MOE_W2_DELTA_MAX_GB", "0"))
 _PROMOTE_PER_TICK = int(os.getenv("VLLM_MOE_W2_DELTA_PROMOTE", "8"))
 _TICK_S = float(os.getenv("VLLM_MOE_W2_DELTA_TICK_MS", "5")) / 1e3
 
@@ -112,7 +124,14 @@ class DeltaTier:
         self.w13_bytes = w13_bytes
         self.w2_bytes = w2_bytes
         self.slot_bytes = w13_bytes + w2_bytes
-        self.n_slots = max(int(_GB * 2**30) // self.slot_bytes, 8)
+        # Auto mode: the pool is NOT allocated here (weight load runs before
+        # the KV cache is planned). finalize_auto() -- driven by the worker
+        # right after initialize_kv_cache -- sizes it from the VRAM actually
+        # free once KV has taken its share, and always before any cudagraph
+        # capture (the desc kernel bakes pool pointers into the graph).
+        self._auto_pending = _AUTO
+        self.n_slots = 0 if _AUTO else max(
+            int(_GB * 2**30) // self.slot_bytes, 8)
         self.pool = torch.empty(self.n_slots, self.slot_bytes, dtype=torch.uint8,
                                 device=dev)
         # device table read by the desc kernel; host mirror for the manager
@@ -163,9 +182,14 @@ class DeltaTier:
         # like _freq; the eviction key under _POLICY == "need".
         self._need = torch.zeros(n_layers, n_experts, dtype=torch.float32)
         self._last_decay = 0
-        logger.info("moe_w2 delta tier: %d slots x %.1f MiB (%.2f GiB pool)",
-                    self.n_slots, self.slot_bytes / 2**20,
-                    self.n_slots * self.slot_bytes / 2**30)
+        if self._auto_pending:
+            logger.info("moe_w2 delta tier: auto-sizing deferred until after "
+                        "KV-cache allocation (slot %.1f MiB, reserve %.1f GiB)",
+                        self.slot_bytes / 2**20, _RESERVE_GB)
+        else:
+            logger.info("moe_w2 delta tier: %d slots x %.1f MiB (%.2f GiB pool)",
+                        self.n_slots, self.slot_bytes / 2**20,
+                        self.n_slots * self.slot_bytes / 2**30)
         if _TRACE:
             logger.info("moe_w2 delta trace ON: level %d, every %d ticks%s",
                         _TRACE, _TRACE_EVERY,
@@ -175,6 +199,51 @@ class DeltaTier:
                         _CAPTURE)
 
     # ---- load-time -------------------------------------------------------
+
+    def finalize_auto(self) -> None:
+        """Size + allocate the auto pool from the VRAM free AFTER KV-cache
+        allocation (VLLM_MOE_W2_DELTA_GB=auto). Driven by the worker's
+        initialize_from_config, i.e. after the KV tensors exist and BEFORE any
+        cudagraph capture — the desc kernel bakes `pool`/`slot_table` pointers
+        into the graph, so the pool must not be reallocated after capture.
+
+        Sizing: free VRAM minus _RESERVE_GB (capture + workspace headroom),
+        optionally capped by _MAX_GB, floored at 0 slots (extreme-context
+        configs where KV takes the whole card -> tier inert, exactly like the
+        manual DELTA_GB=0 rule, but without the manual step). No-op unless
+        auto mode is pending."""
+        if not self._auto_pending:
+            return
+        self._auto_pending = False
+        free_b, _ = torch.cuda.mem_get_info(self.dev)
+        budget = free_b - int(_RESERVE_GB * 2**30)
+        if _MAX_GB > 0:
+            budget = min(budget, int(_MAX_GB * 2**30))
+        n = max(budget // self.slot_bytes, 0)
+        if n == 0:
+            # Nothing to cache into -> behave exactly like manual DELTA_GB=0:
+            # release the pinned host store too (tens of GiB of host RAM the
+            # tier can never use; candidates require li in _host, so the
+            # manager and force_promote turn inert).
+            with self._lock:
+                self._host = {}
+            logger.info(
+                "moe_w2 delta tier AUTO: %.2f GiB free after KV < reserve "
+                "%.1f GiB -> pool disabled (0 slots, pure 2-bit; host store "
+                "released)",
+                free_b / 2**30, _RESERVE_GB)
+            return
+        self.n_slots = int(n)
+        self.pool = torch.empty(self.n_slots, self.slot_bytes,
+                                dtype=torch.uint8, device=self.dev)
+        self._owner = [(-1, -1, 0)] * self.n_slots
+        self._free = list(range(self.n_slots))
+        logger.info(
+            "moe_w2 delta tier AUTO: %d slots x %.1f MiB (%.2f GiB pool; "
+            "%.2f GiB was free after KV, reserve %.1f GiB)",
+            self.n_slots, self.slot_bytes / 2**20,
+            self.n_slots * self.slot_bytes / 2**30, free_b / 2**30,
+            _RESERVE_GB)
 
     def add_layer_host_planes(self, layer_key: int, w13_plane_gpu, w2_plane_gpu):
         """Stage a layer's fragment-major FP4 planes into pinned host memory.
@@ -590,7 +659,7 @@ _TIER: DeltaTier | None = None
 
 
 def enabled() -> bool:
-    return _GB > 0 and os.getenv("VLLM_MOE_W2_DELTA", "1") == "1"
+    return (_GB > 0 or _AUTO) and os.getenv("VLLM_MOE_W2_DELTA", "1") == "1"
 
 
 def get_tier(n_layers=None, n_experts=256, dev=None,
