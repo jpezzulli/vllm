@@ -112,9 +112,17 @@ SLOT_BYTES = W13_BYTES + W2_BYTES     # 12.0 MiB per expert (TP1)
 class DeltaTier:
     def __init__(self, n_layers: int, n_experts: int, dev,
                  w13_bytes: int = W13_BYTES, w2_bytes: int = W2_BYTES,
-                 pool_gb: float | None = None):
+                 pool_gb: float | None = None, policy: str | None = None,
+                 tag: str = "delta"):
         self.n_layers = n_layers
         self.E = n_experts
+        # Per-instance policy/tag: with the base cache and the FP4 tier
+        # coexisting, the base tier wants freq/lru (hot-set convergence)
+        # while the FP4 tier wants "need" (gate-filled only) — a shared
+        # module-level policy cannot express that. `tag` disambiguates the
+        # two tiers' log lines.
+        self._policy = policy if policy is not None else _POLICY
+        self._tag = tag
         if isinstance(dev, torch.device) and dev.index is None:
             dev = torch.device("cuda", torch.cuda.current_device())
         self.dev = dev
@@ -255,10 +263,22 @@ class DeltaTier:
         Called from the plane builder while the FP4 planes are transiently
         on GPU; w13/w2 are [E, bytes] u8.
         """
+        self.add_layer_host_sections(layer_key,
+                                     (w13_plane_gpu,), (w2_plane_gpu,))
+
+    def add_layer_host_sections(self, layer_key: int, parts13, parts2):
+        """Stage a layer whose slot sections arrive as SEPARATE GPU tensors
+        (e.g. [fp4_13|sc13] / [fp4_2|sc2] for the over-base FP4 tier): copy
+        each part D2H into its slice of the pinned row — a GPU-side cat of
+        multi-GiB planes is exactly the transient that OOMs a 32 GB card
+        during load."""
         host = torch.empty(self.E, self.slot_bytes, dtype=torch.uint8,
                            pin_memory=True)
-        host[:, :self.w13_bytes].copy_(w13_plane_gpu, non_blocking=False)
-        host[:, self.w13_bytes:].copy_(w2_plane_gpu, non_blocking=False)
+        off = 0
+        for t in (*parts13, *parts2):
+            host[:, off:off + t.shape[1]].copy_(t, non_blocking=False)
+            off += t.shape[1]
+        assert off == self.slot_bytes, (off, self.slot_bytes)
         self._host[layer_key] = host
 
     def start(self):
@@ -335,8 +355,8 @@ class DeltaTier:
             # gets pulled to the slower FP4 path). freq/lru: promote the hottest
             # candidates first so the limited pool tracks genuinely hot experts
             # across ALL layers (vs the layer-sorted order that starved past layer 0).
-            if _POLICY != "need":
-                if _POLICY == "freq" and len(cand) > 1:
+            if self._policy != "need":
+                if self._policy == "freq" and len(cand) > 1:
                     ca = torch.tensor(cand)
                     order = torch.argsort(self._freq[ca[:, 0], ca[:, 1]],
                                           descending=True)
@@ -386,9 +406,9 @@ class DeltaTier:
         ei = torch.tensor([o[1] for o in self._owner], dtype=torch.long)
         tk = torch.tensor([o[2] for o in self._owner], dtype=torch.float64)
         lic, eic = li.clamp(min=0), ei.clamp(min=0)
-        if _POLICY == "need":
+        if self._policy == "need":
             key = self._need[lic, eic].double()
-        elif _POLICY == "freq":
+        elif self._policy == "freq":
             key = self._freq[lic, eic].double()
         else:
             key = tk.clone()
@@ -407,8 +427,8 @@ class DeltaTier:
                 self._win_evicted += 1
                 if _TRACE >= 2:
                     logger.info(
-                        "[delta] evict   L%-2d E%-3d  slot %-4d (cold %d ticks)",
-                        vli, vei, s, self._tick - vt)
+                        "[%s] evict   L%-2d E%-3d  slot %-4d (cold %d ticks)",
+                        self._tag, vli, vei, s, self._tick - vt)
                 out.append(s)
         return out
 
@@ -429,8 +449,8 @@ class DeltaTier:
         self._n_promoted += 1
         self._win_promoted += 1
         if _TRACE >= 2:
-            logger.info("[delta] promote L%-2d E%-3d  slot %-4d (tick %d)",
-                        li, ei, slot, self._tick)
+            logger.info("[%s] promote L%-2d E%-3d  slot %-4d (tick %d)",
+                        self._tag, li, ei, slot, self._tick)
 
     # ---- confidence-gated re-forward (directive 2 / Step B) --------------
 
@@ -504,7 +524,7 @@ class DeltaTier:
             # policy (repeat offenders first); hottest-first otherwise.
             if len(cand) > 1:
                 ca = torch.tensor(cand)
-                rank = self._need if _POLICY == "need" else self._freq
+                rank = self._need if self._policy == "need" else self._freq
                 order = torch.argsort(rank[ca[:, 0], ca[:, 1]], descending=True)
                 cand = [cand[i] for i in order.tolist()]
             if max_promote is not None:
@@ -536,7 +556,8 @@ class DeltaTier:
             self._n_promoted += len(plan)
             self._win_promoted += len(plan)
         if _TRACE >= 2:
-            logger.info("[delta] force-promote %d experts (gate)", len(plan))
+            logger.info("[%s] force-promote %d experts (gate)",
+                        self._tag, len(plan))
         return len(plan)
 
     def ensure_resident(self, layer_key: int, ids: torch.Tensor) -> int:
@@ -653,15 +674,15 @@ class DeltaTier:
         hr = 100.0 * self._win_hits / max(self._win_active, 1.0)
         hrd = 100.0 * self._win_hits_d / max(self._win_active_d, 1)
         logger.info(
-            "[delta] tick %d: FP4 %d/%d slots, covering %d/%d experts (%.1f%%); "
+            "[%s] tick %d: %d/%d slots, covering %d/%d experts (%.1f%%); "
             "hit-rate %.1f%% tokens / %.1f%% experts; window +%d/-%d, cumulative +%d/-%d",
-            self._tick, cached, self.n_slots, cached, total,
+            self._tag, self._tick, cached, self.n_slots, cached, total,
             100.0 * cached / max(total, 1), hr, hrd, self._win_promoted,
             self._win_evicted, self._n_promoted, self._n_evicted)
         per_layer = cov.sum(dim=1).tolist()
         hist = " ".join(f"L{li}:{int(c)}" for li, c in enumerate(per_layer) if c)
         if hist:
-            logger.info("[delta] FP4 experts per layer: %s", hist)
+            logger.info("[%s] experts per layer: %s", self._tag, hist)
         # CONCENTRATION study: compare how top-heavy low-confidence routing (_need,
         # from the gate via mark_need_only) is vs overall routing (_freq). If the
         # top few % of experts hold MOST of the _need mass while _freq is spread,
@@ -745,7 +766,15 @@ _TIER: DeltaTier | None = None
 # UE8M0 scales, four sections per expert) and a miss cannot be served by any
 # resident fallback — the desc kernel zeroes the pair and bumps a miss
 # counter, and the runner re-runs the step after a synchronous fetch.
-# Mutually exclusive with the FP4 delta tier (they'd fight over `seen`).
+#
+# The FP4 delta tier CAN coexist with the base cache (explicit opt-in:
+# VLLM_MOE_W2_DELTA_GB=<GiB> set in the environment; "auto" unsupported
+# here). It then acts as the quality-recovery tier for host-resident bases:
+# a small gate-filled ("need" policy) FP4 pool whose slots carry their OWN
+# block-32 scales ([fp4_13|sc13|fp4_2|sc2] — with the base host-resident
+# there are no GPU-resident scale planes to share). The desc kernel reads
+# BOTH slot tables with priority FP4 > 2-bit slot > miss; each tier has its
+# own `seen` tensor (the forward marks both), own manager, own policy.
 _BASE_GB = float(os.getenv("VLLM_MOE_W2_BASE_CACHE_GB", "0"))
 _BASE_TIER: DeltaTier | None = None
 
@@ -782,9 +811,20 @@ def base_miss_tol() -> int:
     return _base_tol_dyn
 
 
+# Was VLLM_MOE_W2_DELTA_GB set explicitly (vs the "2.0" default)? Coexistence
+# with the base cache must be opt-in: the historical base-cache configs never
+# set DELTA_GB and must not silently grow an FP4 pool out of the default.
+_GB_EXPLICIT = "VLLM_MOE_W2_DELTA_GB" in os.environ
+
+
 def enabled() -> bool:
-    return (not base_enabled() and (_GB > 0 or _AUTO)
-            and os.getenv("VLLM_MOE_W2_DELTA", "1") == "1")
+    if os.getenv("VLLM_MOE_W2_DELTA", "1") != "1":
+        return False
+    if base_enabled():
+        # FP4 need-pool OVER the base cache: explicit GiB only (auto's
+        # after-KV sizing belongs to the base pool math, not this tier).
+        return _GB_EXPLICIT and _GB > 0
+    return _GB > 0 or _AUTO
 
 
 def base_enabled() -> bool:
@@ -802,7 +842,7 @@ def get_base_tier(n_layers: int, n_experts: int, dev,
     if _BASE_TIER is None:
         _BASE_TIER = DeltaTier(n_layers, n_experts, dev,
                                w13_bytes=w13_bytes, w2_bytes=w2_bytes,
-                               pool_gb=_BASE_GB)
+                               pool_gb=_BASE_GB, tag="base")
         # decode misses counted by the desc kernel (atomic, in-graph); zeroed
         # in-graph at the first layer of every forward, read by the runner
         # after logits to decide the fetch+replay.
@@ -835,10 +875,18 @@ def get_tier(n_layers=None, n_experts=256, dev=None,
             n_layers = moe_w2_cubit._layer_cutoff() + 1
         # The plane builder passes the per-rank FP4 plane sizes (smaller under
         # TP); fall back to the TP1 module constants when unspecified.
+        # Over the base cache the tier defaults to the "need" policy: the pool
+        # is a QUALITY tier filled only by the confidence gate — a freq-filled
+        # pool would duplicate the base tier's hot set at 2x the read bytes.
+        # An explicit VLLM_MOE_W2_DELTA_POLICY still wins.
+        policy = None
+        if base_enabled():
+            policy = os.getenv("VLLM_MOE_W2_DELTA_POLICY", "need")
         _TIER = DeltaTier(
             n_layers, n_experts, dev or torch.device("cuda"),
             w13_bytes=W13_BYTES if w13_bytes is None else w13_bytes,
-            w2_bytes=W2_BYTES if w2_bytes is None else w2_bytes)
+            w2_bytes=W2_BYTES if w2_bytes is None else w2_bytes,
+            policy=policy, tag="fp4" if base_enabled() else "delta")
         # Start the background manager as soon as the tier exists. It idles until
         # experts are actually routed (seen empty -> early return) and only
         # promotes layers whose host planes are already staged, so an early start
