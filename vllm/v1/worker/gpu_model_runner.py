@@ -4472,6 +4472,66 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        # moe_w2 BASE cache (VLLM_MOE_W2_BASE_CACHE_GB>0): the 2-bit base is
+        # host-resident and the GPU pool may MISS routed experts — the desc
+        # kernel zeroed their contributions and bumped the tier's miss
+        # counter. Fetch the missing experts synchronously and replay the
+        # step's graph ONCE (mandatory for correctness, unlike the optional
+        # gate re-forward below). TP-only: all ranks decide via OR-reduce and
+        # replay together (the re-forward is a collective). Fail-safe: on any
+        # error the zero-contribution logits are kept (quality blip, not a
+        # crash).
+        if (
+            moe_w2_gate is not None    # module family deployed
+            and logits is not None
+            and not self.is_pooling_model
+            and get_pp_group().world_size == 1
+        ):
+            try:
+                from vllm.model_executor.layers.quantization.utils import (
+                    moe_w2_delta as _w2d)
+                _btier = _w2d._BASE_TIER
+                if _btier is not None:
+                    _miss = int(_btier.miss_count.item())
+                    _tp = get_tp_group()
+                    if _tp.world_size > 1:
+                        _t = torch.tensor([_miss], device=logits.device)
+                        torch.distributed.all_reduce(
+                            _t, op=torch.distributed.ReduceOp.MAX,
+                            group=_tp.device_group)
+                        _any_miss = bool(_t.item() > 0)
+                    else:
+                        _any_miss = _miss > 0
+                    if _any_miss:
+                        if _miss > 0:
+                            _btier.force_promote(max_promote=None)
+                        with set_forward_context(
+                            attn_metadata,
+                            self.vllm_config,
+                            num_tokens=num_tokens_padded,
+                            num_tokens_across_dp=num_tokens_across_dp,
+                            cudagraph_runtime_mode=cudagraph_mode,
+                            batch_descriptor=batch_desc,
+                            ubatch_slices=ubatch_slices_padded,
+                            slot_mapping=slot_mappings,
+                            skip_compiled=has_encoder_input,
+                        ):
+                            _re_out = self._model_forward(
+                                input_ids=input_ids,
+                                positions=positions,
+                                intermediate_tensors=intermediate_tensors,
+                                inputs_embeds=inputs_embeds,
+                                **model_kwargs,
+                            )
+                        if self.use_aux_hidden_state_outputs:
+                            hidden_states, aux_hidden_states = _re_out
+                        else:
+                            hidden_states = _re_out
+                        sample_hidden_states = hidden_states[logits_indices]
+                        logits = self.model.compute_logits(sample_hidden_states)
+            except Exception as e:  # noqa: BLE001 - never crash serving
+                logger.warning("moe_w2 base-cache miss replay skipped: %s", e)
+
         # Confidence-gated FP4 re-forward (VLLM_MOE_W2_GATE=1; default OFF, so
         # the serving path is byte-for-byte unchanged). When this step's 2-bit
         # top-1 is low-confidence, pull its routed COLD experts up to FP4

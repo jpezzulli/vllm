@@ -111,7 +111,8 @@ SLOT_BYTES = W13_BYTES + W2_BYTES     # 12.0 MiB per expert (TP1)
 
 class DeltaTier:
     def __init__(self, n_layers: int, n_experts: int, dev,
-                 w13_bytes: int = W13_BYTES, w2_bytes: int = W2_BYTES):
+                 w13_bytes: int = W13_BYTES, w2_bytes: int = W2_BYTES,
+                 pool_gb: float | None = None):
         self.n_layers = n_layers
         self.E = n_experts
         if isinstance(dev, torch.device) and dev.index is None:
@@ -129,9 +130,12 @@ class DeltaTier:
         # right after initialize_kv_cache -- sizes it from the VRAM actually
         # free once KV has taken its share, and always before any cudagraph
         # capture (the desc kernel bakes pool pointers into the graph).
-        self._auto_pending = _AUTO
-        self.n_slots = 0 if _AUTO else max(
-            int(_GB * 2**30) // self.slot_bytes, 8)
+        # `pool_gb` overrides the module-level env sizing (used by the BASE
+        # cache tier, which has its own env knob and never auto-defers).
+        _gb = _GB if pool_gb is None else float(pool_gb)
+        self._auto_pending = _AUTO and pool_gb is None
+        self.n_slots = 0 if self._auto_pending else max(
+            int(_gb * 2**30) // self.slot_bytes, 8)
         self.pool = torch.empty(self.n_slots, self.slot_bytes, dtype=torch.uint8,
                                 device=dev)
         # device table read by the desc kernel; host mirror for the manager
@@ -535,6 +539,56 @@ class DeltaTier:
             logger.info("[delta] force-promote %d experts (gate)", len(plan))
         return len(plan)
 
+    def ensure_resident(self, layer_key: int, ids: torch.Tensor) -> int:
+        """Synchronously make the given experts of ONE layer resident (base
+        cache, prefill path): fetch every (layer_key, e) not in the pool,
+        blocking until the bytes are on GPU. Runs on the forward thread OUTSIDE
+        cudagraph capture (prefill is eager), serialized with the manager via
+        the lock. Marks the ids seen first so the batched eviction never picks
+        this layer's in-flight experts as victims. Returns experts fetched."""
+        if layer_key not in self._host:
+            return 0
+        ids = ids.unique().long()
+        mark_seen(self.seen[layer_key], ids.to(self.dev))
+        # snapshot seen (protects eviction) exactly like force_promote
+        main = torch.cuda.current_stream(self.dev)
+        with torch.cuda.stream(self._stream):
+            self._stream.wait_stream(main)
+            self._seen_host.copy_(self.seen, non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record(self._stream)
+        ev.synchronize()
+        with self._lock:
+            cand = [(layer_key, int(e)) for e in ids.cpu()
+                    if int(self._mirror[layer_key, int(e)]) < 0]
+            if not cand:
+                return 0
+            slots = self._take_slots_batch(len(cand))
+            plan = []
+            for (li, ei), slot in zip(cand, slots):
+                self._owner[slot] = (li, ei, self._tick)
+                with torch.cuda.stream(self._stream):
+                    self.pool[slot].copy_(self._host[li][ei], non_blocking=True)
+                plan.append((li, ei, slot))
+            if not plan:
+                return 0
+            with torch.cuda.stream(self._stream):
+                ev = torch.cuda.Event()
+                ev.record(self._stream)
+            ev.synchronize()
+            for li, ei, slot in plan:
+                self.slot_table[li, ei] = slot
+                self._mirror[li, ei] = slot
+                self._freq[li, ei] += 1.0
+            self._n_promoted += len(plan)
+            self._win_promoted += len(plan)
+        if len(plan) < len(cand):
+            logger.warning_once(
+                "moe_w2 base cache: pool too small for one prefill layer "
+                "(%d experts unfetched) — increase VLLM_MOE_W2_BASE_CACHE_GB",
+                len(cand) - len(plan))
+        return len(plan)
+
     def mark_need_only(self, layers=None) -> int:
         """MEASUREMENT ONLY: bump _need for THIS step's routed experts (a low-conf,
         gate-fired step) WITHOUT promoting anything. Lets us study whether 2-bit
@@ -682,9 +736,57 @@ def mark_seen(seen_row, ids):
 
 _TIER: DeltaTier | None = None
 
+# ---------------------------------------------------------------------------
+# BASE cache (inverted delta): the 2-bit BASE planes live in pinned host RAM
+# and the GPU holds only a cache of hot experts — for models whose 2-bit
+# planes alone exceed VRAM (GLM-5.2 on 2 GPUs: ~189 GiB of planes vs 192 GB).
+# Reuses the DeltaTier machinery wholesale (pool, slot table read in-graph,
+# manager prefetch, batched eviction); slot CONTENT differs (2-bit codes +
+# UE8M0 scales, four sections per expert) and a miss cannot be served by any
+# resident fallback — the desc kernel zeroes the pair and bumps a miss
+# counter, and the runner re-runs the step after a synchronous fetch.
+# Mutually exclusive with the FP4 delta tier (they'd fight over `seen`).
+_BASE_GB = float(os.getenv("VLLM_MOE_W2_BASE_CACHE_GB", "0"))
+_BASE_TIER: DeltaTier | None = None
+
 
 def enabled() -> bool:
-    return (_GB > 0 or _AUTO) and os.getenv("VLLM_MOE_W2_DELTA", "1") == "1"
+    return (not base_enabled() and (_GB > 0 or _AUTO)
+            and os.getenv("VLLM_MOE_W2_DELTA", "1") == "1")
+
+
+def base_enabled() -> bool:
+    return _BASE_GB > 0
+
+
+def get_base_tier(n_layers: int, n_experts: int, dev,
+                  w13_bytes: int, w2_bytes: int) -> DeltaTier:
+    """Base-cache tier singleton. `w13_bytes`/`w2_bytes` are the PACKED 2-bit
+    sections per expert (codes13+sc13 / codes2+sc2), so slot_bytes matches the
+    host rows staged by the plane builder. The pool is allocated immediately
+    (explicit env sizing, no auto-defer) and the manager starts prefetching
+    as soon as host planes exist."""
+    global _BASE_TIER
+    if _BASE_TIER is None:
+        _BASE_TIER = DeltaTier(n_layers, n_experts, dev,
+                               w13_bytes=w13_bytes, w2_bytes=w2_bytes,
+                               pool_gb=_BASE_GB)
+        # decode misses counted by the desc kernel (atomic, in-graph); zeroed
+        # in-graph at the first layer of every forward, read by the runner
+        # after logits to decide the fetch+replay.
+        _BASE_TIER.miss_count = torch.zeros(1, dtype=torch.int32,
+                                            device=_BASE_TIER.dev)
+        n_step = n_layers * 16      # decode working set (top-k<=16) headroom
+        assert _BASE_TIER.n_slots >= max(2 * 256, n_step), (
+            f"moe_w2 base cache: pool of {_BASE_TIER.n_slots} slots is smaller "
+            f"than a step's worst-case working set; raise "
+            f"VLLM_MOE_W2_BASE_CACHE_GB")
+        _BASE_TIER.start()
+        logger.info("moe_w2 BASE cache: %d slots x %.2f MiB (%.1f GiB pool) — "
+                    "2-bit base is HOST-resident",
+                    _BASE_TIER.n_slots, _BASE_TIER.slot_bytes / 2**20,
+                    _BASE_TIER.n_slots * _BASE_TIER.slot_bytes / 2**30)
+    return _BASE_TIER
 
 
 def get_tier(n_layers=None, n_experts=256, dev=None,
