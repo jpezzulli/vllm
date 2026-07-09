@@ -113,7 +113,7 @@ class DeltaTier:
     def __init__(self, n_layers: int, n_experts: int, dev,
                  w13_bytes: int = W13_BYTES, w2_bytes: int = W2_BYTES,
                  pool_gb: float | None = None, policy: str | None = None,
-                 tag: str = "delta"):
+                 tag: str = "delta", host_pinned: bool = True):
         self.n_layers = n_layers
         self.E = n_experts
         # Per-instance policy/tag: with the base cache and the FP4 tier
@@ -123,6 +123,14 @@ class DeltaTier:
         # two tiers' log lines.
         self._policy = policy if policy is not None else _POLICY
         self._tag = tag
+        # Pinned host store is right for tiers that promote continuously (the
+        # base cache's misses, the standalone delta's lazy manager). The FP4
+        # need-pool OVER the base promotes only on gate fires — pageable
+        # memory there saves ~360 GiB of pinned RAM on GLM TP2/TP4 (pinning
+        # that much alongside the base store + load staging exhausts a 1 TB
+        # host: measured OOM at boot), at the cost of a bounce-buffer copy on
+        # the rare promote.
+        self._host_pinned = host_pinned
         if isinstance(dev, torch.device) and dev.index is None:
             dev = torch.device("cuda", torch.cuda.current_device())
         self.dev = dev
@@ -269,11 +277,11 @@ class DeltaTier:
     def add_layer_host_sections(self, layer_key: int, parts13, parts2):
         """Stage a layer whose slot sections arrive as SEPARATE GPU tensors
         (e.g. [fp4_13|sc13] / [fp4_2|sc2] for the over-base FP4 tier): copy
-        each part D2H into its slice of the pinned row — a GPU-side cat of
+        each part D2H into its slice of the host row — a GPU-side cat of
         multi-GiB planes is exactly the transient that OOMs a 32 GB card
         during load."""
         host = torch.empty(self.E, self.slot_bytes, dtype=torch.uint8,
-                           pin_memory=True)
+                           pin_memory=self._host_pinned)
         off = 0
         for t in (*parts13, *parts2):
             host[:, off:off + t.shape[1]].copy_(t, non_blocking=False)
@@ -886,7 +894,8 @@ def get_tier(n_layers=None, n_experts=256, dev=None,
             n_layers, n_experts, dev or torch.device("cuda"),
             w13_bytes=W13_BYTES if w13_bytes is None else w13_bytes,
             w2_bytes=W2_BYTES if w2_bytes is None else w2_bytes,
-            policy=policy, tag="fp4" if base_enabled() else "delta")
+            policy=policy, tag="fp4" if base_enabled() else "delta",
+            host_pinned=not base_enabled())
         # Start the background manager as soon as the tier exists. It idles until
         # experts are actually routed (seen empty -> early return) and only
         # promotes layers whose host planes are already staged, so an early start
