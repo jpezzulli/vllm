@@ -1001,12 +1001,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
+        from vllm.v1.kv_cache_interface import KVQuantMode, get_kv_quant_mode
+
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=kv_cache_dtype,
             cache_dtype_str=vllm_config.cache_config.cache_dtype,
+            # Without this the model runner falls back to the "auto"
+            # (656-byte) kv cache shape for the packed nvfp4 layout.
+            kv_quant_mode=(
+                get_kv_quant_mode(vllm_config.cache_config.cache_dtype)
+                if vllm_config.cache_config.cache_dtype == "nvfp4"
+                else KVQuantMode.NONE
+            ),
         )
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
