@@ -378,6 +378,10 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.cache_dtype_str == "nvfp4":
+            # nvfp4_ds_mla: 256B E2M1 + 32B E4M3 block-16 scales + 64B FP8
+            # RoPE = 352 B/token (kv_lora_rank=512 + qk_rope_head_dim=64).
+            return self.block_size * 352
         if self.cache_dtype_str == "fp8_ds_mla":
             if self.model_version == "deepseek_v4":
                 # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.

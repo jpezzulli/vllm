@@ -62,10 +62,10 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
-        if self.kv_cache_dtype != "fp8_ds_mla":
+        if self.kv_cache_dtype not in ("fp8_ds_mla", "nvfp4"):
             raise NotImplementedError(
                 "FLASHINFER_MLA_SPARSE_SM120 requires the packed fp8_ds_mla "
-                f"KV cache layout; got kv_cache_dtype={kv_cache_dtype!r}."
+                f"or nvfp4 KV cache layout; got kv_cache_dtype={kv_cache_dtype!r}."
             )
 
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
@@ -79,7 +79,12 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
             model_type = getattr(
                 vllm_config.model_config.hf_text_config, "model_type", None
             )
-        self.kv_scale_format = _kv_scale_format_for_model(model_type)
+        if self.kv_cache_dtype == "nvfp4":
+            # NVFP4 block-16 packed cache; requires the GLM_NSA_NVFP4 model
+            # type in FlashInfer's sparse-MLA SM120 kernels.
+            self.kv_scale_format = "nvfp4_b16"
+        else:
+            self.kv_scale_format = _kv_scale_format_for_model(model_type)
 
         # Skip-topk layers are built with indexer=None and get the shared
         # buffer via mla_args instead (cf. FLASHMLA_SPARSE).
@@ -99,6 +104,31 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
 
         self.supports_quant_query_input = False
         self._workspace_buffer: torch.Tensor | None = None
+
+    def do_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+    ) -> None:
+        if kv_cache.numel() == 0:
+            return
+        if kv_cache_dtype == "nvfp4":
+            from vllm.v1.attention.backends.mla.nvfp4_ds_mla_cache import (
+                concat_and_cache_nvfp4_ds_mla,
+            )
+
+            k_pe_2d = k_pe.squeeze(1) if k_pe.dim() == 3 else k_pe
+            concat_and_cache_nvfp4_ds_mla(
+                kv_c_normed, k_pe_2d, kv_cache, slot_mapping.flatten()
+            )
+            return
+        super().do_kv_cache_update(
+            kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale
+        )
 
     def forward_mqa(
         self,

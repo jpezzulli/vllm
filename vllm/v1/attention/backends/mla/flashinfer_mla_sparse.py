@@ -151,6 +151,7 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
         "fp8",
         "fp8_e4m3",
         "fp8_ds_mla",
+        "nvfp4",
     ]
 
     @staticmethod
@@ -202,6 +203,7 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
             "fp8",
             "fp8_e4m3",
             "fp8_ds_mla",
+            "nvfp4",
         ):
             return "kv_cache_dtype not supported"
         vllm_config = get_current_vllm_config()
@@ -228,6 +230,10 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        if cache_dtype_str == "nvfp4":
+            # nvfp4_ds_mla packed layout: 256B E2M1 NoPE + 32B E4M3
+            # block-16 scales + 64B FP8 RoPE = 352 B/token.
+            return (num_blocks, block_size, 352)
         if cache_dtype_str in ("auto", "fp8", "fp8_e4m3", "fp8_ds_mla"):
             # fp8_ds_mla packed layout: 512 NoPE + 16 scales + 128 RoPE.
             return (num_blocks, block_size, 656)

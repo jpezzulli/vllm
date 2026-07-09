@@ -2222,7 +2222,15 @@ class VllmConfig:
     def validate_nvfp4_kv_cache_with_mla(self) -> "VllmConfig":
         if self.model_config is None:
             return self
-        if self.cache_config.cache_dtype == "nvfp4" and self.model_config.use_mla:
+        # SM120 sparse MLA has a packed nvfp4_ds_mla layout (352 B/token);
+        # keep the guard for every other platform/backend combination.
+        from vllm.platforms import current_platform
+
+        if (
+            self.cache_config.cache_dtype == "nvfp4"
+            and self.model_config.use_mla
+            and not current_platform.is_device_capability_family(120)
+        ):
             raise ValueError(
                 "nvfp4 KV cache is not supported with MLA (Multi-head Latent "
                 "Attention) backends. Please use a different --kv-cache-dtype "
