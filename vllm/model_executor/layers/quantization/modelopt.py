@@ -1421,6 +1421,12 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         self,
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> mk.FusedMoEPrepareAndFinalizeModular | None:
+        # VLLM_MOE_W2: the 2-bit path skips the stock kernel setup, so
+        # supports_internal_mk stays False and the runner's
+        # maybe_init_modular_kernel reaches this. Nothing to build (TP-only;
+        # apply() dispatches to moe_w2_forward) -> no-op instead of raising.
+        if getattr(self, "_moe_w2_active", False):
+            return None
         raise ValueError(
             f"{self.__class__.__name__} uses the new modular kernel initialization "
             "logic. This function should not be called."
@@ -1566,12 +1572,21 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
         # VLLM_MOE_W2: re-quantize the host-staged NVFP4 experts to 2-bit
-        # tensor-sym planes; skip the stock kernel setup entirely.
+        # tensor-sym planes; skip the stock kernel setup entirely. Unlike the
+        # mxfp4/fp8 methods, this class raises in maybe_make_prepare_finalize
+        # (new-style internal-MK method) and its get_fused_moe_quant_config
+        # rebuilds a backend config from the (now stubbed) scale tensors — so
+        # pre-set a benign moe_quant_config (skips _ensure_moe_quant_config_
+        # init) and flag the method so maybe_make_prepare_finalize no-ops.
         from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
         if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
+            from vllm.model_executor.layers.fused_moe.config import (
+                FUSED_MOE_UNQUANTIZED_CONFIG)
             key = len(moe_w2_cubit._LAYERS)
             moe_w2_cubit.build_layer_planes_nvfp4(layer, key)
             layer._moe_w2_key = key
+            self._moe_w2_active = True
+            self.moe_quant_config = FUSED_MOE_UNQUANTIZED_CONFIG
             return
 
         # Use a single gscale for w13.
