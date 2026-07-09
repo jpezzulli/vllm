@@ -4499,12 +4499,19 @@ class GPUModelRunner(
                         torch.distributed.all_reduce(
                             _t, op=torch.distributed.ReduceOp.MAX,
                             group=_tp.device_group)
-                        _any_miss = bool(_t.item() > 0)
+                        _max_miss = int(_t.item())
                     else:
-                        _any_miss = _miss > 0
-                    if _any_miss:
-                        if _miss > 0:
-                            _btier.force_promote(max_promote=None)
+                        _max_miss = _miss
+                    # Fetch this rank's missing experts whenever it has any
+                    # (they join the pool for future steps); replay only when
+                    # the worst rank exceeds the tolerance — the same reduced
+                    # max on every rank, so the collective replay stays in
+                    # lockstep. Tolerated steps keep their logits: <= TOL of
+                    # the step's ~top_k*n_layers weighted contributions were
+                    # zeroed (bounded approximation, delta/gate class).
+                    if _miss > 0:
+                        _btier.force_promote(max_promote=None)
+                    if _max_miss > _w2d.base_miss_tol():
                         with set_forward_context(
                             attn_metadata,
                             self.vllm_config,

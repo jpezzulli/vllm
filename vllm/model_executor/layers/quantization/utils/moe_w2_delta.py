@@ -749,6 +749,38 @@ _TIER: DeltaTier | None = None
 _BASE_GB = float(os.getenv("VLLM_MOE_W2_BASE_CACHE_GB", "0"))
 _BASE_TIER: DeltaTier | None = None
 
+# Miss tolerance: a decode step with <= TOL missing routed (layer, expert)
+# pairs keeps its logits (the missing pairs contributed zero) instead of
+# replaying the graph. Rationale: at 99.9% token hit-rate a 600-pair step
+# still has a ~45% chance of >=1 miss, and mandatory replays collapsed
+# GLM-5.2 TP4 from 56.7 to 18.2 tok/s at 74% coverage — while dropping k of
+# ~600 weighted expert contributions is the same approximation class the
+# FP4 delta/gate already trades in. Missing experts are STILL fetched (they
+# join the pool for subsequent steps). 0 = strict (always replay).
+# The _FILE variant is mtime-cached and re-read on change, so a tolerance
+# sweep runs in ONE server (same idiom as the gate's TAU_FILE).
+_BASE_MISS_TOL = int(os.getenv("VLLM_MOE_W2_BASE_MISS_TOL", "0"))
+_BASE_MISS_TOL_FILE = os.getenv("VLLM_MOE_W2_BASE_MISS_TOL_FILE", "")
+_base_tol_dyn = _BASE_MISS_TOL
+_base_tol_mtime = -1.0
+
+
+def base_miss_tol() -> int:
+    global _base_tol_dyn, _base_tol_mtime
+    if not _BASE_MISS_TOL_FILE:
+        return _BASE_MISS_TOL
+    try:
+        m = os.path.getmtime(_BASE_MISS_TOL_FILE)
+        if m != _base_tol_mtime:
+            _base_tol_mtime = m
+            with open(_BASE_MISS_TOL_FILE) as f:
+                _base_tol_dyn = int(f.read().strip())
+            logger.info("moe_w2 base cache: miss tolerance -> %d",
+                        _base_tol_dyn)
+    except (OSError, ValueError):
+        pass
+    return _base_tol_dyn
+
 
 def enabled() -> bool:
     return (not base_enabled() and (_GB > 0 or _AUTO)
