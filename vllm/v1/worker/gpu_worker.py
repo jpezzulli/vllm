@@ -929,9 +929,22 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
-        # launch non-blocking send of intermediate tensors
+        # launch non-blocking send of intermediate tensors.
+        # Under FULL cudagraphs the model output is a VIEW into the cudagraph
+        # memory pool, which the next graph replay (or any other captured
+        # graph) overwrites. The async isend below only guards buffer reuse
+        # via tensor.record_stream(), which is a NO-OP on graph-pool memory ->
+        # the next step can clobber the bytes while the send is still in
+        # flight, producing intermittent cross-stage hidden-state corruption
+        # that compounds over decode steps. Clone into fresh caching-allocator
+        # memory first: the clone is ordered after the graph replay on the
+        # current stream, and record_stream() then correctly defers its reuse
+        # until the send completes.
+        send_tensors = {
+            k: (v.clone() if v.is_cuda else v) for k, v in output.tensors.items()
+        }
         self._pp_send_work = get_pp_group().isend_tensor_dict(
-            output.tensors,
+            send_tensors,
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
         )

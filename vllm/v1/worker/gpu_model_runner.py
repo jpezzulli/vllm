@@ -1370,10 +1370,19 @@ class GPUModelRunner(
                         req_state.output_token_ids.extend(
                             new_token_ids[-num_new_tokens:]
                         )
-            elif num_output_tokens < len(req_state.output_token_ids):
-                # Some output tokens were discarded due to a sync-KV-load
-                # failure, or output_token_ids was inflated by the optimistic
-                # extend above (async spec decode). Align the cached state.
+            # Trim any optimistic over-extend back to the authoritative
+            # scheduler count. On the last rank this also handles tokens
+            # discarded by a sync-KV-load failure. On non-last PP ranks (async
+            # spec decode) it undoes the optimistic extend above + the
+            # _pp_receive placeholder append, which are otherwise NEVER
+            # corrected there (the deferred correction is not applied on
+            # non-last ranks) -- left uncorrected, output_token_ids grows
+            # ~num_spec faster than num_computed every step, inflating
+            # num_tokens until the discard mask trips and the request is
+            # dropped from prev_req_id_to_index (-> stale [-1,...] input ->
+            # embedding assert). Runs on all ranks; it is a no-op (len already
+            # == count) in the non-async / non-spec paths.
+            if num_output_tokens < len(req_state.output_token_ids):
                 del req_state.output_token_ids[num_output_tokens:]
                 if req_index is not None:
                     end_idx = (
@@ -2488,8 +2497,11 @@ class GPUModelRunner(
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
+                # The drafter only exists on the last PP rank; other ranks
+                # fall through to the non-eagle branch.
+                _drafter = getattr(self, "drafter", None)
                 if isinstance(
-                    self.drafter,
+                    _drafter,
                     (
                         EagleProposer,
                         DFlashProposer,
@@ -2497,16 +2509,20 @@ class GPUModelRunner(
                         ExtractHiddenStatesProposer,
                     ),
                 ):
-                    if self.drafter.kv_cache_gid == kv_cache_gid:
+                    if _drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
             # Capture per-group block tables for multi-group proposers.
-            if self.speculative_config and isinstance(self.drafter, Step3p5MTPProposer):
+            if self.speculative_config and isinstance(
+                getattr(self, "drafter", None), Step3p5MTPProposer
+            ):
                 self.drafter.set_per_group_attn_metadata(
                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping
                 )
-            elif self.speculative_config and isinstance(self.drafter, Gemma4Proposer):
+            elif self.speculative_config and isinstance(
+                getattr(self, "drafter", None), Gemma4Proposer
+            ):
                 self.drafter.set_per_group_block_table(
                     kv_cache_gid, cm.block_table_tensor
                 )
@@ -3575,6 +3591,18 @@ class GPUModelRunner(
             intermediate_tensors = self.sync_and_gather_intermediate_tensors(
                 num_input_tokens, intermediate_tensors, True
             )
+            # Zero the padding rows (beyond the real scheduled tokens) of the
+            # received hidden states, mirroring the positions zeroing above.
+            # Under FULL cudagraph the graph is captured for the padded size
+            # and reads these rows; if they hold stale/non-deterministic data
+            # (the PP transfer copies the padded extent), row-coupled kernels
+            # can leak them into the real tokens' output -> non-deterministic
+            # decode on non-first PP ranks. Zeroing makes the captured input
+            # deterministic.
+            if num_input_tokens > num_scheduled_tokens:
+                assert self.intermediate_tensors is not None
+                for _k, _t in self.intermediate_tensors.items():
+                    _t[num_scheduled_tokens:num_input_tokens].zero_()
 
         if is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             # Run the encoder, just like we do with other multimodal inputs.
@@ -4665,6 +4693,12 @@ class GPUModelRunner(
             # receive sampled token ids from the last PP rank.
             if self.use_async_scheduling and not get_pp_group().is_last_rank:
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
+                # Spec decode: also receive the drafts (the drafter only runs
+                # on the last rank). Order matters -- this must follow the
+                # sampled receive to match the broadcast order on the last
+                # rank.
+                if self.num_spec_tokens > 0:
+                    self._pp_receive_draft_token_ids()
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
@@ -4829,6 +4863,23 @@ class GPUModelRunner(
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
 
+        # PP + async spec decode: the drafter ran only on this (last) rank,
+        # but the first rank embeds input_ids and needs the drafts to fill the
+        # spec positions. Broadcast them now (after they are proposed) so the
+        # next step's _prepare_input_ids scatters them into rank 0's input;
+        # otherwise rank 0 embeds stale tokens at the spec positions and every
+        # draft is rejected. Mirrors _pp_broadcast_prev_sampled_token_ids and
+        # must come after it to keep the device_group broadcasts ordered
+        # across ranks.
+        if (
+            self.use_async_scheduling
+            and not self.broadcast_pp_output
+            and self.num_spec_tokens > 0
+        ):
+            pp = get_pp_group()
+            if pp.world_size > 1 and pp.is_last_rank:
+                self._pp_broadcast_draft_token_ids()
+
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
         # draft model to also save its KV cache.
@@ -4920,13 +4971,35 @@ class GPUModelRunner(
     def _pp_broadcast_prev_sampled_token_ids(
         self, sampled_token_ids: torch.Tensor
     ) -> None:
-        """Broadcast sampled token ids (GPU) from last PP stage"""
+        """Broadcast sampled token ids (GPU) from last PP stage.
+
+        For non-spec decode `sampled_token_ids` is [num_reqs, 1]. For
+        speculative decode it is [num_reqs, 1 + num_spec] with -1 in the
+        rejected tail; the next step's input needs the LAST ACCEPTED token per
+        request (the token the next forward must be conditioned on), so the
+        receiver reduces it to [num_reqs, 1]. This makes PP + async scheduling
+        work with MTP/spec decode (otherwise the prev accepted token is never
+        carried into the next step's input on non-last ranks).
+        """
         pp = get_pp_group()
         assert pp.is_last_rank
-        # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
-        assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (
-            "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
-        )
+        assert sampled_token_ids.dim() == 2
+        # Broadcast a FIXED-width [num_reqs, 1 + num_spec] tensor (with -1 in
+        # the rejected tail) so the receiving ranks can recover both the last
+        # accepted token (for the next input) AND the per-request accepted
+        # count (for output-length bookkeeping). The sampled width varies by
+        # step (1 at prefill / no-draft, 1 + num_spec at spec decode), so pad
+        # to the fixed width the receivers allocate -- otherwise the
+        # collective sizes mismatch and the broadcast deadlocks.
+        sampled_token_ids = sampled_token_ids.to(torch.int32)
+        target_w = 1 + self.num_spec_tokens
+        if sampled_token_ids.shape[1] < target_w:
+            pad = sampled_token_ids.new_full(
+                (sampled_token_ids.shape[0], target_w - sampled_token_ids.shape[1]),
+                -1,
+            )
+            sampled_token_ids = torch.cat([sampled_token_ids, pad], dim=1)
+        sampled_token_ids = sampled_token_ids.contiguous()
         # Skip for chunked prefill: sampled tokens are dummy
         # and will be discarded, no need to broadcast.
         if not self._is_all_reqs_chunked_prefill():
@@ -4935,16 +5008,33 @@ class GPUModelRunner(
             )
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
-        """Receive sampled token ids broadcast from last PP stage"""
+        """Receive sampled token ids broadcast from last PP stage.
+
+        Receives the full [num_reqs, 1 + num_spec] tensor (with -1 in the
+        rejected tail). For spec decode, reduces it to the LAST ACCEPTED token
+        per request (what the next input must be conditioned on) and advances
+        each request's local output length by its accepted count (not a fixed
+        1), so positions stay consistent across PP ranks.
+        """
         pp = get_pp_group()
         assert not pp.is_last_rank
         num_reqs = self.input_batch.num_reqs
-        # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
-        recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
+        width = 1 + self.num_spec_tokens
+        recv = torch.empty((num_reqs, width), dtype=torch.int32, device=self.device)
         # skip for chunked prefill.
         if not self._is_all_reqs_chunked_prefill():
             torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
-        self.input_batch.prev_sampled_token_ids = recv
+
+        if width == 1:
+            counts_cpu = [1] * num_reqs
+            self.input_batch.prev_sampled_token_ids = recv
+        else:
+            # accepted count = number of non-(-1) entries per request (>= 1).
+            counts = (recv != -1).sum(dim=1)
+            last_idx = (counts - 1).clamp(min=0).unsqueeze(1)
+            last_tok = recv.gather(1, last_idx)  # [num_reqs, 1], last accepted
+            self.input_batch.prev_sampled_token_ids = last_tok
+            counts_cpu = counts.tolist()
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
         # can map req_id -> previous batch row
@@ -4955,14 +5045,135 @@ class GPUModelRunner(
             if i in discard_req_indices_set:
                 continue
             prev_req_id_to_index[req_id] = i
-            # PP+async scheduling: advance per-request local cached output length by
-            # appending a placeholder (-1) token id.
+            # PP+async scheduling: advance per-request local cached output
+            # length by appending one placeholder (-1) per accepted token this
+            # step.
             if (req_state := self.requests.get(req_id)) is not None:
-                req_state.output_token_ids.append(-1)
+                for _ in range(int(counts_cpu[i])):
+                    req_state.output_token_ids.append(-1)
             pos = self.input_batch.num_tokens_no_spec[i]
-            self.input_batch.is_token_ids[i, pos] = True
-            self.input_batch.num_tokens_no_spec[i] = pos + 1
+            end = pos + int(counts_cpu[i])
+            self.input_batch.is_token_ids[i, pos:end] = True
+            self.input_batch.num_tokens_no_spec[i] = end
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
+
+    def _pp_broadcast_draft_token_ids(self) -> None:
+        """Broadcast the just-proposed draft token ids (GPU) from the last PP
+        stage to all ranks.
+
+        Under PP the drafter (MTP/EAGLE) runs only on the last rank, but the
+        FIRST rank is the only rank that embeds ``input_ids`` -- so without
+        this it never sees the speculative tokens and embeds stale values at
+        the spec positions, yielding garbage hidden states and ~0% draft
+        acceptance. Broadcasting the drafts lets the next step's
+        ``_prepare_input_ids`` scatter them into rank 0's input exactly as the
+        co-located (TP / single-GPU) path does.
+
+        Paired with ``_pp_receive_draft_token_ids``. MUST be issued AFTER
+        ``_pp_broadcast_prev_sampled_token_ids`` so the two broadcasts on the
+        PP ``device_group`` stay in the same order on every rank.
+        """
+        pp = get_pp_group()
+        assert pp.is_last_rank
+        # Skip for chunked prefill (mirror the sampled-token broadcast): no
+        # drafts are consumed, and the other ranks skip the matching receive.
+        if self._is_all_reqs_chunked_prefill():
+            return
+        num_reqs = self.input_batch.num_reqs
+        width = self.num_spec_tokens
+        # Fixed [num_reqs, num_spec] shape the receivers allocate. Pad missing
+        # slots with 0 (a valid token id) rather than -1, so a shape mismatch
+        # can never trip the embedding bounds check on rank 0.
+        out = torch.zeros((num_reqs, width), dtype=torch.int32, device=self.device)
+        draft = self._draft_token_ids
+        if isinstance(draft, torch.Tensor) and draft.dim() == 2:
+            d = draft.to(torch.int32)
+            r = min(d.shape[0], num_reqs)
+            c = min(d.shape[1], width)
+            out[:r, :c] = d[:r, :c]
+        torch.distributed.broadcast(out, src=pp.rank, group=pp.device_group)
+
+    def _pp_receive_draft_token_ids(self) -> None:
+        """Receive the draft token ids broadcast from the last PP stage and
+        stash them in ``self._draft_token_ids`` so the next step's
+        ``_prepare_input_ids`` scatters them into rank 0's (the embedding
+        rank's) input at the spec positions. Paired with
+        ``_pp_broadcast_draft_token_ids``.
+        """
+        pp = get_pp_group()
+        assert not pp.is_last_rank
+        if self._is_all_reqs_chunked_prefill():
+            return
+        num_reqs = self.input_batch.num_reqs
+        width = self.num_spec_tokens
+        recv = torch.empty((num_reqs, width), dtype=torch.int32, device=self.device)
+        torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
+        self._draft_token_ids = recv
+
+    def _pp_share_draft_embed_tokens(self) -> None:
+        """Copy the target model's input embedding from the first PP rank into
+        the MTP drafter on the last PP rank (one-time, at load).
+
+        vLLM's `_maybe_share_embeddings` only shares the target embedding with
+        the draft when `pp_world_size == 1`. Under PP the target's
+        `embed_tokens` lives on the first rank while the drafter lives on the
+        last rank, so the share is skipped -- and DeepSeek-V4 checkpoints ship
+        no `mtp.*` embedding weight, so the drafter's `embed_tokens` is left
+        zero/uninitialized. The draft then embeds every token as garbage,
+        ignores the actual previous token and accepts ~0% of its drafts.
+        Broadcasting the embedding restores single-GPU acceptance.
+        """
+        pp = get_pp_group()
+        if pp.world_size <= 1:
+            return
+        # Locate the target embedding (only materialized on the first rank).
+        src_emb = None
+        if pp.is_first_rank:
+            inner = getattr(self.model, "model", None)
+            emb = getattr(inner, "embed_tokens", None)
+            src_emb = getattr(emb, "weight", None)
+        # Broadcast [rows, cols] first so every rank allocates a matching
+        # buffer.
+        shape_t = torch.zeros(2, dtype=torch.int64, device=self.device)
+        if src_emb is not None:
+            shape_t[0], shape_t[1] = src_emb.shape[0], src_emb.shape[1]
+        torch.distributed.broadcast(shape_t, src=pp.first_rank, group=pp.device_group)
+        rows, cols = int(shape_t[0].item()), int(shape_t[1].item())
+        if rows == 0 or cols == 0:
+            logger.warning(
+                "MTP+PP embed share: target embed_tokens not found; skipping "
+                "(draft acceptance will be degraded)."
+            )
+            return
+        dtype = self.model_config.dtype
+        if src_emb is not None:
+            buf = src_emb.detach().to(device=self.device, dtype=dtype).contiguous()
+        else:
+            buf = torch.empty((rows, cols), dtype=dtype, device=self.device)
+        torch.distributed.broadcast(buf, src=pp.first_rank, group=pp.device_group)
+        if pp.is_last_rank and hasattr(self, "drafter"):
+            draft_model = getattr(self.drafter, "model", None)
+            inner = getattr(draft_model, "model", None)
+            dst = getattr(inner, "embed_tokens", None)
+            dst_w = getattr(dst, "weight", None)
+            if dst_w is None:
+                logger.warning(
+                    "MTP+PP embed share: drafter embed_tokens missing; skipping."
+                )
+                return
+            if dst_w.shape != buf.shape:
+                logger.warning(
+                    "MTP+PP embed share: shape mismatch draft=%s target=%s; skip.",
+                    list(dst_w.shape),
+                    list(buf.shape),
+                )
+                return
+            dst_w.data.copy_(buf)
+            logger.info(
+                "MTP+PP: copied target embed_tokens -> drafter %s (abs=%.2f)",
+                list(buf.shape),
+                float(buf.float().abs().sum()),
+            )
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
@@ -5432,6 +5643,22 @@ class GPUModelRunner(
                             spec_config.draft_model_config,
                         )
                         eplb_models += 1
+
+                # MTP + PP: the drafter's input embedding cannot be shared
+                # with the target (target embed_tokens is on the FIRST PP
+                # rank, the drafter on the LAST), and vLLM only shares
+                # embeddings when pp_world_size == 1 -> the drafter's
+                # embed_tokens stays zero/uninitialized (DeepSeek-V4
+                # checkpoints carry no mtp.* embedding), the draft embeds
+                # every token as garbage and accepts ~0% of its drafts.
+                # Broadcast the target embedding (first rank) into the drafter
+                # (last rank). Collective: every rank must reach this
+                # (config-gated).
+                if (
+                    self.speculative_config is not None
+                    and get_pp_group().world_size > 1
+                ):
+                    self._pp_share_draft_embed_tokens()
 
                 self._setup_eagle3_aux_hidden_state_outputs()
 
@@ -6193,7 +6420,8 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
+            # The drafter lives on the last PP rank only.
+            if self.speculative_config and get_pp_group().is_last_rank and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
@@ -7099,8 +7327,9 @@ class GPUModelRunner(
         # because some of them change the threshold at init time.
         self.calculate_reorder_batch_threshold()
 
-        # Initialize drafter attention backend
-        if self.speculative_config and (
+        # Initialize drafter attention backend (drafter lives on the last PP
+        # rank only).
+        if self.speculative_config and get_pp_group().is_last_rank and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
         ):
@@ -7153,7 +7382,8 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
+        # The drafter lives on the last PP rank only.
+        if self.speculative_config and get_pp_group().is_last_rank and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_extract_hidden_states()
         ):

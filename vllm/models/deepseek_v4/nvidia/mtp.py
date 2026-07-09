@@ -40,6 +40,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
+from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.models.deepseek_v4.common.ops import (
     fused_mtp_input_rmsnorm,
@@ -257,7 +258,12 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         return logits
 
 
-class DeepSeekV4MTP(nn.Module):
+class DeepSeekV4MTP(nn.Module, SupportsPP):
+    # The MTP drafter runs whole on the last PP rank (it consumes the target's
+    # local last-rank hidden state); it is never pipeline-split and never
+    # exchanges IntermediateTensors. Declaring SupportsPP only satisfies the
+    # generic verify_with_parallel_config gate so pipeline_parallel_size > 1 is
+    # allowed with MTP speculative decoding.
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
