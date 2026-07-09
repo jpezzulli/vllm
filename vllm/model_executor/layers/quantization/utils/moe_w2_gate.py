@@ -34,7 +34,16 @@ Env knobs:
                            0.70-0.80 for more recall once a functional eval confirms
                            the FP4 upgrades are correct; lower to 0.50 if marginal.
   VLLM_MOE_W2_GATE_MAX_PROMOTE  cap experts force-promoted per fired step
-                                (0 = unlimited, default).
+                                (default 64; 0 = unlimited). The cap bounds
+                                the fire cost: each promote is a synchronous
+                                H2D plane copy, and deep/wide models route
+                                600+ (layer, expert) pairs per step (GLM-5.2:
+                                unlimited fires measured 200-1400 promotes =
+                                up to ~6 GiB H2D and a 56->3 tok/s collapse;
+                                64 caps it at ~0.3 GiB). Most-needed experts
+                                are promoted first, and promotions persist,
+                                so repeated fires still converge to FP4
+                                coverage of the hard set.
   VLLM_MOE_W2_GATE_TRACE   0 (default) | 1 log each fire/re-forward.
 """
 
@@ -50,7 +59,7 @@ _ENABLED = os.getenv("VLLM_MOE_W2_GATE", "0") == "1"
 _SIGNAL = os.getenv("VLLM_MOE_W2_GATE_SIGNAL", "max_prob")
 _DEFAULT_TAU = {"max_prob": 0.60, "margin": 1.5}
 _TAU = float(os.getenv("VLLM_MOE_W2_GATE_TAU", str(_DEFAULT_TAU.get(_SIGNAL, 0.60))))
-_MAX_PROMOTE = int(os.getenv("VLLM_MOE_W2_GATE_MAX_PROMOTE", "0"))
+_MAX_PROMOTE = int(os.getenv("VLLM_MOE_W2_GATE_MAX_PROMOTE", "64"))
 _TRACE = os.getenv("VLLM_MOE_W2_GATE_TRACE", "0") == "1"
 # Measurement mode: on a fired step, COUNT routed experts (delta._need) instead of
 # promoting/re-forwarding -> study whether 2-bit difficulty concentrates on few

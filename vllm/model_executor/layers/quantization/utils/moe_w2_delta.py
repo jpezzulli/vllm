@@ -358,39 +358,60 @@ class DeltaTier:
             self._log_summary()
             self._last_summary_tick = self._tick
 
-    def _take_slot(self, seen_set):
-        if self._free:
-            return self._free.pop()
-        # evict the least-valuable slot not active this window: least-frequently
-        # used (freq policy) or coldest last-seen (lru). Both restrict to slots
-        # cold >= 2 ticks so in-flight graph reads never hit a rewritten slot.
-        best, best_key = None, None
-        for s, (li, ei, t) in enumerate(self._owner):
-            if (li, ei) in seen_set or self._tick - t < 2:
-                continue
-            # need: evict the LEAST-needed expert (smallest gate-flag score) so the
-            # pool retains the experts 2-bit most struggles with. freq: least-freq.
-            # lru: coldest last-seen.
-            if _POLICY == "need":
-                key = float(self._need[li, ei])
-            elif _POLICY == "freq":
-                key = float(self._freq[li, ei])
-            else:
-                key = t
-            if best_key is None or key < best_key:
-                best, best_key = s, key
-        if best is None:
-            return None
-        li, ei, t = self._owner[best]
-        # unmap FIRST (graphs stop dispatching w4 before bytes change)
-        self.slot_table[li, ei] = -1
-        self._mirror[li, ei] = -1
-        self._n_evicted += 1
-        self._win_evicted += 1
-        if _TRACE >= 2:
-            logger.info("[delta] evict   L%-2d E%-3d  slot %-4d (cold %d ticks)",
-                        li, ei, best, self._tick - t)
-        return best
+    def _take_slots_batch(self, k: int) -> list[int]:
+        """Take up to k slots (lock held by caller): free list first, then ONE
+        vectorized eviction pass over all slots. Replaces the old per-slot
+        python scan per promotion — O(n_slots) per TAKEN slot — which at GLM
+        scale (4k slots x hundreds of gate promotions per fire) burned seconds
+        of GIL time per fired step and starved the forward thread.
+
+        Eviction policy is unchanged: least-valuable slot by _POLICY key
+        (need / freq / lru), restricted to slots whose owner is not active in
+        the current seen window (read directly from the _seen_host snapshot —
+        the call sites always passed a set built from exactly that) and cold
+        >= 2 ticks, so in-flight graph reads never hit a rewritten slot.
+        Victims are unmapped here (graphs stop dispatching w4 before bytes
+        change); the caller reserves _owner for each returned slot."""
+        out: list[int] = []
+        while self._free and len(out) < k:
+            out.append(self._free.pop())
+        k_evict = k - len(out)
+        if k_evict <= 0:
+            return out
+        li = torch.tensor([o[0] for o in self._owner], dtype=torch.long)
+        ei = torch.tensor([o[1] for o in self._owner], dtype=torch.long)
+        tk = torch.tensor([o[2] for o in self._owner], dtype=torch.float64)
+        lic, eic = li.clamp(min=0), ei.clamp(min=0)
+        if _POLICY == "need":
+            key = self._need[lic, eic].double()
+        elif _POLICY == "freq":
+            key = self._freq[lic, eic].double()
+        else:
+            key = tk.clone()
+        ineligible = (li < 0) | ((self._tick - tk) < 2)
+        # owner active in the current window -> not evictable
+        ineligible |= self._seen_host[lic, eic].to(torch.bool)
+        key[ineligible] = float("inf")
+        take = min(k_evict, int((~ineligible).sum()))
+        if take > 0:
+            victims = torch.topk(key, take, largest=False).indices.tolist()
+            for s in victims:
+                vli, vei, vt = self._owner[s]
+                self.slot_table[vli, vei] = -1
+                self._mirror[vli, vei] = -1
+                self._n_evicted += 1
+                self._win_evicted += 1
+                if _TRACE >= 2:
+                    logger.info(
+                        "[delta] evict   L%-2d E%-3d  slot %-4d (cold %d ticks)",
+                        vli, vei, s, self._tick - vt)
+                out.append(s)
+        return out
+
+    def _take_slot(self, seen_set=None):
+        """Single-slot wrapper (kept for the unit tests / external callers)."""
+        slots = self._take_slots_batch(1)
+        return slots[0] if slots else None
 
     def _promote(self, li, ei, slot):
         with torch.cuda.stream(self._stream):
@@ -449,6 +470,14 @@ class DeltaTier:
         seen = self._seen_host.nonzero()
         if seen.numel() == 0:
             return 0
+        # Bound the working set to RECENT steps: `seen` otherwise accumulates
+        # up to 4 manager ticks of routings (the manager zeroes it lazily), so
+        # on deep/wide models a single fire tried to force-promote every
+        # expert routed in the whole window (GLM-5.2: 75 layers x top-8 ->
+        # 600+/step, measured 200-1400 per fire = up to ~6 GiB synchronous
+        # H2D). Zeroing after the snapshot is the manager's own idiom; a flag
+        # lost to the in-flight scatter race only delays a lazy promotion.
+        self.seen.zero_()
         layer_filter = set(layers) if layers is not None else None
         with self._lock:
             seen_set = set()
@@ -476,20 +505,16 @@ class DeltaTier:
                 cand = [cand[i] for i in order.tolist()]
             if max_promote is not None:
                 cand = cand[:max_promote]
-            # take slots (default stream: evictions unmap on the forward stream),
-            # issue all copies on the side stream, then a SINGLE sync before
-            # mapping — bytes resident before any graph replay can read them.
+            # take ALL slots in one vectorized batch (evictions unmap on the
+            # forward stream), issue all copies on the side stream, then a
+            # SINGLE sync before mapping — bytes resident before any graph
+            # replay can read them. The batch returns distinct slots, and each
+            # gets its _owner reserved before the copies, so a concurrent
+            # manager tick can never hand one of them out again (two experts
+            # -> one slot -> pool corruption; see the force_promote history).
+            slots = self._take_slots_batch(len(cand))
             plan = []
-            for li, ei in cand:
-                slot = self._take_slot(seen_set)
-                if slot is None:
-                    break  # pool full of hot/in-flight slots; promote what we can
-                # RESERVE the slot's owner IMMEDIATELY: _take_slot's eviction
-                # scans _owner for victims, so without this a later iteration in
-                # THIS loop could hand out the same just-taken slot again (two
-                # experts -> one slot -> one reads the other's weights -> pool
-                # corruption). Owner tick == current tick also cold-protects it.
-                # GPU slot_table/_mirror writes stay deferred until after the sync.
+            for (li, ei), slot in zip(cand, slots):
                 self._owner[slot] = (li, ei, self._tick)
                 with torch.cuda.stream(self._stream):
                     self.pool[slot].copy_(self._host[li][ei], non_blocking=True)
