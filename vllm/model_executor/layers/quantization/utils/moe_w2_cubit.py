@@ -885,14 +885,18 @@ def _moe_w2_forward_timed(
     if tier is not None and not prefill:
         _launch("w4", st["K2"], d[3], st["N2"], pairs, stream)
 
-    # ---- weighted unpermute (pad slots masked out).
-    # NOTE (determinism): index_add_ scatters with atomics, so the f32
-    # accumulation order varies run-to-run — identical PREFILLS wobble by
-    # ~1e-2 abs (measured; decode's contention is low enough to be stable in
-    # practice). Pre-existing behavior, kept: a deterministic unpermute
-    # (bijective index_copy into [T*top_k, H] + fixed-order reduce) is the
-    # candidate fix but changes a hot validated path — see the PP-determinism
-    # investigation notes before touching this.
+    # ---- weighted unpermute (pad slots masked out), DETERMINISTIC.
+    # The old `out.index_add_(0, rows, c2*w)` scattered with atomics, so the
+    # f32 accumulation ORDER varied run-to-run: identical inputs wobbled by
+    # up to ~1.6e-2 abs on prefill, and single-token probes produced a small
+    # set of bit-distinct logit variants — the root cause of the "greedy
+    # decode is not reproducible" investigation (PP_DETERMINISM.md; it was
+    # never PP-specific). Deterministic scheme: every VALID slot owns a
+    # unique (token, j) coordinate (valid sorted_ids are a permutation of
+    # token*top_k + j), so index_copy_ into [T*top_k (+1 dump row), H] has no
+    # write collisions except filler slots, which all target the discarded
+    # dump row. The final sum(dim=1) reduces top_k in a fixed order.
+    # Static shapes + no host branches -> cudagraph-capture-safe.
     w = topk_weights.reshape(-1)[sorted_ids.clamp(max=T * top_k - 1)]
     w = torch.where(valid, w, torch.zeros_like(w)).to(torch.float32)
     if miss_rows is not None:
@@ -900,10 +904,12 @@ def _moe_w2_forward_timed(
         # (their GEMMs early-EXITed) — zero their scatter weight so a miss
         # contributes exactly nothing (the replay recomputes them properly).
         w = w * miss_rows.to(torch.float32)
-    out = torch.zeros(T, H, dtype=torch.float32, device=dev)
-    out.index_add_(0, rows.clamp(max=T - 1),
-                   ws["c2"][:slots].float() * w.unsqueeze(1))
-    return out.to(x.dtype)
+    dump = T * top_k                       # collision row for filler slots
+    dst = torch.where(valid, sorted_ids,
+                      torch.full_like(sorted_ids, dump)).long()
+    gath = torch.zeros(dump + 1, H, dtype=torch.float32, device=dev)
+    gath.index_copy_(0, dst, ws["c2"][:slots].float() * w.unsqueeze(1))
+    return gath[:dump].view(T, top_k, H).sum(dim=1).to(x.dtype)
 
 
 def _moe_w2_forward_fake(
