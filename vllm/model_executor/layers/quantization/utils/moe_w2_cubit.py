@@ -20,7 +20,7 @@ Opt-in via VLLM_MOE_W2=1. Replaces the stock routed-expert GEMM path:
 
 VRAM: planes+scales ~1.73 GiB/layer (vs ~3.2 GiB raw fp4) -> 43 layers fit
 a single 96 GB SM120 board together with the fp8 dense stack and KV.
-The MTP drafter keeps its original (Marlin) path: layer names containing
+The MTP drafter keeps the stock DeepGEMM-MXFP4 path: layer names containing
 "mtp" are excluded, matching the QUANT_PROBE protocol (drafter unmodified).
 """
 
@@ -61,12 +61,14 @@ def _nwarp_for_k(k: int) -> int:
 _cu = None
 _fns: dict = {}
 _state = "uninit"
-# PREFILL LEVER (opt-in, default OFF): fragment-major activations so each lane's
-# m16k32 QMMA A-fragment loads in ONE LDG.128 (vs 8 strided 4-byte loads). Profile
-# showed prefill moe_w2_mm is L1/load-issue bound (NOT weight-DRAM bound), so this
-# cuts the dominant load class ~4x at identical occupancy -> ~1.3x prefill GEMM.
-# Numerics are bit-identical to mc4. Needs moe_w2_mm_mc4afrag_k{K}.cubin present.
-_AFRAG = os.getenv("VLLM_MOE_W2_AFRAG", "0") == "1"
+# PREFILL LEVER (default ON since the mc4afrag cubins ship): fragment-major
+# activations so each lane's m16k32 QMMA A-fragment loads in ONE LDG.128 (vs 8
+# strided 4-byte loads). Profile showed prefill moe_w2_mm is L1/load-issue bound
+# (NOT weight-DRAM bound), so this cuts the dominant load class ~4x at identical
+# occupancy -> measured 1.30x (K=4096) / 1.27x (K=2048) on the prefill GEMM.
+# Numerics are bit-identical to mc4. Needs moe_w2_mm_mc4afrag_k{K}.cubin present
+# (loader degrades to mc4 when missing). Opt out: VLLM_MOE_W2_AFRAG=0.
+_AFRAG = os.getenv("VLLM_MOE_W2_AFRAG", "1") == "1"
 _afrag_ok = False
 
 
@@ -517,11 +519,49 @@ def _workspaces(slots: int, tokens: int, dev, inter: int = 2048,
                              device=dev),
             no_slots=torch.full((256,), -1, dtype=torch.int32, device=dev),
         )
+        if _afrag_ok:
+            # AFRAG destination buffers: the triton repack streams row-major
+            # a1/a2 into these (single pass, no copy-back); the desc tables
+            # point the GEMM at them instead of a1/a2.
+            _WS.update(
+                a1f=torch.zeros(slots + 4, hidden, dtype=torch.float8_e4m3fn,
+                                device=dev),
+                a2f=torch.zeros(slots + 4, inter, dtype=torch.float8_e4m3fn,
+                                device=dev),
+            )
     return _WS
 
 
 import triton
 import triton.language as tl
+
+
+@triton.jit
+def _afrag_repack_kernel(src_ptr, dst_ptr, K: tl.constexpr):
+    """Row-major fp8 [pairs*16, K] -> AFRAG fragment-major, single pass.
+
+    One program = one (pair, j=k64) 16-row x 64-byte block = 256 u32 words;
+    the permutation [pair, g2, g, j, quad, t, b] -> [pair, j, g, t, quad, g2, b]
+    lands each program's words in one contiguous 1 KiB dst run. Bit-identical
+    to _to_fragment_major (validated), ~3x faster than the torch permute+copy
+    and needs no intermediate tensor."""
+    p = tl.program_id(0)
+    j = tl.program_id(1)
+    w = tl.arange(0, 256)
+    g2 = w & 1
+    quad = (w >> 1) & 3
+    t = (w >> 3) & 3
+    g = (w >> 5) & 7
+    src_off = (p * 16 + g2 * 8 + g) * (K // 4) + j * 16 + quad * 4 + t
+    dst_off = p * 16 * (K // 4) + j * 256 + w
+    tl.store(dst_ptr + dst_off, tl.load(src_ptr + src_off))
+
+
+def _afrag_repack(src: torch.Tensor, dst: torch.Tensor, pairs: int, K: int):
+    """Repack rows [:pairs*16] of `src` (fp8 row-major) into `dst` (AFRAG)."""
+    src32 = src.view(torch.uint8).view(-1).view(torch.int32)
+    dst32 = dst.view(torch.uint8).view(-1).view(torch.int32)
+    _afrag_repack_kernel[(pairs, K // 64)](src32, dst32, K=K)
 
 
 @triton.jit
@@ -671,12 +711,19 @@ def _moe_w2_forward_timed(
             moe_w2_delta.mark_seen(tier.seen[layer_key], topk_ids.view(-1).long())
         slot_row = ws["no_slots"]
         pool_ptr = ws["a1"].data_ptr()      # never dereferenced (m4=0)
+    # AFRAG (prefill): the GEMM reads fragment-major activations from the
+    # dedicated a1f/a2f buffers (filled by the single-pass triton repack
+    # below); point the desc 'a' fields there. w4 tables are decode-only,
+    # so redirecting the shared base in prefill is safe.
+    use_afrag = prefill and _afrag_ok
+    a1_base = ws["a1f"] if use_afrag else ws["a1"]
+    a2_base = ws["a2f"] if use_afrag else ws["a2"]
     d = ws["desc"]
     cap = d.shape[1]
     _desc_build_kernel[(triton.cdiv(pairs, 256),)](
         expert_blocks, num_post, slot_row, d,
-        ws["a1"].data_ptr(), ws["as1"].data_ptr(), ws["c13"].data_ptr(),
-        ws["a2"].data_ptr(), ws["as2"].data_ptr(), ws["c2"].data_ptr(),
+        a1_base.data_ptr(), ws["as1"].data_ptr(), ws["c13"].data_ptr(),
+        a2_base.data_ptr(), ws["as2"].data_ptr(), ws["c2"].data_ptr(),
         st["planes13"].data_ptr(), st["sc13"].data_ptr(),
         st["planes2"].data_ptr(), st["sc2"].data_ptr(), pool_ptr,
         st["planes13"].shape[1], st["sc13"].shape[1],
@@ -692,20 +739,17 @@ def _moe_w2_forward_timed(
         st["E"], pairs, cap * 6, mblock, BLOCK=256)
 
     # ---- w13 GEMMs (both tiers) -> fused silu*up -> quant -> w2 GEMMs
-    # AFRAG prefill: repack the activation to fragment-major in-place (desc 'a'
-    # pointers are unchanged -- only the per-tile byte order differs) so the GEMM
-    # loads each m16k32 A-fragment in one LDG.128. Numerics bit-identical to mc4.
-    use_afrag = prefill and _afrag_ok
+    # AFRAG prefill: single-pass triton repack row-major a1/a2 -> fragment-major
+    # a1f/a2f (desc built against a1f/a2f above) so the GEMM loads each m16k32
+    # A-fragment in one LDG.128. Numerics bit-identical to mc4.
     w2tier = ("w2mc4afrag" if use_afrag else "w2mc4") if prefill else "w2"
     # AFRAG repacks COMPLETE 16-row tiles. `slots` is moe_align's OVER-ALLOCATED
     # row count (sorted_ids.numel() = topk*T + E*15), NOT a multiple of 16; the
     # desc/kernel only ever touch the first `pairs*16` rows (num_post <= pairs*16),
     # so repack exactly that tile-aligned region. Rows [pairs*16:slots] are unused
-    # filler (left untouched, never read). Capacity is fine: pairs*16 <= slots <=
-    # a1.shape[0]-4. (Row-major `[:slots]` here would mis-shape -> hard crash.)
-    n_af = pairs * 16
+    # filler (never read). Capacity is fine: pairs*16 <= slots <= a1.shape[0]-4.
     if use_afrag:
-        ws["a1"][:n_af].copy_(_to_fragment_major(ws["a1"][:n_af], pairs, st["K13"]))
+        _afrag_repack(ws["a1"], ws["a1f"], pairs, st["K13"])
     _launch(w2tier, st["K13"], d[0], st["N13"], pairs, stream)
     if tier is not None and not prefill:
         _launch("w4", st["K13"], d[2], st["N13"], pairs, stream)
@@ -714,7 +758,7 @@ def _moe_w2_forward_timed(
     _, qs2 = per_token_group_quant_fp8(act, 128, out_q=ws["a2"][:slots])
     ws["as2"][:slots] = qs2
     if use_afrag:
-        ws["a2"][:n_af].copy_(_to_fragment_major(ws["a2"][:n_af], pairs, st["K2"]))
+        _afrag_repack(ws["a2"], ws["a2f"], pairs, st["K2"])
     _launch(w2tier, st["K2"], d[1], st["N2"], pairs, stream)
     if tier is not None and not prefill:
         _launch("w4", st["K2"], d[3], st["N2"], pairs, stream)
