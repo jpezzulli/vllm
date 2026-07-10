@@ -250,6 +250,57 @@ def _stage_fp4_host(tier, layer_key: int, fp13, sc13, fp2, sc2) -> None:
         tier.add_layer_host_planes(layer_key, fp13, fp2)
 
 
+def _try_skip_requant(layer, layer_key: int, E: int, N13: int, K13: int,
+                      N2: int, K2: int, param_names) -> bool:
+    """Boot-from-pack: when every host store this config serves from already
+    holds this layer's rows (valid pack written by a previous boot), the
+    dequant->requant of the checkpoint experts produces bytes NOBODY reads —
+    the base planes live in the pack, and so do the FP4 need-pool sections.
+    Skip it: register the layer's slot-layout metadata and the param stubs
+    exactly as _finish_layer's base path would, and let the tiers serve
+    from the pack. On GLM the requant is the dominant boot cost (NVFP4 ->
+    f64 -> 2-bit, hundreds of GiB of transients); with the pack it reduces
+    to open+read.
+
+    Only applies over the base cache (base_enabled): the GPU-resident plane
+    path needs the planes materialized regardless. A PinnedHostStore never
+    contains layers at boot -> configs without VLLM_MOE_W2_STORE_DIR are
+    untouched. Layers absent from the pack (e.g. the MTP drafter, or a
+    partially written pack) requant as before. When the FP4 tier is enabled
+    but ITS pack misses the layer, we also requant (the fp4 sections can
+    only be rebuilt from the checkpoint bytes)."""
+    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+    if not moe_w2_delta.base_enabled():
+        return False
+    dev = torch.device("cuda")
+    c13len, s13len = N13 * K13 // 4, N13 * K13 // 32
+    c2len, s2len = N2 * K2 // 4, N2 * K2 // 32
+    btier = moe_w2_delta.get_base_tier(
+        _layer_cutoff() + 1, E, dev,
+        w13_bytes=c13len + s13len, w2_bytes=c2len + s2len)
+    if layer_key not in btier._store:
+        return False
+    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
+    if tier is not None and layer_key not in tier._store:
+        return False
+    _LAYERS[layer_key] = dict(
+        N13=N13, K13=K13, N2=N2, K2=K2, E=E, base=True,
+        off_s13=c13len, off_c2=c13len + s13len,
+        off_s2=c13len + s13len + c2len,
+        off4_s13=2 * c13len, off4_c2=2 * c13len + s13len,
+        off4_s2=2 * c13len + s13len + 2 * c2len,
+    )
+    stub = torch.empty(0, dtype=torch.uint8, device=dev)
+    for name in param_names:
+        layer.register_parameter(
+            name, torch.nn.Parameter(stub, requires_grad=False))
+    logger.info(
+        "moe_w2: layer %d requant SKIPPED — %s serving from pack "
+        "(boot-from-pack)", layer_key,
+        "base+fp4" if tier is not None else "base")
+    return True
+
+
 def build_layer_planes(layer, layer_key: int) -> None:
     """Quantize one FusedMoE layer's experts to 2-bit planes (GPU, chunked).
 
@@ -268,6 +319,10 @@ def build_layer_planes(layer, layer_key: int) -> None:
     K13, K2 = N2, N13 // 2               # H, I (4096/2048 on DS4-Flash TP1)
     from vllm.model_executor.layers.quantization.utils import moe_w2_delta
     _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
+    if _try_skip_requant(layer, layer_key, E, N13, K13, N2, K2,
+                         ("w13_weight", "w13_weight_scale", "w2_weight",
+                          "w2_weight_scale")):
+        return
 
     planes13 = torch.empty(E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
     sc13 = torch.empty(E, N13 * K13 // 32, dtype=torch.uint8, device=dev)
@@ -344,6 +399,10 @@ def build_layer_planes_fp8(layer, layer_key: int,
     E, N13, K13 = w13.shape
     _, N2, K2 = w2.shape
     _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
+    if _try_skip_requant(layer, layer_key, E, N13, K13, N2, K2,
+                         ("w13_weight", f"w13_{scale_suffix}", "w2_weight",
+                          f"w2_{scale_suffix}")):
+        return
 
     planes13 = torch.empty(E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
     sc13 = torch.empty(E, N13 * K13 // 32, dtype=torch.uint8, device=dev)
@@ -422,6 +481,10 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
     K2 = K2h * 2
     group = K13 // s13.shape[2]                 # 16 for NVFP4
     _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
+    if _try_skip_requant(layer, layer_key, E, N13, K13, N2, K2,
+                         ("w13_weight", "w13_weight_scale", "w2_weight",
+                          "w2_weight_scale")):
+        return
 
     planes13 = torch.empty(E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
     sc13 = torch.empty(E, N13 * K13 // 32, dtype=torch.uint8, device=dev)
@@ -896,6 +959,16 @@ def _moe_w2_forward_timed(
             # the gate's force_promote reads the FP4 tier's own seen scatter
             moe_w2_delta.mark_seen(tier.seen[layer_key],
                                    topk_ids.view(-1).long())
+        if not prefill and btier.route_log is not None:
+            # per-(token,layer) routing log for the draft-prefetch predictor:
+            # a static [n_layers, T_cap, k_cap] buffer the runner reads back
+            # post-step (~KBs). In-graph safe: fixed shapes per captured
+            # size, static destination. Rows beyond this step's real token
+            # count hold stale ids — the host slices by the true T.
+            _t = min(topk_ids.shape[0], btier.route_log.shape[1])
+            _k = min(topk_ids.shape[1], btier.route_log.shape[2])
+            btier.route_log[layer_key, :_t, :_k].copy_(
+                topk_ids[:_t, :_k], non_blocking=True)
         if layer_key == 0:
             # per-step counter reset, in-graph (layer 0 runs first each step)
             btier.miss_count.zero_()
