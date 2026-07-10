@@ -590,6 +590,13 @@ def make_store(tag: str, n_layers: int, n_experts: int, slot_bytes: int,
     (plus a pinned arena for the BASE tier when VLLM_MOE_W2_BASE_RAM_GB
     is set), else the classic pinned/pageable host store. Env read at call
     time so tests can toggle backends without reimporting the module."""
+    if os.getenv("VLLM_MOE_W2_BASE_NVME_RATIO", "").strip():
+        logger.error(
+            "VLLM_MOE_W2_BASE_NVME_RATIO (the RAM:NVMe interleaved-split "
+            "experiment, moe_w2_nvme) is superseded by the pack store and "
+            "IGNORED. Equivalent config: VLLM_MOE_W2_STORE_DIR=<dir> + "
+            "VLLM_MOE_W2_BASE_RAM_GB=<pinned GiB> (the arena fraction is "
+            "the RAM share; it also persists quantization across boots).")
     dir_ = os.getenv("VLLM_MOE_W2_STORE_DIR", "").strip()
     if not dir_:
         return PinnedHostStore(slot_bytes, pinned=pinned)

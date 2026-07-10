@@ -97,14 +97,21 @@ def enabled() -> bool:
 @functools.cache
 def _layer_cutoff() -> int:
     """Main-stack layer count: layers >= this are the MTP drafter. Taken from
-    the model config when available (43 for DS4-Flash, 78 for GLM-5.2);
-    VLLM_MOE_W2_NUM_LAYERS overrides."""
+    the model config when available (43 for DS4-Flash, 78 for GLM-5.2, 61 for
+    Kimi-K2.7); VLLM_MOE_W2_NUM_LAYERS overrides.
+
+    get_text_config() unwraps composite VLM configs (KimiK25Config keeps
+    num_hidden_layers on .text_config; a bare hf_config lookup would raise
+    and silently fall back to 43, sending layers 43+ down the stock path);
+    for text-only configs it returns self."""
     v = os.getenv("VLLM_MOE_W2_NUM_LAYERS")
     if v is not None:
         return int(v)
     try:
         from vllm.config import get_current_vllm_config
-        n = get_current_vllm_config().model_config.hf_config.num_hidden_layers
+        cfg = get_current_vllm_config().model_config.hf_config
+        cfg = cfg.get_text_config()
+        n = cfg.num_hidden_layers
         if n:
             return int(n)
     except Exception:  # noqa: BLE001
@@ -162,11 +169,11 @@ def _ensure_ready() -> bool:
         for tier, kern in (("w2", b"moe_w2_mm"), ("w4", b"moe_w4_mm"),
                            ("w2mc2", b"moe_w2_mm"), ("w2mc4", b"moe_w2_mm")):
             # GEMM contraction K: gate-up needs K=hidden (4096 DS4-Flash,
-            # 6144 GLM-5.x); down needs K=I/TP (2048 @ TP1, 1024 @ TP2,
-            # 512 @ TP4). Cubins are loaded opportunistically -- the plane
-            # builders assert the shapes the model actually needs are present
-            # (_assert_kernels fails loudly at weight load).
-            for k in (6144, 4096, 2048, 1024, 512):
+            # 6144 GLM-5.x, 7168 Kimi-K2.x); down needs K=I/TP (2048 @ TP1,
+            # 1024 @ TP2, 512 @ TP4). Cubins are loaded opportunistically --
+            # the plane builders assert the shapes the model actually needs
+            # are present (_assert_kernels fails loudly at weight load).
+            for k in (7168, 6144, 4096, 2048, 1024, 512):
                 if tier in ("w2mc2", "w2mc4"):
                     fname = f"moe_w2_mm_{tier[2:]}_k{k}.cubin"
                 else:
@@ -184,7 +191,7 @@ def _ensure_ready() -> bool:
         global _afrag_ok
         if _AFRAG:
             try:
-                for k in (6144, 4096, 2048, 1024, 512):
+                for k in (7168, 6144, 4096, 2048, 1024, 512):
                     path = os.path.join(_DIR, f"moe_w2_mm_mc4afrag_k{k}.cubin")
                     if not os.path.exists(path):
                         continue
@@ -486,12 +493,42 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
                           "w2_weight_scale")):
         return
 
+    # Planes cache (VLLM_MOE_W2_PLANES_CACHE): the requant below is
+    # deterministic given (checkpoint, TP layout, zero mode), so cached
+    # planes can be streamed back instead of rebuilt (~9 min saved on
+    # Kimi-K2.7 restarts). Complements the pack store's boot-from-pack
+    # above: the cache serves GPU-RESIDENT plane configs (planes must be
+    # materialized), the pack store serves host-resident tiers (planes
+    # never materialize). CPU tensors from the cache feed the same
+    # _stage_fp4_host/_finish_layer sinks (their copy_ calls are
+    # device-agnostic).
+    from vllm.model_executor.layers.quantization.utils import (
+        moe_w2_planes_cache as planes_cache)
+    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
+    lidx = planes_cache.layer_idx_from_name(getattr(layer, "layer_name", ""))
+    if planes_cache.enabled() and lidx is not None:
+        cached = planes_cache.try_load(lidx, planes_cache.expected_sizes(
+            E, N13, K13, N2, K2, want_fp4=tier is not None))
+        if cached is not None:
+            planes13 = cached["planes13"].view(E, -1).to(dev)
+            sc13 = cached["sc13"].view(E, -1).to(dev)
+            planes2 = cached["planes2"].view(E, -1).to(dev)
+            sc2 = cached["sc2"].view(E, -1).to(dev)
+            if tier is not None:
+                _stage_fp4_host(tier, layer_key, cached["fp13"].view(E, -1),
+                                sc13, cached["fp2"].view(E, -1), sc2)
+            _finish_layer(layer, layer_key, dev, planes13, sc13, planes2,
+                          sc2, N13, K13, N2, K2, E,
+                          ("w13_weight", "w13_weight_scale", "w2_weight",
+                           "w2_weight_scale"))
+            logger.info("moe_w2: layer %d planes from cache", lidx)
+            return
+
     planes13 = torch.empty(E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
     sc13 = torch.empty(E, N13 * K13 // 32, dtype=torch.uint8, device=dev)
     planes2 = torch.empty(E, N2 * K2 // 4, dtype=torch.uint8, device=dev)
     sc2 = torch.empty(E, N2 * K2 // 32, dtype=torch.uint8, device=dev)
 
-    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
     fp13 = fp2 = None
     if tier is not None:
         fp13 = torch.empty(E, N13 * K13 // 2, dtype=torch.uint8, device=dev)
@@ -526,6 +563,11 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
             sc2[e0 + i] = pack_scales(sbytes)
             if fp2 is not None:
                 fp2[e0 + i] = pack_fp4_fragment_major(nib)
+
+    if planes_cache.enabled() and lidx is not None:
+        planes_cache.store(lidx, dict(planes13=planes13, sc13=sc13,
+                                      planes2=planes2, sc2=sc2,
+                                      fp13=fp13, fp2=fp2))
 
     if tier is not None:
         _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
@@ -594,7 +636,7 @@ def _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
 # --------------------------------------------------------------------------
 
 def _workspaces(slots: int, tokens: int, dev, inter: int = 2048,
-                hidden: int = 4096) -> dict:
+                hidden: int = 4096, n_experts: int = 256) -> dict:
     # `inter` = per-rank expert intermediate size I (2048 on 1 GPU; 1024 @ TP2,
     # 512 @ TP4 as the experts shard). The hidden H (4096 DS4, 6144 GLM-5.x) is
     # NOT sharded, so the A-side (a1), x-quant (xq) and w2 output (c2) buffers
@@ -602,14 +644,17 @@ def _workspaces(slots: int, tokens: int, dev, inter: int = 2048,
     # activation (act/a2 = I) and its group-128 scales (as2 = I/128) follow the
     # shard.
     if (_WS.get("slots", 0) < slots or _WS.get("tokens", 0) < tokens
-            or _WS.get("inter") != inter or _WS.get("hidden") != hidden):
+            or _WS.get("inter") != inter or _WS.get("hidden") != hidden
+            or _WS.get("n_experts", 0) < n_experts):
         slots = max(slots, _WS.get("slots", 0))
         tokens = max(tokens, _WS.get("tokens", 0))
+        n_experts = max(n_experts, _WS.get("n_experts", 0))
         _WS.update(
             slots=slots,
             tokens=tokens,
             inter=inter,
             hidden=hidden,
+            n_experts=n_experts,
             # token-side quant buffers; the LAST row is the permanent zero
             # pad row (gather source for filler slots) — quant only ever
             # writes rows [:T].
@@ -635,7 +680,11 @@ def _workspaces(slots: int, tokens: int, dev, inter: int = 2048,
                            device=dev),
             desc=torch.empty(4, slots // _BLOCK, 6, dtype=torch.int64,
                              device=dev),
-            no_slots=torch.full((256,), -1, dtype=torch.int32, device=dev),
+            # -1 slot row for the tier-less desc path; sized to the MODEL's
+            # expert count (256 = DS4 default; 384 Kimi-K2.x reads past a
+            # fixed 256-row table).
+            no_slots=torch.full((max(n_experts, 256),), -1,
+                                dtype=torch.int32, device=dev),
         )
         if _afrag_ok:
             # AFRAG destination buffers: the triton repack streams row-major
@@ -910,7 +959,8 @@ def _moe_w2_forward_timed(
     # st["K2"] = per-rank expert intermediate I (w2 contraction), st["K13"] =
     # hidden H (w13 contraction) -> size the workspaces for the model's shapes
     # (and correctly under tensor parallelism).
-    ws = _workspaces(slots, T, dev, inter=st["K2"], hidden=st["K13"])
+    ws = _workspaces(slots, T, dev, inter=st["K2"], hidden=st["K13"],
+                     n_experts=st["E"])
 
     # ---- activation quant (group-128) into the padded buffer; the buffer's
     # last row is the permanent zero pad row for filler slots.

@@ -116,6 +116,19 @@ def _f64_to_codes_scales(
     per-block-32 UE8M0 scale along K -> e2m1 snap -> tensor-sym {-4,-1,1,4}
     via _NIBBLE_TO_CODE. Load-time-only f64 math so midpoint comparisons and
     tie-breaks match the numpy prototype the sweep validated exactly.
+
+    ZERO-SIGN BALANCING (Kimi-K2.7-NVFP4 finding): the tensor-sym codebook
+    has no zero level, so exact zeros map to +-1 by their SIGN BIT. That is
+    unbiased only while +0/-0 are balanced (GLM/DS4 checkpoints are). The
+    modelopt INT4->BF16->NVFP4 Kimi-K2.7 export writes ALL zeros as +0
+    (~13.3% of expert mass) -> sign-preserving mapping would inject a +0.134
+    unit-space bias per tensor, 3x the asym-codebook bias that degenerates
+    GLM (tools/sweep_nvfp4_codebook.py reproduces both numbers). When a
+    tensor's exact zeros are one-signed (>95%), assign them +-1 ALTERNATING
+    by k-position parity instead: net bias ~0 (block-local cancellation),
+    identical L2 (|err| = 1 unit either way), deterministic. Balanced-zero
+    checkpoints keep the validated sign-preserving map bit-exactly.
+    VLLM_MOE_W2_ZERO_MODE={auto,sign,alt} overrides (default auto).
     """
     assert w.dtype == torch.float64
     N, K = w.shape
@@ -134,6 +147,21 @@ def _f64_to_codes_scales(
     mag = torch.bucketize(u.abs().reshape(N, K),
                           _E2M1_MID.to(w.device)).to(torch.uint8)
     neg = torch.signbit(u).reshape(N, K)
+
+    import os
+    zero_mode = os.getenv("VLLM_MOE_W2_ZERO_MODE", "auto")
+    if zero_mode != "sign":
+        zero = (u == 0.0).reshape(N, K)
+        nz = int(zero.sum())
+        if nz:
+            nneg = int(neg[zero].sum())
+            one_signed = min(nneg, nz - nneg) < 0.05 * nz
+            if zero_mode == "alt" or (zero_mode == "auto" and one_signed):
+                # k-position parity: deterministic, block-local ~balance
+                parity = (torch.arange(K, device=w.device, dtype=torch.uint8)
+                          & 1).view(1, K).expand(N, K)
+                neg = torch.where(zero, parity.bool(), neg)
+
     nibbles = mag | (neg.to(torch.uint8) << 3)
     codes = _NIBBLE_TO_CODE.to(w.device)[nibbles.long()]
     return codes, scale_bytes, (nibbles if want_nibbles else None)

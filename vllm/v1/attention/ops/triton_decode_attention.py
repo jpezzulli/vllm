@@ -530,6 +530,13 @@ def _decode_grouped_att_m_fwd(
         # like non-MLA D_QK=576, BLOCK_DMODEL=1024, BLOCK_H=16
         # exceeds 101376 bytes limit
         num_stages = 1
+    elif (not is_hip_ and BLOCK_DMODEL + BLOCK_DPE >= 576
+          and torch.cuda.get_device_capability()[0] == 12):
+        # SM12x (consumer Blackwell) has 99 KiB smem/block; the MLA 512+64
+        # tile at num_stages=2 needs 100 KiB (102400 > 101376) -> same
+        # single-stage fallback as the BLOCK_DMODEL>=1024 case above.
+        # Hit by dense-MLA models (DeepSeek-V3 dims: Kimi-K2.x) on SM120.
+        num_stages = 1
 
     _fwd_grouped_kernel_stage1[grid](
         q,

@@ -188,6 +188,7 @@ return curr_o @ W_O
 """
 
 import functools
+import os
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -1433,6 +1434,13 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
 
+        # VLLM_MLA_CHUNKED_WORKSPACE_TOKENS: cap override (in tokens) for the
+        # chunked-context workspace. Diagnostic/workaround knob for the
+        # multi-chunk context path; raising it makes contexts up to the cap
+        # single-chunk at the cost of workspace + up-projection memory.
+        workspace_cap = int(
+            os.environ.get("VLLM_MLA_CHUNKED_WORKSPACE_TOKENS", 64 * 1024)
+        )
         chunked_prefill_workspace_size = min(
             # Try for 8 full length request or at least 4 pages per-request
             max(
@@ -1447,7 +1455,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             # which would result in up-projected context being
             #   2*(192*128)*(64*1024) = 3gb
             # (assuming 192 QK head dim, 128 heads, and fp16)
-            64 * 1024,
+            workspace_cap,
         )
 
         # Enforce that we enough for at least 1 page per request

@@ -46,6 +46,19 @@ def merge_attn_states(
             When provided, output must be FP8 dtype.
     """
 
+    # Both the CUDA and Triton kernels index prefix_output AND suffix_output
+    # with a single shared head stride taken from prefix_output.stride(1).
+    # The MLA chunked-context path violates that assumption: FA2 chunk
+    # outputs are unpadded slices of padded buffers (head stride 192 for a
+    # 128-wide head), while the merged intermediate from a previous
+    # merge_attn_states call is allocated contiguous (head stride 128). With
+    # mismatched strides the suffix is read at the wrong offsets and the
+    # merged output is corrupt. Normalize to a common layout first; this is
+    # a no-op copy-wise unless the strides actually differ.
+    if prefix_output.stride() != suffix_output.stride():
+        prefix_output = prefix_output.contiguous()
+        suffix_output = suffix_output.contiguous()
+
     # NOTE(DefTruth): Currently, custom merge_attn_states CUDA kernel
     # does not support FP8 dtype for inputs, fallback to use Triton kernel.
     # However, when output_scale is provided, the inputs are still BF16/FP16

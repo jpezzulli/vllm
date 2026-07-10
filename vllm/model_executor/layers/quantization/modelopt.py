@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any, cast
 
@@ -129,6 +130,92 @@ class ModelOptKVCacheMethod(BaseKVCacheMethod):
         super().__init__(quant_config)
 
 
+def _maybe_dense_fp8_method(prefix: str, layer):
+    """VLLM_MOE_W2_DENSE_FP8=1: serve the checkpoint's excluded BF16 dense
+    GEMMs (attention projections, shared experts, the first dense MLP) with
+    ONLINE-quantized FP8 (per-tensor weight scale at load, dynamic per-token
+    activations) instead of UnquantizedLinearMethod.
+
+    Motivation (Kimi-K2.7 on the 2-bit expert path): the BF16 dense stack is
+    ~77% of decode bytes/token/rank — attention 3.1 GB + shared experts
+    1.3 GB vs 1.5 GB for the 2-bit experts — so FP8 halves the dominant read
+    stream (~+50% decode ceiling) and frees ~2.3 GiB VRAM/rank. The DSv3
+    family is FP8-native (trained with FP8 GEMMs; DS4-Flash/GLM ship FP8
+    dense), so quality exposure is second-order vs the 2-bit experts.
+
+    Deliberately NOT overridden: lm_head/embeddings (logit sensitivity,
+    ParallelLMHead is excluded by the isinstance check), vision tower and
+    mm_projector (name filter), router gates (never ask for a quant method),
+    and kv_b_proj — the MLA impl unpacks its weight into the w_kc/w_vc
+    einsum operands at load, and it is only ~4 MB/layer/rank anyway.
+    """
+    mode = os.getenv("VLLM_MOE_W2_DENSE_FP8", "0")
+    if mode not in ("1", "attn", "l0"):
+        return None
+    if not isinstance(layer, LinearBase):
+        return None
+    p = prefix or ""
+    if ".kv_b_proj" in p:
+        return None
+    # "l0": ONLY the first dense MLP — bisection mode (no shared experts,
+    # no attention; the plain-Linear proof case). "1": + shared experts.
+    # "attn": + attention projections. Bring-up so far: both "1" and "attn"
+    # produced NaN logits — suspects are the MoE runner touching shared
+    # expert weights outside LinearMethod.apply, and the MLA absorption
+    # reading module weights raw; "l0" isolates the base mechanism.
+    targets = ".layers.0." in p and ".mlp." in p
+    if mode in ("1", "attn"):
+        targets = targets or ".shared_experts." in p
+    if mode == "attn":
+        targets = targets or ".self_attn." in p
+    if targets:
+        return _OnlineFp8LinearMethod.build()
+    return None
+
+
+class _OnlineFp8LinearMethod:
+    """Fp8LinearMethod wrapper that quantizes BF16 weights itself.
+
+    The stock non-serialized Fp8 flow relies on the model loader's
+    online-quantize hook (engaged only when the top-level quantization is
+    "fp8"); under the modelopt config that hook never runs, so
+    process_weights_after_loading reaches process_fp8_weight_tensor_strategy
+    with the create_weights sentinel scales (float32 lowest) and the layer
+    serves garbage. Here the BF16 weight is quantized explicitly (dynamic
+    per-tensor scale) and handed to the scaled-mm kernel directly.
+    """
+
+    _cls = None
+
+    @classmethod
+    def build(cls):
+        if cls._cls is None:
+            from vllm.model_executor.layers.quantization.fp8 import (
+                Fp8Config,
+                Fp8LinearMethod,
+            )
+            from vllm.model_executor.utils import replace_parameter
+
+            class OnlineFp8LinearMethod(Fp8LinearMethod):
+                def process_weights_after_loading(self, layer) -> None:
+                    w = layer.weight
+                    if w.dtype == torch.float8_e4m3fn:
+                        return super().process_weights_after_loading(layer)
+                    from vllm import _custom_ops as ops
+                    qw, ws = ops.scaled_fp8_quant(
+                        w.to(torch.bfloat16), scale=None)
+                    replace_parameter(layer, "weight", qw.t())
+                    replace_parameter(layer, "weight_scale",
+                                      ws.reshape(1).to(torch.float32))
+                    layer.input_scale = None
+                    self.fp8_linear.process_weights_after_loading(layer)
+
+            cls._cls = OnlineFp8LinearMethod
+        from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+        return cls._cls(Fp8Config(is_checkpoint_fp8_serialized=False,
+                                  activation_scheme="dynamic"))
+
+
 class ModelOptQuantConfigBase(QuantizationConfig):
     LinearMethodCls: type = LinearMethodBase
     FusedMoEMethodCls: type = FusedMoEMethodBase
@@ -188,6 +275,9 @@ class ModelOptQuantConfigBase(QuantizationConfig):
 
         # handle exclusion
         if self.is_layer_excluded(prefix):
+            dense_fp8 = _maybe_dense_fp8_method(prefix, layer)
+            if dense_fp8 is not None:
+                return dense_fp8
             if isinstance(layer, (LinearBase, ParallelLMHead)):
                 return UnquantizedLinearMethod()
             return None
@@ -2522,6 +2612,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
         # Excluded layers
         if self.is_layer_excluded(prefix):
+            dense_fp8 = _maybe_dense_fp8_method(prefix, layer)
+            if dense_fp8 is not None:
+                return dense_fp8
             if isinstance(layer, (LinearBase, ParallelLMHead)):
                 return UnquantizedLinearMethod()
             return None
