@@ -4349,6 +4349,30 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        # moe_w2 draft-affinity PREFETCH (VLLM_MOE_W2_PREFETCH=1): before the
+        # forward, fold the PREVIOUS step's in-graph routing log into the
+        # token->experts table and prefetch this step's predicted experts on
+        # the tier's side stream. Under MTP this step's input ids ARE last
+        # step's sampled+draft tokens — the draft signal. Decode-shaped
+        # steps only (a prefill chunk would poison the table; prefill
+        # prefetches via ensure_resident anyway).
+        if moe_w2_gate is not None and not self.is_pooling_model:
+            try:
+                from vllm.model_executor.layers.quantization.utils import (
+                    moe_w2_delta as _w2d)
+                _btier = _w2d._BASE_TIER
+                if (
+                    _btier is not None
+                    and _btier.route_log is not None
+                    and max_num_scheduled_tokens <= 4
+                ):
+                    _n_real = min(
+                        scheduler_output.total_num_scheduled_tokens,
+                        _btier.route_log.shape[1])
+                    _btier.draft_prefetch(input_ids[:_n_real])
+            except Exception as e:  # noqa: BLE001 - never crash serving
+                logger.warning_once("moe_w2 draft prefetch skipped: %s", e)
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
@@ -4379,6 +4403,97 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        # moe_w2 BASE cache under PIPELINE parallelism: a miss is LOCAL to the
+        # stage — its desc kernels zeroed the missing pairs' contributions and
+        # bumped ITS miss counter, and the stage still holds this step's
+        # inputs (static graph buffers / intermediate_tensors). Correctness
+        # therefore needs only a SEGMENT re-run before the activations are
+        # consumed downstream — ~1/pp_size of a forward, unlike the gate's
+        # full-pipeline replay (the gate's signal, confidence, exists only at
+        # the logits; the base's signal is per-stage). No PP collective: each
+        # stage fixes its own segment; TP ranks WITHIN a stage decide via
+        # MAX-reduce and replay together (the segment contains TP
+        # collectives). Downstream stages never see the zeroed activations,
+        # so no cross-stage coordination is needed. KV rewrites in the replay
+        # are idempotent (same slot mapping, corrected values) — this covers
+        # MTP verify steps too, same as the inline TP path. PP==1 keeps the
+        # post-logits path below (unchanged).
+        if (
+            moe_w2_gate is not None
+            and get_pp_group().world_size > 1
+            and not self.is_pooling_model
+        ):
+            try:
+                from vllm.model_executor.layers.quantization.utils import (
+                    moe_w2_delta as _w2d)
+                _btier = _w2d._BASE_TIER
+                if _btier is not None:
+                    # open this step's pin scope: slots touched by any pass
+                    # below are ineligible for eviction until the next step
+                    _btier.step_begin()
+                    _miss = int(_btier.miss_count.item())
+                    _tp = get_tp_group()
+                    if _tp.world_size > 1:
+                        _t = torch.tensor([_miss], device=_btier.dev)
+                        torch.distributed.all_reduce(
+                            _t, op=torch.distributed.ReduceOp.MAX,
+                            group=_tp.device_group)
+                        _max_miss = int(_t.item())
+                    else:
+                        _max_miss = _miss
+                    if _miss > 0:
+                        _btier.force_promote(max_promote=None)
+                    _btier.kpi_step(
+                        _max_miss, _max_miss > _w2d.base_miss_tol())
+                    # Replay to a FIXED POINT (bounded): the corrected early
+                    # layers can re-route later layers to experts the first
+                    # pass never fetched — those SECOND-ORDER misses zero
+                    # contributions inside the replay itself, making logits
+                    # depend on pool content (measured as cross-request
+                    # greedy nondeterminism). Re-read the counter after each
+                    # replay; fetch + replay again until miss-free (typically
+                    # converges in one extra pass).
+                    _replays = 0
+                    while (_max_miss > _w2d.base_miss_tol()
+                           and _replays < 8):
+                        _replays += 1
+                        with set_forward_context(
+                            attn_metadata,
+                            self.vllm_config,
+                            num_tokens=num_tokens_padded,
+                            num_tokens_across_dp=num_tokens_across_dp,
+                            cudagraph_runtime_mode=cudagraph_mode,
+                            batch_descriptor=batch_desc,
+                            ubatch_slices=ubatch_slices_padded,
+                            slot_mapping=slot_mappings,
+                            skip_compiled=has_encoder_input,
+                        ):
+                            model_output = self._model_forward(
+                                input_ids=input_ids,
+                                positions=positions,
+                                intermediate_tensors=intermediate_tensors,
+                                inputs_embeds=inputs_embeds,
+                                **model_kwargs,
+                            )
+                        _miss = int(_btier.miss_count.item())
+                        if _tp.world_size > 1:
+                            _t = torch.tensor([_miss], device=_btier.dev)
+                            torch.distributed.all_reduce(
+                                _t, op=torch.distributed.ReduceOp.MAX,
+                                group=_tp.device_group)
+                            _max_miss = int(_t.item())
+                        else:
+                            _max_miss = _miss
+                        if _miss > 0:
+                            _btier.force_promote(max_promote=None)
+                    if _replays > 1:
+                        _btier.kpi_second_order(
+                            _replays - 1,
+                            capped=_max_miss > _w2d.base_miss_tol())
+            except Exception as e:  # noqa: BLE001 - never crash serving
+                logger.warning(
+                    "moe_w2 base-cache PP stage replay skipped: %s", e)
 
         # moe_w2 confidence gate under PP: cache this step's forward context so
         # the worker can drive a FULL second pipeline pass (gate_reforward) when
@@ -4492,6 +4607,9 @@ class GPUModelRunner(
                     moe_w2_delta as _w2d)
                 _btier = _w2d._BASE_TIER
                 if _btier is not None:
+                    # open this step's pin scope: slots touched by any pass
+                    # below are ineligible for eviction until the next step
+                    _btier.step_begin()
                     _miss = int(_btier.miss_count.item())
                     _tp = get_tp_group()
                     if _tp.world_size > 1:
@@ -4511,7 +4629,22 @@ class GPUModelRunner(
                     # zeroed (bounded approximation, delta/gate class).
                     if _miss > 0:
                         _btier.force_promote(max_promote=None)
-                    if _max_miss > _w2d.base_miss_tol():
+                    # KPI: per-step replay rate + missing pairs (windowed
+                    # INFO line) — the pool-sizing signal.
+                    _btier.kpi_step(
+                        _max_miss, _max_miss > _w2d.base_miss_tol())
+                    # Replay to a FIXED POINT (bounded): corrected early
+                    # layers can re-route later layers onto experts the
+                    # first pass never fetched; those second-order misses
+                    # zero contributions inside the replay itself and made
+                    # greedy output depend on pool content (cross-request
+                    # nondeterminism). Re-read the counter after each
+                    # replay; fetch + replay until miss-free (typically one
+                    # extra pass).
+                    _replays = 0
+                    while (_max_miss > _w2d.base_miss_tol()
+                           and _replays < 8):
+                        _replays += 1
                         with set_forward_context(
                             attn_metadata,
                             self.vllm_config,
@@ -4536,6 +4669,21 @@ class GPUModelRunner(
                             hidden_states = _re_out
                         sample_hidden_states = hidden_states[logits_indices]
                         logits = self.model.compute_logits(sample_hidden_states)
+                        _miss = int(_btier.miss_count.item())
+                        if _tp.world_size > 1:
+                            _t = torch.tensor([_miss], device=logits.device)
+                            torch.distributed.all_reduce(
+                                _t, op=torch.distributed.ReduceOp.MAX,
+                                group=_tp.device_group)
+                            _max_miss = int(_t.item())
+                        else:
+                            _max_miss = _miss
+                        if _miss > 0:
+                            _btier.force_promote(max_promote=None)
+                    if _replays > 1:
+                        _btier.kpi_second_order(
+                            _replays - 1,
+                            capped=_max_miss > _w2d.base_miss_tol())
             except Exception as e:  # noqa: BLE001 - never crash serving
                 logger.warning("moe_w2 base-cache miss replay skipped: %s", e)
 
