@@ -4455,8 +4455,7 @@ class GPUModelRunner(
                     # replay; fetch + replay again until miss-free (typically
                     # converges in one extra pass).
                     _replays = 0
-                    while (_max_miss > _w2d.base_miss_tol()
-                           and _replays < 8):
+                    while _w2d.fp_continue(_replays, _max_miss):
                         _replays += 1
                         with set_forward_context(
                             attn_metadata,
@@ -4487,10 +4486,8 @@ class GPUModelRunner(
                             _max_miss = _miss
                         if _miss > 0:
                             _btier.force_promote(max_promote=None)
-                    if _replays > 1:
-                        _btier.kpi_second_order(
-                            _replays - 1,
-                            capped=_max_miss > _w2d.base_miss_tol())
+                    if _replays:
+                        _btier.kpi_fp(_replays, _max_miss)
             except Exception as e:  # noqa: BLE001 - never crash serving
                 logger.warning(
                     "moe_w2 base-cache PP stage replay skipped: %s", e)
@@ -4642,8 +4639,7 @@ class GPUModelRunner(
                     # replay; fetch + replay until miss-free (typically one
                     # extra pass).
                     _replays = 0
-                    while (_max_miss > _w2d.base_miss_tol()
-                           and _replays < 8):
+                    while _w2d.fp_continue(_replays, _max_miss):
                         _replays += 1
                         with set_forward_context(
                             attn_metadata,
@@ -4680,10 +4676,8 @@ class GPUModelRunner(
                             _max_miss = _miss
                         if _miss > 0:
                             _btier.force_promote(max_promote=None)
-                    if _replays > 1:
-                        _btier.kpi_second_order(
-                            _replays - 1,
-                            capped=_max_miss > _w2d.base_miss_tol())
+                    if _replays:
+                        _btier.kpi_fp(_replays, _max_miss)
             except Exception as e:  # noqa: BLE001 - never crash serving
                 logger.warning("moe_w2 base-cache miss replay skipped: %s", e)
 

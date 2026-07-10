@@ -35,6 +35,7 @@ from .deepseek_v2 import (
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
+from .interfaces import SupportsPP
 from .utils import get_pp_missing_layer_names, maybe_prefix
 
 logger = init_logger(__name__)
@@ -205,7 +206,14 @@ class DeepSeekMultiTokenPredictor(nn.Module):
 
 
 @support_torch_compile
-class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
+class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
+    # Same PP story as DeepSeekV4MTP (vllm/models/deepseek_v4/nvidia/mtp.py):
+    # the MTP drafter runs WHOLE on the last PP rank (it consumes the
+    # target's last-rank hidden state), is never pipeline-split and never
+    # exchanges IntermediateTensors. Declaring SupportsPP only satisfies the
+    # generic verify_with_parallel_config gate so pipeline_parallel_size > 1
+    # works with method:"mtp" drafters (GLM-5.x glm_moe_dsa, DeepSeek V3
+    # family) — exercised by the base-cache PP path.
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config

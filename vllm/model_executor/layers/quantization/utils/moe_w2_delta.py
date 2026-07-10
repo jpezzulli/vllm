@@ -219,6 +219,8 @@ class DeltaTier:
         self._kpi_c_replays = 0
         self._kpi_unfixed = 0     # experts replay could NOT restore (window)
         self._kpi_2nd = 0         # extra replays for second-order misses
+        self._kpi_fp_giveup = 0   # steps that accepted second-order residue
+        self._kpi_fp_resid = 0    # residual missing pairs in those steps
         # Slots touched since step_begin(): promoted or hit by any pass of
         # the CURRENT step. Never evictable (even in the emergency pass) —
         # without this, a fixed-point iteration can evict pass-k's fetches
@@ -889,6 +891,10 @@ class DeltaTier:
                    if self._kpi_unfixed else "")
         if self._kpi_2nd:
             unfixed += (f"; second-order replays: {self._kpi_2nd}")
+        if self._kpi_fp_giveup:
+            unfixed += (
+                f"; fp-residue: {self._kpi_fp_giveup} steps "
+                f"(avg {self._kpi_fp_resid / self._kpi_fp_giveup:.0f} pairs)")
         if self._kpi_prefetched:
             unfixed += (f"; draft-prefetched: {self._kpi_prefetched}")
         logger.info(
@@ -904,23 +910,31 @@ class DeltaTier:
         self._kpi_steps = self._kpi_miss_pairs = self._kpi_replays = 0
         self._kpi_unfixed = 0
         self._kpi_2nd = 0
+        self._kpi_fp_giveup = 0
+        self._kpi_fp_resid = 0
         self._kpi_prefetched = 0
 
-    def kpi_second_order(self, n: int, capped: bool = False) -> None:
-        """Runner reports n EXTRA fixed-point replays this step (a corrected
-        pass re-routed onto still-missing experts). Chronic second-order
-        replays = coverage too low for the model's routing volatility.
-        `capped`: the loop exited at its bound with misses STILL present —
-        the step's logits kept zeroed contributions (hard determinism/
-        quality breach; logged loudly)."""
-        self._kpi_2nd += n
-        if capped:
+    def kpi_fp(self, replays: int, residual: int) -> None:
+        """Runner reports the step's fixed-point outcome: total replay
+        passes and the residual max-miss after the loop. residual==0 (or
+        within tol) = clean fixed point. residual > FP_THRESH = the
+        adaptive break: working set moving, second-order residue accepted
+        after the mandatory first-order restore (expected on fresh prose;
+        KPI-counted, not a warning). residual in (tol, FP_THRESH] = the
+        loop hit FP_MAX while within closing distance — pathological
+        ping-pong, logged loudly."""
+        if replays > 1:
+            self._kpi_2nd += replays - 1
+        if residual <= base_miss_tol():
+            return
+        self._kpi_fp_giveup += 1
+        self._kpi_fp_resid += residual
+        if residual <= fp_thresh():
             self._kpi_unfixed += 1
             logger.warning(
-                "moe_w2 [%s]: fixed-point replay hit its cap with misses "
-                "remaining — this step kept zeroed expert contributions "
-                "(nondeterministic output). Pool badly undersized for this "
-                "workload.", self._tag)
+                "moe_w2 [%s]: fixed-point replay hit FP_MAX with %d misses "
+                "remaining (within thresh) — ping-pong; step kept zeroed "
+                "contributions.", self._tag, residual)
 
     # ---- observability ---------------------------------------------------
 
@@ -1107,6 +1121,60 @@ def base_miss_tol() -> int:
     except (OSError, ValueError):
         pass
     return _base_tol_dyn
+
+
+# Adaptive fixed-point replay policy. Pass 1 is MANDATORY above the
+# tolerance band (it restores every first-order miss — the bulk of the
+# quality). Further passes chase SECOND-ORDER misses (corrected layers
+# re-routing onto unfetched experts) and only run while the step is within
+# FP_THRESH of miss-free: that yields strict, bit-deterministic fixed
+# points for extra passes, while on shifting content (fresh prose: 100+
+# missing pairs, residue stays large) the loop stops at 2 forwards/step —
+# the old single-replay cost — instead of burning 3x+ chasing a moving
+# target. The accepted residue is second-order only, small, and
+# KPI-visible ("fp-residue"). DEFAULT 0 = mandatory pass only: measured
+# A/B (GLM TP2 46 GiB pool, runtime thresh flip, same server, fox 384
+# med 5): thresh=16 -> 19.2 tok/s, thresh=0 -> 28.3 at unchanged quality
+# probes (needle 36K PASS, arithmetic ok) — the second-order chase cost
+# ~35% decode for residue the pre-fixed-point stack silently kept
+# anyway, plus first-order restoration on top. DS4 1x5090 14 GiB:
+# thresh-insensitive (31.2 vs 31.4 — residue >16 either way). Raise for
+# bit-determinism studies on converged working sets. THRESH is
+# file-tunable at runtime (sweep idiom of TAU/TOL); FP_MAX bounds
+# pathological ping-pong.
+_FP_MAX = int(os.getenv("VLLM_MOE_W2_FP_MAX", "8"))
+_FP_THRESH = int(os.getenv("VLLM_MOE_W2_FP_THRESH", "0"))
+_FP_THRESH_FILE = os.getenv("VLLM_MOE_W2_FP_THRESH_FILE", "")
+_fp_thresh_dyn = _FP_THRESH
+_fp_thresh_mtime = -1.0
+
+
+def fp_thresh() -> int:
+    global _fp_thresh_dyn, _fp_thresh_mtime
+    if not _FP_THRESH_FILE:
+        return _FP_THRESH
+    try:
+        m = os.path.getmtime(_FP_THRESH_FILE)
+        if m != _fp_thresh_mtime:
+            _fp_thresh_mtime = m
+            with open(_FP_THRESH_FILE) as f:
+                _fp_thresh_dyn = int(f.read().strip())
+            logger.info("moe_w2 base cache: fixed-point thresh -> %d",
+                        _fp_thresh_dyn)
+    except (OSError, ValueError):
+        pass
+    return _fp_thresh_dyn
+
+
+def fp_continue(passes: int, max_miss: int) -> bool:
+    """Should the runner run another replay pass? (adaptive policy above)"""
+    if max_miss <= base_miss_tol():
+        return False            # inside the tolerance band (or miss-free)
+    if passes == 0:
+        return True             # first-order restore is mandatory
+    if passes >= _FP_MAX:
+        return False            # hard bound on ping-pong
+    return max_miss <= fp_thresh()
 
 
 # Base-cache KPI cadence: every N runner steps log the per-STEP replay rate,
