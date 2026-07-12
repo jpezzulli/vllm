@@ -4443,7 +4443,9 @@ class GPUModelRunner(
                     else:
                         _max_miss = _miss
                     if _miss > 0:
-                        _btier.force_promote(max_promote=None)
+                        _btier.force_promote(
+                            max_promote=None,
+                            pin=_w2d.fp_continue(0, _max_miss))
                     _btier.kpi_step(
                         _max_miss, _max_miss > _w2d.base_miss_tol())
                     # Replay to a FIXED POINT (bounded): the corrected early
@@ -4485,9 +4487,21 @@ class GPUModelRunner(
                         else:
                             _max_miss = _miss
                         if _miss > 0:
-                            _btier.force_promote(max_promote=None)
+                            _btier.force_promote(
+                                max_promote=None,
+                                pin=_w2d.fp_continue(_replays, _max_miss))
                     if _replays:
                         _btier.kpi_fp(_replays, _max_miss)
+                    # close the base seen window HERE for PP: non-last
+                    # ranks early-return before the shared end-of-step
+                    # hook (see the step_end call after the gate block).
+                    # The FP4 window is only closed on prefill-shaped
+                    # steps — a decode fire decision arrives later via the
+                    # worker (gate_reforward) and consumes it there.
+                    _btier.step_end()
+                    if (_w2d._TIER is not None
+                            and max_num_scheduled_tokens > 4):
+                        _w2d._TIER.step_end()
             except Exception as e:  # noqa: BLE001 - never crash serving
                 logger.warning(
                     "moe_w2 base-cache PP stage replay skipped: %s", e)
@@ -4625,7 +4639,13 @@ class GPUModelRunner(
                     # the step's ~top_k*n_layers weighted contributions were
                     # zeroed (bounded approximation, delta/gate class).
                     if _miss > 0:
-                        _btier.force_promote(max_promote=None)
+                        # pin only when a replay will actually re-read the
+                        # step (otherwise the fetch serves FUTURE steps and
+                        # pinning it just starves the eviction — see
+                        # force_promote's pin doc)
+                        _btier.force_promote(
+                            max_promote=None,
+                            pin=_w2d.fp_continue(0, _max_miss))
                     # KPI: per-step replay rate + missing pairs (windowed
                     # INFO line) — the pool-sizing signal.
                     _btier.kpi_step(
@@ -4675,7 +4695,9 @@ class GPUModelRunner(
                         else:
                             _max_miss = _miss
                         if _miss > 0:
-                            _btier.force_promote(max_promote=None)
+                            _btier.force_promote(
+                                max_promote=None,
+                                pin=_w2d.fp_continue(_replays, _max_miss))
                     if _replays:
                         _btier.kpi_fp(_replays, _max_miss)
             except Exception as e:  # noqa: BLE001 - never crash serving
@@ -4766,6 +4788,28 @@ class GPUModelRunner(
                             logits = self.model.compute_logits(sample_hidden_states)
             except Exception as e:  # noqa: BLE001 - gate must never crash serving
                 logger.warning("moe_w2 confidence gate re-forward skipped: %s", e)
+
+        # moe_w2: the step is fully executed (base replays + gate replay
+        # done) — close both tiers' SEEN windows so the eviction exclusion
+        # and force_promote's hit-pinning stay scoped to ONE step. Without
+        # this a prefill's accumulated marks (61 ensure_resident layers)
+        # pinned the whole pool at the next decode step (measured: [pool
+        # 2123, pinned 2123], hundreds of unpromotable experts, corrupted
+        # first decode tokens).
+        if moe_w2_gate is not None and not self.is_pooling_model:
+            try:
+                from vllm.model_executor.layers.quantization.utils import (
+                    moe_w2_delta as _w2d_end)
+                if _w2d_end._BASE_TIER is not None:
+                    _w2d_end._BASE_TIER.step_end()
+                # under PP a pending gate fire consumes the FP4 window in
+                # gate_reforward() (driven by the worker AFTER this call);
+                # force_promote zeroes it there.
+                if _w2d_end._TIER is not None and not getattr(
+                        self, "_gate_fire", False):
+                    _w2d_end._TIER.step_end()
+            except Exception:  # noqa: BLE001 - never crash serving
+                pass
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,

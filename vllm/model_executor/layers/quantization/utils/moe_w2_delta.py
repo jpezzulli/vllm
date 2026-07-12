@@ -325,6 +325,7 @@ class DeltaTier:
         self._kpi_c_steps = 0
         self._kpi_c_replays = 0
         self._kpi_unfixed = 0     # experts replay could NOT restore (window)
+        self._kpi_deferred = 0    # slotless warm-up fetches (no reader; window)
         self._kpi_2nd = 0         # extra replays for second-order misses
         self._kpi_fp_giveup = 0   # steps that accepted second-order residue
         self._kpi_fp_resid = 0    # residual missing pairs in those steps
@@ -334,6 +335,13 @@ class DeltaTier:
         # to serve pass-k+1 (their seen marks are zeroed after each
         # snapshot) and ping-pong past the replay cap.
         self._step_pins: set[int] = set()
+        # Prefill-layer pin scope (ensure_resident): pins live only until
+        # the NEXT ensure_resident call (the layer's eager GEMMs are done
+        # by then). Step-scoped pins would accumulate the whole prefill
+        # working set (61 layers x routed >> pool) and starve every later
+        # layer's fetch; no scope at all lets the emergency eviction take
+        # the CURRENT layer's slots between its fetch and its GEMMs.
+        self._layer_pins: set[int] = set()
         # Residency coupling (BASE tier only, split-FP4 over the base
         # cache): the coexisting FP4 tier whose refinement slots read THIS
         # tier's base slots — its mapped experts are eviction-blocked here.
@@ -659,6 +667,8 @@ class DeltaTier:
                    | ((self._tick - tk) < 2))
         if self._step_pins:
             blocked[list(self._step_pins)] = True
+        if self._layer_pins:
+            blocked[list(self._layer_pins)] = True
         if bool(blocked.all()):
             return None
         key = self._freq[lic, eic].double()
@@ -780,9 +790,16 @@ class DeltaTier:
         of GIL time per fired step and starved the forward thread.
 
         `emergency=True` (synchronous runner-thread callers only — never the
-        background manager) adds a second eviction pass that relaxes the
-        2-tick coldness bound when the first pass cannot cover k, keeping
-        the seen-window exclusion. See the pass comments below.
+        background manager) adds two fallback eviction passes when the first
+        pass cannot cover k: pass 2 relaxes the 2-tick coldness bound but
+        keeps the seen-window exclusion; pass 3 also drops the seen window
+        (a recency HEURISTIC — with per-step manager passes the snapshot
+        holds one full step's routing, which under an MTP-verify gate storm
+        approaches the pool size and starved pass 2 into leaving zeroed
+        contributions: measured as corrupted math on DS4 three-tier,
+        tau→storm). Pass 3 keeps only the correctness contracts: step pins
+        (the CURRENT step's reads/fetches) and split-FP4 residency coupling.
+        See the pass comments below.
 
         Eviction policy is unchanged: least-valuable slot by _POLICY key
         (need / freq / lru), restricted to slots whose owner is not active in
@@ -809,34 +826,54 @@ class DeltaTier:
             # inf sentinel below cannot be represented there (lru is not a
             # production policy for these tiers; surfaced by unit tests)
             key = tk.double()
-        # Hard exclusions: free markers, owners active in the current seen
-        # window (their slots may be read by this step's graph/replay), and
-        # step-pinned slots (touched by any pass of the current step).
-        blocked = (li < 0) | self._seen_host[lic, eic].to(torch.bool)
+        # Exclusion tiers. HARD (correctness): free markers, step-pinned
+        # slots (fetched or hit by a pass of the CURRENT step — a replay is
+        # about to read them), and the coupled-FP4 block added below. SOFT
+        # (recency heuristic): owners active in the seen window — likely to
+        # be routed again soon, but nothing in-flight reads them once the
+        # step that marked them is over and they are not step-pinned.
+        hard = torch.zeros_like(li, dtype=torch.bool)
+        hard |= (li < 0)
         if self._step_pins:
-            blocked[list(self._step_pins)] = True
+            hard[list(self._step_pins)] = True
+        if self._layer_pins:
+            hard[list(self._layer_pins)] = True
+        blocked = hard | self._seen_host[lic, eic].to(torch.bool)
         # Residency coupling (split-FP4 over the base cache): never evict a
         # BASE slot whose expert is mapped in the coupled FP4 tier — the
         # split kernel reads its refinement against THESE base codes+scales.
-        # The read is lockless (the other tier's host mirror, mutated under
-        # ITS lock); a torn value is benign: dispatch requires residency in
-        # BOTH slot tables, so a stale exclusion only delays one eviction
-        # and a missed one downgrades that expert to a base miss -> the
-        # standard fetch+replay restores it.
+        # HARD exclusion: these experts are exactly the gate's recent
+        # promotions (the quality-critical set), and in split mode a
+        # base-evicted pair downgrades to a plain MISS — zeroed inside a
+        # gate replay (which never refetches). Measured as corrupted math
+        # on gate-fired tokens when this was soft. The cost is bounded by
+        # the (small) FP4 pool size. The mirror read is lockless (the other
+        # tier mutates it under ITS lock); a torn value is benign: dispatch
+        # requires residency in BOTH slot tables, so a stale exclusion only
+        # delays one eviction and a missed one downgrades that expert to a
+        # base miss -> the standard fetch+replay restores it.
         if self._coupled_fp4 is not None:
-            blocked |= self._coupled_fp4._mirror[lic, eic] >= 0
+            cpl = self._coupled_fp4._mirror[lic, eic] >= 0
+            hard |= cpl
+            blocked |= cpl
         # Pass 1: only >=min_cold-tick-cold victims (never disturbs slots a
         # CONCURRENT in-flight graph might still read — the background
         # manager's constraint; speculative prefetchers pass a much higher
-        # bound so they can never churn the hot set). Pass 2 (emergency):
-        # the synchronous callers (force_promote / ensure_resident, runner
-        # thread, no forward in flight) relax the coldness bound rather
-        # than leave a missing expert UNRESTORED — a replay that keeps
-        # zeroed contributions is a silent quality hit and a nondeterminism
-        # source, strictly worse than evicting a warm-but-idle slot.
+        # bound so they can never churn the hot set). Passes 2-3
+        # (emergency): the synchronous callers (force_promote /
+        # ensure_resident, runner thread, no forward in flight) relax first
+        # the coldness bound, then the seen window, rather than leave a
+        # missing expert UNRESTORED — a replay that keeps zeroed
+        # contributions is a silent quality hit and a nondeterminism
+        # source, strictly worse than evicting a warm-but-idle slot. The
+        # seen window must be droppable: one step of an MTP-verify gate
+        # storm can mark nearly the whole pool (DS4: 3 tok x top-8 x 61
+        # layers vs an 11 GiB pool), and an all-blocked pass 2 silently
+        # zeroes hundreds of experts per step (measured: corrupted math).
         passes = [blocked | ((self._tick - tk) < min_cold)]
         if emergency:
             passes.append(blocked)
+            passes.append(hard)
         taken: set[int] = set()
         for ineligible in passes:
             need = k - len(out)
@@ -901,7 +938,25 @@ class DeltaTier:
         poll."""
         with self._lock:
             self._step_pins.clear()
+            self._layer_pins.clear()
         wake_all()
+
+    def step_end(self) -> None:
+        """Close this step's SEEN window (runner: after the replay loop /
+        the gate decision consumed it). `seen` must scope to ONE step: the
+        eviction exclusion and force_promote's hit-pinning derive from it,
+        and the old free-running manager implicitly kept it that narrow by
+        zeroing every ~20 ms of wall clock. Event-driven passes turned that
+        into "last 4 steps", so a PREFILL's marks (61 ensure_resident
+        layers, thousands of pairs) survived into the first decode step's
+        force_promote — which then pinned every hit slot, leaving eviction
+        NO victims (measured: [pool 2123, pinned 2123], hundreds of
+        unpromotable experts per step, corrupted first decode tokens).
+        Decode steps with misses are unaffected (force_promote already
+        zeroes after its snapshot); this closes the window for miss-free
+        and prefill steps. A mark lost to an in-flight scatter only delays
+        one lazy promotion (the manager's own idiom)."""
+        self.seen.zero_()
 
     # ---- draft-affinity prefetch (VLLM_MOE_W2_PREFETCH=1) ------------------
 
@@ -1011,7 +1066,8 @@ class DeltaTier:
             self._kpi_prefetched += len(plan)
         return len(plan)
 
-    def force_promote(self, layers=None, max_promote=None) -> int:
+    def force_promote(self, layers=None, max_promote=None,
+                      pin: bool = True) -> int:
         """Synchronously pull this step's COLD routed experts up to FP4, for a
         confidence-gated re-forward (directive 2 / Step B).
 
@@ -1032,6 +1088,15 @@ class DeltaTier:
         Args:
             layers: optional iterable of layer keys to restrict to (default all).
             max_promote: optional cap on experts promoted this call.
+            pin: step-pin the touched slots (hits + fetches). Pass False
+                ONLY when no replay follows this call in the current step
+                (the runner's LAST fetch of the fixed-point loop): those
+                fetches serve future steps, and pinning them would grow
+                the step's pin set to the whole working set — on MTP
+                verify (3 pos x top-8 x 61 layers) that is the entire
+                14 GiB pool, leaving the eviction no victims (measured:
+                [pool 2123, pinned 2123], hundreds of unpromotable
+                experts, corrupted math).
         Returns:
             number of experts newly promoted to FP4.
         """
@@ -1075,7 +1140,8 @@ class DeltaTier:
             if bool(hit.any()):
                 hs = slots[hit]
                 self._owner_tick[hs] = self._tick
-                self._step_pins.update(hs.tolist())
+                if pin:
+                    self._step_pins.update(hs.tolist())
             keep = torch.ones(seen.shape[0], dtype=torch.bool)
             if layer_filter is not None:
                 lf = torch.zeros(self.n_layers, dtype=torch.bool)
@@ -1120,7 +1186,8 @@ class DeltaTier:
             rows = self._store.rows_for([p for p, _ in plan])
             for ((li, ei), slot), row in zip(plan, rows):
                 self._own(slot, li, ei)
-                self._step_pins.add(slot)
+                if pin:
+                    self._step_pins.add(slot)
                 with torch.cuda.stream(self._stream):
                     self.pool[slot].copy_(row, non_blocking=True)
             with torch.cuda.stream(self._stream):
@@ -1134,18 +1201,33 @@ class DeltaTier:
             self._n_promoted += len(plan)
             self._win_promoted += len(plan)
         if len(plan) < len(cand):
-            # QUALITY KPI: some of this step's missing experts got NO slot
-            # (free list empty + every victim ineligible: seen-live or <2
-            # ticks old). The mandatory replay then RE-ZEROES their
-            # contributions — a silent quality drop even at MISS_TOL=0, and
-            # (pool-content-dependent) a source of run-to-run greedy
-            # nondeterminism. The fix is a bigger pool, not a knob.
-            self._kpi_unfixed += len(cand) - len(plan)
-            logger.warning_once(
-                "moe_w2 [%s]: %d missing experts could not be promoted "
-                "(pool too tight to evict) — replay keeps their zeroed "
-                "contributions. Raise the pool GiB; occurrences counted "
-                "in the KPI line.", self._tag, len(cand) - len(plan))
+            if not pin:
+                # No reader follows this call in the current step (see the
+                # pin doc): a slotless candidate is a DEFERRED warm-up
+                # fetch, not a quality event — the next step that routes it
+                # refetches under its own (pinned) mandatory pass. Expected
+                # whenever pool ~= one step's working set.
+                self._kpi_deferred += len(cand) - len(plan)
+            else:
+                # QUALITY KPI: some of this step's missing experts got NO
+                # slot (free list empty + every victim ineligible) and a
+                # replay WILL re-read the step — their contributions stay
+                # zeroed: a silent quality drop even at MISS_TOL=0, and
+                # (pool-content-dependent) a source of run-to-run greedy
+                # nondeterminism. The fix is a bigger pool, not a knob.
+                self._kpi_unfixed += len(cand) - len(plan)
+                npin = len(self._step_pins)
+                ncpl = (int((self._coupled_fp4._mirror[
+                    self._owner_li.clamp(min=0),
+                    self._owner_ei.clamp(min=0)] >= 0).sum())
+                        if self._coupled_fp4 is not None else 0)
+                logger.warning(
+                    "moe_w2 [%s]: %d missing experts could not be promoted "
+                    "(pool too tight to evict) — replay keeps their zeroed "
+                    "contributions. Raise the pool GiB; occurrences counted "
+                    "in the KPI line. [pool %d, pinned %d, fp4-coupled %d, "
+                    "free %d, wanted %d]", self._tag, len(cand) - len(plan),
+                    self.n_slots, npin, ncpl, len(self._free), len(cand))
         if _TRACE >= 2:
             logger.info("[%s] force-promote %d experts (gate)",
                         self._tag, len(plan))
@@ -1172,13 +1254,19 @@ class DeltaTier:
                 ev.record(self._stream)
             ev.synchronize()
         with self._lock:
+            # open THIS layer's pin scope (releases the previous layer's —
+            # its GEMMs are done; see _layer_pins in __init__)
+            self._layer_pins.clear()
             slots = self._mirror[layer_key].long()[ids.cpu()]
             hit = slots >= 0
             if bool(hit.any()):
-                # tick-refresh cached hits (same rationale as
-                # force_promote: protect them from a racing manager
-                # eviction while this layer's eager GEMMs read them)
-                self._owner_tick[slots[hit]] = self._tick
+                # tick-refresh + LAYER-pin cached hits: the eager GEMMs
+                # read them right after this call, and the emergency
+                # eviction (this very call's fetch, pass 3) may otherwise
+                # take them — seen/coldness are soft exclusions there.
+                hs = slots[hit]
+                self._owner_tick[hs] = self._tick
+                self._layer_pins.update(hs.tolist())
             cand = [(layer_key, int(e)) for e in ids.cpu()[~hit].tolist()]
             if not cand:
                 return 0
@@ -1195,6 +1283,7 @@ class DeltaTier:
             rows = self._store.rows_for([p for p, _ in plan], scan=True)
             for ((li, ei), slot), row in zip(plan, rows):
                 self._own(slot, li, ei)
+                self._layer_pins.add(slot)
                 with torch.cuda.stream(self._stream):
                     self.pool[slot].copy_(row, non_blocking=True)
             with torch.cuda.stream(self._stream):
@@ -1320,6 +1409,9 @@ class DeltaTier:
         unfixed = (f"; UNRESTORED experts: {self._kpi_unfixed} "
                    "(pool too tight — quality at risk)"
                    if self._kpi_unfixed else "")
+        if self._kpi_deferred:
+            unfixed += (f"; deferred warm-ups: {self._kpi_deferred} "
+                        "(benign; pool ~= step working set)")
         if self._kpi_2nd:
             unfixed += (f"; second-order replays: {self._kpi_2nd}")
         if self._kpi_fp_giveup:
@@ -1345,6 +1437,7 @@ class DeltaTier:
             100.0 * self.n_slots / cov_total, unfixed)
         self._kpi_steps = self._kpi_miss_pairs = self._kpi_replays = 0
         self._kpi_unfixed = 0
+        self._kpi_deferred = 0
         self._kpi_2nd = 0
         self._kpi_fp_giveup = 0
         self._kpi_fp_resid = 0
