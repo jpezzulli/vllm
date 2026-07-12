@@ -334,6 +334,11 @@ class DeltaTier:
         # to serve pass-k+1 (their seen marks are zeroed after each
         # snapshot) and ping-pong past the replay cap.
         self._step_pins: set[int] = set()
+        # Residency coupling (BASE tier only, split-FP4 over the base
+        # cache): the coexisting FP4 tier whose refinement slots read THIS
+        # tier's base slots — its mapped experts are eviction-blocked here.
+        # Set by get_tier() when the need-pool is created in split mode.
+        self._coupled_fp4 = None
         # Draft-affinity prefetch (VLLM_MOE_W2_PREFETCH=1, base tier only):
         # route_log = in-graph [n_layers, T_cap, K_cap] routing log written
         # by the forward glue; _aff = token->experts affinity table folded
@@ -800,13 +805,26 @@ class DeltaTier:
         elif self._policy == "freq":
             key = self._freq[lic, eic].double()
         else:
-            key = tk.clone()
+            # double, not clone: the tensorized owner-tick is int64 and the
+            # inf sentinel below cannot be represented there (lru is not a
+            # production policy for these tiers; surfaced by unit tests)
+            key = tk.double()
         # Hard exclusions: free markers, owners active in the current seen
         # window (their slots may be read by this step's graph/replay), and
         # step-pinned slots (touched by any pass of the current step).
         blocked = (li < 0) | self._seen_host[lic, eic].to(torch.bool)
         if self._step_pins:
             blocked[list(self._step_pins)] = True
+        # Residency coupling (split-FP4 over the base cache): never evict a
+        # BASE slot whose expert is mapped in the coupled FP4 tier — the
+        # split kernel reads its refinement against THESE base codes+scales.
+        # The read is lockless (the other tier's host mirror, mutated under
+        # ITS lock); a torn value is benign: dispatch requires residency in
+        # BOTH slot tables, so a stale exclusion only delays one eviction
+        # and a missed one downgrades that expert to a base miss -> the
+        # standard fetch+replay restores it.
+        if self._coupled_fp4 is not None:
+            blocked |= self._coupled_fp4._mirror[lic, eic] >= 0
         # Pass 1: only >=min_cold-tick-cold victims (never disturbs slots a
         # CONCURRENT in-flight graph might still read — the background
         # manager's constraint; speculative prefetchers pass a much higher
@@ -1611,27 +1629,25 @@ _GB_EXPLICIT = "VLLM_MOE_W2_DELTA_GB" in os.environ
 
 # SPLIT FP4 (VLLM_MOE_W2_DELTA_SPLIT=1, default off): the delta tier stores
 # 2-bit REFINEMENT planes instead of full e2m1 nibble planes and dispatches
-# moe_w4s_mm, which reads them alongside the GPU-RESIDENT 2-bit base planes
-# (nested codebook; see moe_w2_planes.nibbles_to_refinement) — half the
-# pool bytes per expert = 2x FP4 coverage at equal VRAM, at ~+16-23%
-# kernel-time on the FP4-served pairs (decode ALU; read bytes unchanged).
-# Requires the base planes resident on GPU, so it is INERT over the base
-# cache (the base slot could be evicted under the refinement's feet;
-# residency coupling is future work).
+# moe_w4s_mm, which reads them alongside the 2-bit base (nested codebook;
+# see moe_w2_planes.nibbles_to_refinement) — half the pool bytes per expert
+# (over the base cache: less — the refinement slot also drops the private
+# scale sections, the base slot's serve both GEMMs) = 2x+ FP4 coverage at
+# equal VRAM, at ~+16-23% kernel-time on the FP4-served pairs (decode ALU;
+# read bytes unchanged).
+#
+# GPU-resident-base configs read the resident planes directly. Over the
+# BASE CACHE the base codes+scales come from the base tier's pool slot, so
+# split serving is RESIDENCY-COUPLED: the desc kernel routes a pair to w4s
+# only when the expert is resident in BOTH slot tables (FP4-mapped but
+# base-missing counts as a miss -> the standard fetch+replay restores it),
+# and the base tier's eviction hard-excludes experts mapped in the FP4
+# tier (_coupled_fp4) so a mapped refinement never outlives its base row.
 _SPLIT = os.getenv("VLLM_MOE_W2_DELTA_SPLIT", "0") == "1"
 
 
 def split_enabled() -> bool:
-    if not _SPLIT:
-        return False
-    if base_enabled():
-        logger.warning_once(
-            "VLLM_MOE_W2_DELTA_SPLIT=1 is unsupported over the base cache "
-            "(VLLM_MOE_W2_BASE_CACHE_GB>0) — the resident 2-bit base the "
-            "split kernel refines does not exist there. Flag ignored; the "
-            "FP4 tier serves full nibble planes via moe_w4_mm.")
-        return False
-    return True
+    return _SPLIT
 
 
 def enabled() -> bool:
@@ -1738,12 +1754,24 @@ def get_tier(n_layers=None, n_experts=256, dev=None,
         policy = None
         if base_enabled():
             policy = os.getenv("VLLM_MOE_W2_DELTA_POLICY", "need")
+        # Split refinement slots have a DIFFERENT geometry than full-FP4
+        # slots; a distinct pack tag ("fp4s") keeps the two modes' pack
+        # files apart — a shared pack dir otherwise ping-pong-rebuilds one
+        # file under the other config's feet (the page-cache store reads
+        # it live at serve time -> garbage FP4 rows on BOTH; measured).
+        fp4_tag = "fp4s" if split_enabled() else "fp4"
         _TIER = DeltaTier(
             n_layers, n_experts, dev or torch.device("cuda"),
             w13_bytes=W13_BYTES if w13_bytes is None else w13_bytes,
             w2_bytes=W2_BYTES if w2_bytes is None else w2_bytes,
-            policy=policy, tag="fp4" if base_enabled() else "delta",
+            policy=policy, tag=fp4_tag if base_enabled() else "delta",
             host_pinned=not base_enabled())
+        if base_enabled() and split_enabled() and _BASE_TIER is not None:
+            # residency coupling: the base tier must not evict slots the
+            # FP4 tier's refinement rows are mapped against
+            _BASE_TIER._coupled_fp4 = _TIER
+            logger.info("moe_w2 delta: split-FP4 residency coupling armed "
+                        "(base evictions exclude FP4-mapped experts)")
         # Start the background manager as soon as the tier exists. It idles until
         # experts are actually routed (seen empty -> early return) and only
         # promotes layers whose host planes are already staged, so an early start

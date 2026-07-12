@@ -290,11 +290,14 @@ def _fp4_tier_for_build(E: int, dev, n13k13: int, n2k2: int):
     carry their OWN block-32 scale sections ([fp4_13|sc13|fp4_2|sc2]) — the
     base planes, and with them the GPU-resident scale planes the standalone
     delta shares, are host-resident there. Split mode (DELTA_SPLIT): slots
-    hold 2-bit REFINEMENT planes — half the nibble bytes."""
+    hold 2-bit REFINEMENT planes (half the nibble bytes) and NO scale
+    sections even over the base cache — the split kernel reads scales from
+    the base slot the refinement is residency-coupled to."""
     from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+    split = moe_w2_delta.split_enabled()
     sc13, sc2 = ((n13k13 // 32, n2k2 // 32)
-                 if moe_w2_delta.base_enabled() else (0, 0))
-    div = 4 if moe_w2_delta.split_enabled() else 2
+                 if moe_w2_delta.base_enabled() and not split else (0, 0))
+    div = 4 if split else 2
     return moe_w2_delta.get_tier(n_experts=E, dev=dev,
                                  w13_bytes=n13k13 // div + sc13,
                                  w2_bytes=n2k2 // div + sc2)
@@ -303,9 +306,10 @@ def _fp4_tier_for_build(E: int, dev, n13k13: int, n2k2: int):
 def _stage_fp4_host(tier, layer_key: int, fp13, sc13, fp2, sc2) -> None:
     """Stage a layer's FP4 planes into the tier's pinned host store; over the
     base cache the scale planes ride along inside the slot sections (copied
-    section-by-section — no GPU-side cat temporaries)."""
+    section-by-section — no GPU-side cat temporaries). Split slots carry
+    refinement only — their scales live in the coupled base slot."""
     from vllm.model_executor.layers.quantization.utils import moe_w2_delta
-    if moe_w2_delta.base_enabled():
+    if moe_w2_delta.base_enabled() and not moe_w2_delta.split_enabled():
         tier.add_layer_host_sections(layer_key, (fp13, sc13), (fp2, sc2))
     else:
         tier.add_layer_host_planes(layer_key, fp13, fp2)
@@ -377,10 +381,15 @@ def plan_pack_skip(layer) -> bool:
                               c13len + s13len + c2len + s2len):
             return False
         if moe_w2_delta.enabled():
-            # over-base FP4 need-pool: its slots carry their own scales
-            # ([fp4_13|sc13|fp4_2|sc2]) — mirror _fp4_tier_for_build's sizing
-            fslot = (N13 * K13 // 2 + s13len) + (N2 * K2 // 2 + s2len)
-            if not pack_has_layer("fp4", key, n_keys, E, fslot):
+            # over-base FP4 need-pool: mirror _fp4_tier_for_build's sizing
+            # and get_tier's pack tag (split refinement slots live in a
+            # SEPARATE pack — different geometry, "fp4s")
+            if moe_w2_delta.split_enabled():
+                ftag, fslot = "fp4s", N13 * K13 // 4 + N2 * K2 // 4
+            else:
+                ftag = "fp4"
+                fslot = (N13 * K13 // 2 + s13len) + (N2 * K2 // 2 + s2len)
+            if not pack_has_layer(ftag, key, n_keys, E, fslot):
                 return False
     else:
         # GPU-resident: the planes cache is the only source that can
@@ -1290,6 +1299,78 @@ def _desc_build_kernel_base_delta(
         tl.store(d + 5, m, mask=mask)
 
 
+@triton.jit
+def _desc_build_kernel_base_delta_split(
+    eids_ptr, npost_ptr, bslot_ptr, fslot_ptr, miss_ptr, d_ptr, d4s_ptr,
+    a1b, as1b, c13b, a2b, as2b, c2b,
+    bpoolb, bslot_bytes, off_s13, off_c2, off_s2,
+    fpoolb, fslot_bytes, w13r_bytes,
+    a1_rb, as1_rb, c13_rb, a2_rb, as2_rb, c2_rb,
+    n_experts, pairs, cap6, cap8, mblock,
+    BLOCK: tl.constexpr,
+):
+    """Base cache + SPLIT FP4 need-pool: refinement slots are read AGAINST
+    the base pool slot (codes + scales), so a pair routes to the w4s tier
+    only when its expert is resident in BOTH slot tables. FP4-mapped but
+    base-missing counts as a MISS (contributes zero, bumps miss_ptr — the
+    runner's base fetch + replay restores it; the base tier's eviction
+    hard-excludes FP4-mapped experts so this is a transient, not a steady
+    state). w2 tables (d_ptr[0..1], 6-field) serve base-resident pairs not
+    in FP4; w4s tables (d4s_ptr[0..1], 8-field/64 B) carry
+    {a, as, base=bslot codes section, ref=fslot section,
+    bs=bslot scale section, c, m, pad}."""
+    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = p < pairs
+    e = tl.load(eids_ptr + p, mask=mask, other=0).to(tl.int64)
+    e = tl.minimum(tl.maximum(e, 0), n_experts - 1)
+    bslot = tl.load(bslot_ptr + e, mask=mask, other=-1).to(tl.int64)
+    fslot = tl.load(fslot_ptr + e, mask=mask, other=-1).to(tl.int64)
+    npost = tl.load(npost_ptr).to(tl.int64)
+    live = p < npost // mblock
+    bhit = bslot >= 0
+    is4 = (fslot >= 0) & bhit          # split serve needs BOTH resident
+    m2 = tl.where(live & bhit & ~is4, mblock, 0).to(tl.int64)
+    m4 = tl.where(live & is4, mblock, 0).to(tl.int64)
+    n_miss = tl.sum(tl.where(mask & live & ~bhit, 1, 0))
+    tl.atomic_add(miss_ptr, n_miss)
+    base = p.to(tl.int64) * mblock
+    bs = bpoolb + tl.maximum(bslot, 0) * bslot_bytes
+    fs = fpoolb + tl.maximum(fslot, 0) * fslot_bytes
+    a1 = a1b + base * a1_rb
+    as1 = as1b + base * as1_rb
+    c13 = c13b + base * c13_rb
+    a2 = a2b + base * a2_rb
+    as2 = as2b + base * as2_rb
+    c2 = c2b + base * c2_rb
+    for gi in tl.static_range(2):      # w2 tables (base pool sections)
+        d = d_ptr + gi * cap6 + p * 6
+        if gi == 0:
+            b, s, a, as_, c = bs, bs + off_s13, a1, as1, c13
+        else:
+            b, s, a, as_, c = bs + off_c2, bs + off_s2, a2, as2, c2
+        tl.store(d + 0, a, mask=mask)
+        tl.store(d + 1, as_, mask=mask)
+        tl.store(d + 2, b, mask=mask)
+        tl.store(d + 3, s, mask=mask)
+        tl.store(d + 4, c, mask=mask)
+        tl.store(d + 5, m2, mask=mask)
+    for gi in tl.static_range(2):      # w4s tables (base + refinement)
+        d = d4s_ptr + gi * cap8 + p * 8
+        if gi == 0:
+            bb, rr, ss, a, as_, c = bs, fs, bs + off_s13, a1, as1, c13
+        else:
+            bb, rr, ss, a, as_, c = (bs + off_c2, fs + w13r_bytes,
+                                     bs + off_s2, a2, as2, c2)
+        tl.store(d + 0, a, mask=mask)
+        tl.store(d + 1, as_, mask=mask)
+        tl.store(d + 2, bb, mask=mask)
+        tl.store(d + 3, rr, mask=mask)
+        tl.store(d + 4, ss, mask=mask)
+        tl.store(d + 5, c, mask=mask)
+        tl.store(d + 6, m4, mask=mask)
+        tl.store(d + 7, tl.zeros_like(m4), mask=mask)
+
+
 def _launch(tier: str, K: int, desc: torch.Tensor, n_rows: int, pairs: int,
             stream):
     fn = _fns[(tier, K)]
@@ -1428,7 +1509,22 @@ def _moe_w2_forward_timed(
             btier.miss_count.zero_()
         slot_row = btier.slot_table[layer_key]
         use_fp4 = tier is not None and not prefill
-        if use_fp4:
+        use_w4s_base = use_fp4 and moe_w2_delta.split_enabled()
+        if use_w4s_base:
+            fslot_row = tier.slot_table[layer_key]
+            d4s = ws["desc4s"]
+            _desc_build_kernel_base_delta_split[(triton.cdiv(pairs, 256),)](
+                expert_blocks, num_post, slot_row, fslot_row,
+                btier.miss_count, d, d4s,
+                a1_base.data_ptr(), ws["as1"].data_ptr(), ws["c13"].data_ptr(),
+                a2_base.data_ptr(), ws["as2"].data_ptr(), ws["c2"].data_ptr(),
+                btier.pool.data_ptr(), btier.slot_bytes,
+                st["off_s13"], st["off_c2"], st["off_s2"],
+                tier.pool.data_ptr(), tier.slot_bytes, tier.w13_bytes,
+                st["K13"], (st["K13"] // 128) * 4, 4 * st["K2"], st["K2"],
+                (st["K2"] // 128) * 4, 2 * st["K13"],
+                st["E"], pairs, cap * 6, d4s.shape[1] * 8, mblock, BLOCK=256)
+        elif use_fp4:
             fslot_row = tier.slot_table[layer_key]
             _desc_build_kernel_base_delta[(triton.cdiv(pairs, 256),)](
                 expert_blocks, num_post, slot_row, fslot_row,
@@ -1457,10 +1553,12 @@ def _moe_w2_forward_timed(
         # never write their c13/c2 rows, but those workspace rows hold STALE
         # values from a previous forward — zeroing the WEIGHT (not the rows)
         # makes the miss contribution an exact 0 for free. Graph-safe (pure
-        # tensor ops on captured buffers). FP4-resident pairs are NOT misses.
+        # tensor ops on captured buffers). FP4-resident pairs are NOT misses
+        # — except under split, where serving needs the BASE slot too (an
+        # FP4-mapped/base-missing pair contributed zero and must replay).
         e_pair = expert_blocks.to(torch.long).clamp_(0, st["E"] - 1)
         resident = (slot_row[e_pair] >= 0)
-        if use_fp4:
+        if use_fp4 and not use_w4s_base:
             resident |= (fslot_row[e_pair] >= 0)
         miss_rows = resident.repeat_interleave(mblock)[:slots]
         if not use_fp4:
@@ -1528,7 +1626,10 @@ def _moe_w2_forward_timed(
     if use_afrag:
         _afrag_repack(ws["a1"], ws["a1f"], pairs, st["K13"])
     _launch(w2tier, st["K13"], d[0], st["N13"], pairs, stream)
-    use_w4s = (tier is not None and not prefill and not base_mode
+    # split-FP4 dispatch: both residency modes fill ws["desc4s"] (classic:
+    # _desc_build_kernel_w4s against resident planes; base cache:
+    # _desc_build_kernel_base_delta_split against the coupled base slots)
+    use_w4s = (tier is not None and not prefill
                and moe_w2_delta.split_enabled())
     if tier is not None and not prefill:
         if use_w4s:
