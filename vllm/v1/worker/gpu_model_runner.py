@@ -5995,6 +5995,33 @@ class GPUModelRunner(
             format_gib(self.model_memory_usage),
             time_after_load - time_before_load,
         )
+        # moe_w2 pool-floor guard: refuse to serve a base-cache pool sized
+        # below its per-step working set (silent quality corruption:
+        # routed experts keep zeroed contributions). Runs here because the
+        # plane builder has registered every MoE layer by end-of-load and
+        # the spec/scheduler configs are final. VLLM_MOE_W2_FORCE_POOL=1
+        # downgrades the failure to a warning.
+        if moe_w2_gate is not None and not load_dummy_weights:
+            try:
+                from vllm.model_executor.layers.quantization.utils import (
+                    moe_w2_delta as _w2d_floor)
+                if _w2d_floor._BASE_TIER is not None or _w2d_floor._TIER is not None:
+                    _n_spec = 0
+                    if self.speculative_config is not None:
+                        _n_spec = int(getattr(
+                            self.speculative_config,
+                            "num_speculative_tokens", 0) or 0)
+                    _topk = int(getattr(
+                        self.model_config.hf_text_config,
+                        "num_experts_per_tok", 0) or 0)
+                    if _topk > 0:
+                        _w2d_floor.check_pool_floor(
+                            _topk, _n_spec,
+                            int(self.scheduler_config.max_num_seqs))
+            except ValueError:
+                raise
+            except Exception as e:  # noqa: BLE001 - guard must not break boot
+                logger.warning("moe_w2 pool-floor check skipped: %s", e)
         if not load_dummy_weights:
             prepare_communication_buffer_for_model(self.model)
             if (drafter := getattr(self, "drafter", None)) and (

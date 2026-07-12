@@ -34,16 +34,24 @@ Env knobs:
                            0.70-0.80 for more recall once a functional eval confirms
                            the FP4 upgrades are correct; lower to 0.50 if marginal.
   VLLM_MOE_W2_GATE_MAX_PROMOTE  cap experts force-promoted per fired step
-                                (default 64; 0 = unlimited). The cap bounds
-                                the fire cost: each promote is a synchronous
-                                H2D plane copy, and deep/wide models route
-                                600+ (layer, expert) pairs per step (GLM-5.2:
-                                unlimited fires measured 200-1400 promotes =
-                                up to ~6 GiB H2D and a 56->3 tok/s collapse;
-                                64 caps it at ~0.3 GiB). Most-needed experts
-                                are promoted first, and promotions persist,
-                                so repeated fires still converge to FP4
-                                coverage of the hard set.
+                                (default 0 = UNLIMITED). A cap below one
+                                step's routed set silently breaks the
+                                fire's contract: the replay re-decides the
+                                token with most of its routing still 2-bit
+                                (measured on DS4: cap 64 vs ~350-pair
+                                steps made accuracy/token-length WORSE as
+                                tau rose — partial upgrades churn the pool
+                                without cleaning any step). There is no
+                                model-independent "harmless" value, so the
+                                default is off; promotions are only the
+                                step's COLD routed experts (steady state:
+                                tens) and per-fire H2D is bounded by the
+                                pool size. Set a cap (e.g. 64-128) only
+                                for latency-sensitive serving on configs
+                                with large slots (non-split) AND a large
+                                pool — the GLM-5.2 case where unlimited
+                                fires measured 200-1400 promotes = ~6 GiB
+                                H2D and a 56->3 tok/s collapse.
   VLLM_MOE_W2_GATE_TRACE   0 (default) | 1 log each fire/re-forward.
 """
 
@@ -59,7 +67,7 @@ _ENABLED = os.getenv("VLLM_MOE_W2_GATE", "0") == "1"
 _SIGNAL = os.getenv("VLLM_MOE_W2_GATE_SIGNAL", "max_prob")
 _DEFAULT_TAU = {"max_prob": 0.60, "margin": 1.5}
 _TAU = float(os.getenv("VLLM_MOE_W2_GATE_TAU", str(_DEFAULT_TAU.get(_SIGNAL, 0.60))))
-_MAX_PROMOTE = int(os.getenv("VLLM_MOE_W2_GATE_MAX_PROMOTE", "64"))
+_MAX_PROMOTE = int(os.getenv("VLLM_MOE_W2_GATE_MAX_PROMOTE", "0"))
 _TRACE = os.getenv("VLLM_MOE_W2_GATE_TRACE", "0") == "1"
 # Measurement mode: on a fired step, COUNT routed experts (delta._need) instead of
 # promoting/re-forwarding -> study whether 2-bit difficulty concentrates on few

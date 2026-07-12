@@ -1757,6 +1757,76 @@ def base_enabled() -> bool:
     return _BASE_GB > 0
 
 
+def check_pool_floor(top_k: int, n_spec: int, max_num_seqs: int) -> None:
+    """Boot-time guard: refuse to serve when a pool is sized below its
+    WORKING-SET floor (VLLM_MOE_W2_FORCE_POOL=1 downgrades to a warning).
+
+    BASE cache: a pool smaller than the per-step routed working set cannot
+    hold a step's experts even with perfect eviction — the emergency path
+    then leaves routed experts ZEROED (silent quality corruption; measured
+    on DS4+MTP2: 11 GiB pool -> corrupted math, 14 GiB -> clean). Floor:
+        pairs = moe_layers x top_k x (1 + n_spec) x sqrt(min(seqs, 4))
+    (sqrt: concurrent decodes overlap heavily on hot experts). HARD floor
+    1.15x pairs (below the measured-bad anchor stays below it), comfort
+    1.40x (the measured-good anchor stays above it).
+
+    FP4 need-pool (gate): pool < one step's routed set means a fire can
+    NEVER cover its own step (partial upgrades regardless of
+    GATE_MAX_PROMOTE) — degraded recovery, not corruption: WARN only.
+    """
+    import math
+    force = os.getenv("VLLM_MOE_W2_FORCE_POOL", "0") == "1"
+    seq_f = math.sqrt(float(min(max(max_num_seqs, 1), 4)))
+    t = _BASE_TIER
+    if t is not None and len(t._store) > 0:
+        pairs = int(len(t._store) * top_k * (1 + n_spec) * seq_f)
+        hard = int(1.15 * pairs)
+        comfort = int(1.40 * pairs)
+        gib = t.n_slots * t.slot_bytes / 2**30
+        need_gib = hard * t.slot_bytes / 2**30
+        if t.n_slots < hard:
+            msg = (
+                f"moe_w2 BASE cache pool is BELOW the working-set floor: "
+                f"{t.n_slots} slots ({gib:.1f} GiB) < {hard} required "
+                f"(~{need_gib:.1f} GiB) for {len(t._store)} MoE layers x "
+                f"top-{top_k} x (1+{n_spec} spec) x {max_num_seqs} seqs. "
+                f"Steps will keep ZEROED expert contributions (silent "
+                f"quality corruption). Raise VLLM_MOE_W2_BASE_CACHE_GB, "
+                f"reduce num_speculative_tokens/max_num_seqs, or set "
+                f"VLLM_MOE_W2_FORCE_POOL=1 to serve anyway.")
+            if not force:
+                raise ValueError(msg)
+            logger.warning("%s (FORCED past the check)", msg)
+        elif t.n_slots < comfort:
+            logger.warning(
+                "moe_w2 BASE cache pool is tight: %d slots (%.1f GiB) < "
+                "comfort %d for this step working set — expect UNRESTORED "
+                "bursts at prefill->decode transitions (watch the KPI "
+                "line).", t.n_slots, gib, comfort)
+        else:
+            logger.info(
+                "moe_w2 BASE cache pool floor check OK: %d slots (%.1f "
+                "GiB) >= comfort %d (step working set %d pairs).",
+                t.n_slots, gib, comfort, pairs)
+    d = _TIER
+    if d is not None and gate_armed() and len(d._store) > 0:
+        step_set = int(len(d._store) * top_k * (1 + n_spec))
+        if d.n_slots < step_set:
+            logger.warning(
+                "moe_w2 FP4 need-pool (%d slots) is smaller than one "
+                "step's routed set (~%d pairs): gate fires can only "
+                "PARTIALLY upgrade their own step regardless of "
+                "GATE_MAX_PROMOTE. Quality recovery is degraded (not "
+                "corrupted). For clean fires raise VLLM_MOE_W2_DELTA_GB "
+                "to >= %.1f GiB.", d.n_slots, step_set,
+                step_set * d.slot_bytes / 2**30)
+
+
+def gate_armed() -> bool:
+    from vllm.model_executor.layers.quantization.utils import moe_w2_gate
+    return moe_w2_gate.enabled()
+
+
 def spec_suppressed() -> bool:
     """Spec-guard latch (VLLM_MOE_W2_SPEC_GUARD): True while the base pool
     is too cold for speculation to pay — the runner then skips scheduling
