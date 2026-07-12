@@ -54,6 +54,7 @@ MTPModelTypes = Literal[
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
+DSparkModelTypes = Literal["dspark"]
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
 ]
@@ -66,6 +67,7 @@ SpeculativeMethod = Literal[
     "custom_class",
     EagleModelTypes,
     NgramGPUTypes,
+    DSparkModelTypes,
 ]
 RejectionSampleMethod = Literal["standard", "synthetic"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
@@ -217,6 +219,43 @@ class SpeculativeConfig:
     synthetic_acceptance_rates. Only valid when rejection_sample_method is 'synthetic'.
     Mutually exclusive with synthetic_acceptance_rates."""
 
+    dspark_scheduler: bool = False
+    """Enable the DSpark hardware-aware confidence scheduler: adaptive
+    per-step verification width from the profiled cost table, online
+    engine-overhead estimate, and calibrated confidence-head survival.
+    Also captures FULL decode CUDA graphs at every verification width and,
+    when no num_speculative_tokens_per_batch_size is configured, auto-derives
+    the dynamic-SD batch-size table from the startup profile."""
+
+    dspark_per_request: bool = False
+    """DSpark: allocate per-request verification widths (paper Algorithm 1)
+    within the batch-level width budget via a global greedy over calibrated
+    prefix-survival probabilities. Requires dspark_scheduler."""
+
+    dspark_pad_to_bucket: bool = False
+    """DSpark: execute ragged per-request widths as a single uniform padded
+    forward at the scheduler-optimal width (pads route KV to the dummy slot
+    and are excluded from sampling), keeping FULL-graph execution. Requires
+    dspark_per_request."""
+
+    dspark_confidence_threshold: float = 0.0
+    """DSpark: per-request confidence threshold (0 disables). Requires
+    dspark_scheduler. This single knob drives two different mechanisms
+    depending on dspark_per_request:
+
+    - With dspark_per_request: it sets per-request VERIFICATION WIDTHS -- each
+      request keeps the prefix whose calibrated survival >= threshold.
+    - Without dspark_per_request: it masks drafts within the batch-uniform
+      width -- positions whose raw survival < threshold are force-rejected.
+
+    Primarily for acceptance-rate studies."""
+
+    dspark_budget_frac: float = 1.0
+    """DSpark: fraction of the batch verification-token budget the
+    per-request allocator may spend. 1.0 is lossless (equivalent to the
+    uniform batch width); lower values trade accepted tokens for higher
+    acceptance rates."""
+
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
         """Mean acceptance length to unconditional per-position rates, using
@@ -289,6 +328,7 @@ class SpeculativeConfig:
             "eagle3",
             "extract_hidden_states",
             "dflash",
+            "dspark",
         )
         factors.append(uses_aux_hidden_states)
 
@@ -561,6 +601,42 @@ class SpeculativeConfig:
 
         return hf_config
 
+    def _validate_dspark(self):
+        # Called at the end of __post_init__, once method is fully resolved.
+        if self.method != "dspark":
+            if (
+                self.dspark_scheduler
+                or self.dspark_per_request
+                or self.dspark_pad_to_bucket
+                or self.dspark_confidence_threshold != 0.0
+                or self.dspark_budget_frac != 1.0
+            ):
+                raise ValueError(
+                    f"dspark_* options require method='dspark' (got {self.method!r})."
+                )
+            return
+        if self.dspark_per_request and not self.dspark_scheduler:
+            raise ValueError("dspark_per_request requires dspark_scheduler=True.")
+        if self.dspark_pad_to_bucket and not self.dspark_per_request:
+            raise ValueError("dspark_pad_to_bucket requires dspark_per_request=True.")
+        if self.dspark_confidence_threshold > 0.0 and not self.dspark_scheduler:
+            raise ValueError(
+                "dspark_confidence_threshold requires dspark_scheduler=True."
+            )
+        if self.dspark_budget_frac < 1.0 and not self.dspark_per_request:
+            raise ValueError(
+                "dspark_budget_frac < 1.0 requires dspark_per_request=True."
+            )
+        if not 0.0 < self.dspark_budget_frac <= 1.0:
+            raise ValueError(
+                f"dspark_budget_frac must be in (0, 1], got {self.dspark_budget_frac}."
+            )
+        if not 0.0 <= self.dspark_confidence_threshold <= 1.0:
+            raise ValueError(
+                f"dspark_confidence_threshold must be in [0, 1], got "
+                f"{self.dspark_confidence_threshold}."
+            )
+
     def __post_init__(self):
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
@@ -604,6 +680,13 @@ class SpeculativeConfig:
                 self.model = self.target_model_config.model
                 # Align the quantization of draft model for cases such as
                 # --quantization fp8 with a bf16 checkpoint.
+                if not self.quantization:
+                    self.quantization = self.target_model_config.quantization
+            elif self.method == "dspark":
+                # DeepSeek DSpark can ship the weights inside the target checkpoint
+                if self.target_model_config is None:
+                    raise ValueError("target_model_config must be present for dspark")
+                self.model = self.target_model_config.model
                 if not self.quantization:
                     self.quantization = self.target_model_config.quantization
             elif self.method in ("ngram", "[ngram]"):
@@ -733,18 +816,24 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash"):
+                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
                 # yuhuili/EAGLE3-LLaMA3.1-Instruct-8B
                 # AngelSlim/Qwen3-8B_eagle3
+                # deepseek-ai/dspark_qwen3_8b_block7
                 elif "eagle-" in self.draft_model_config.model.lower():
                     self.method = "eagle"
                 elif "eagle3" in self.draft_model_config.model.lower():
                     self.method = "eagle3"
                 elif "dflash" in self.draft_model_config.model.lower():
                     self.method = "dflash"
+                elif (
+                    "dspark" in self.draft_model_config.model.lower()
+                    or "Qwen3DSparkModel" in self.draft_model_config.architectures
+                ):
+                    self.method = "dspark"
                 elif self.draft_model_config.hf_config.model_type == "medusa":
                     self.method = "medusa"
                 elif self.draft_model_config.hf_config.model_type == "mlp_speculator":
@@ -791,7 +880,18 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
 
-                if self.method == "dflash":
+                if self.method == "dspark" and (
+                    "Qwen3DSparkModel" not in self.draft_model_config.architectures
+                ):
+                    # DeepSeek-V4 DSpark reuses the full DeepSeek-V4 config
+                    # and its weights ship in the target checkpoint.
+                    self.draft_model_config.hf_config.model_type = "deepseek_v4"
+                    self.draft_model_config.hf_config.architectures = [
+                        "DSparkDraftModel"
+                    ]
+                    self.update_arch_()
+
+                if self.method in ("dflash", "dspark"):
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -845,6 +945,7 @@ class SpeculativeConfig:
                         self.target_parallel_config, self.draft_tensor_parallel_size
                     )
                 )
+        self._validate_dspark()
         return self
 
     def _validate_suffix_decoding(self):
@@ -1107,10 +1208,16 @@ class SpeculativeConfig:
         )
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "mtp", "dflash")
+        # NOTE: This method is usually a stand-in for "speculative decoding using
+        # target model hidden states"
+        # TODO(ben): Refactor this so the naming is clearer
+        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
+
+    def use_dspark(self) -> bool:
+        return self.method == "dspark"
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None

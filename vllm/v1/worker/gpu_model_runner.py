@@ -5387,6 +5387,22 @@ class GPUModelRunner(
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
             return None
+        # moe_w2 spec-guard (VLLM_MOE_W2_SPEC_GUARD): while the base pool is
+        # cold (replay EMA above threshold), drop this step's drafts instead
+        # of scheduling them — a k-token verify batch unions ~(1+k)x the
+        # experts of a pure decode step, so speculation on a cold pool
+        # multiplies miss-replays and is a net loss until the pool warms
+        # (colibri's measured cold-cache MTP regression). The drafter still
+        # ran (cheap); only scheduling is suppressed, and it resumes
+        # automatically via the tier's hysteresis latch.
+        if moe_w2_gate is not None:
+            try:
+                from vllm.model_executor.layers.quantization.utils import (
+                    moe_w2_delta as _w2d)
+                if _w2d.spec_suppressed():
+                    return None
+            except Exception:  # noqa: BLE001 - guard must never crash
+                pass
         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
         return DraftTokenIds(req_ids, draft_token_ids)
 
@@ -5868,6 +5884,24 @@ class GPUModelRunner(
                     and get_pp_group().world_size > 1
                 ):
                     self._pp_share_draft_embed_tokens()
+
+                # moe_w2 LOOKA/PILOT (router-lookahead, env-gated): collect
+                # the live mlp.gate weights per built w2 layer and allocate
+                # the in-graph prediction buffers. Must run after weight
+                # load (gates materialized, _LAYERS populated) and before
+                # any cudagraph capture. No-op unless armed via env.
+                if moe_w2_gate is not None:
+                    try:
+                        from vllm.model_executor.layers.quantization.utils \
+                            import moe_w2_delta as _w2d
+                        from vllm.model_executor.layers.quantization.utils \
+                            import moe_w2_looka as _w2l
+                        if _w2d._BASE_TIER is not None:
+                            _w2l.arm(self.model,
+                                     _w2d._BASE_TIER.n_layers,
+                                     _w2d._BASE_TIER.dev)
+                    except Exception as e:  # noqa: BLE001 - never fatal
+                        logger.warning("moe_w2 LOOKA arm failed: %s", e)
 
                 self._setup_eagle3_aux_hidden_state_outputs()
 

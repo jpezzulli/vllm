@@ -584,6 +584,33 @@ class TieredPackStore(MmapPackStore):
         return st
 
 
+def pack_has_layer(tag: str, layer_key: int, n_layers: int, n_experts: int,
+                   slot_bytes: int) -> bool:
+    """Sidecar-only presence probe: does the pack this config would serve
+    from already hold `layer_key`? Used at WEIGHT-CREATE time (before any
+    store exists) to decide the loader-level skip — a pack-resident layer's
+    checkpoint experts never need to be read into host staging at all.
+    Deliberately touches only the sidecar JSON (no fd, no arena, no pinned
+    allocs) and never raises."""
+    dir_ = os.getenv("VLLM_MOE_W2_STORE_DIR", "").strip()
+    if not dir_:
+        return False
+    try:
+        stride = (slot_bytes + _ALIGN - 1) // _ALIGN * _ALIGN
+        sidecar = os.path.join(dir_, f"{tag}.{_rank_suffix()}.json")
+        if not os.path.exists(sidecar):
+            return False
+        with open(sidecar) as f:
+            meta = json.load(f)
+        want = dict(version=_PACK_VERSION, E=n_experts,
+                    slot_bytes=slot_bytes, stride=stride)
+        if any(meta.get(k) != v for k, v in want.items()):
+            return False
+        return int(layer_key) in {int(li) for li in meta.get("layers", [])}
+    except Exception:  # noqa: BLE001 - probe only, staging path still works
+        return False
+
+
 def make_store(tag: str, n_layers: int, n_experts: int, slot_bytes: int,
                pinned: bool):
     """Store factory: pack-file backends when VLLM_MOE_W2_STORE_DIR is set

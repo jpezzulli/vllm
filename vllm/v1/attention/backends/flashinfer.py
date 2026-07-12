@@ -408,7 +408,9 @@ class FlashInferBackend(AttentionBackend):
 
     @staticmethod
     def get_dtype_for_flashinfer(kv_cache_dtype: str) -> torch.dtype:
-        if kv_cache_dtype in ("fp8", "fp8_e4m3"):
+        # "fp8_ds_mla" is the target's packed sparse-MLA format; dense layers
+        # sharing the cache config (e.g. DSpark draft heads) store plain e4m3.
+        if kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
             return torch.float8_e4m3fn
         elif kv_cache_dtype == "fp8_e5m2":
             return torch.float8_e5m2

@@ -117,6 +117,27 @@ def expected_sizes(E: int, N13: int, K13: int, N2: int, K2: int,
     return exp
 
 
+def cache_has_layer(layer_idx: int, sizes: dict[str, int]) -> bool:
+    """Presence probe for the loader-level skip: would try_load hit, without
+    reading a byte of plane data? Same validity rules (meta match + every
+    required part at its exact expected size); os.path.getsize only. Never
+    raises."""
+    if not enabled() or _broken:
+        return False
+    try:
+        d = _rank_dir()
+        mp = os.path.join(d, "meta.json")
+        if not os.path.exists(mp) or json.load(open(mp)) != _meta():
+            return False
+        for part, nbytes in sizes.items():
+            p = os.path.join(d, f"layer{layer_idx}.{part}.bin")
+            if not os.path.exists(p) or os.path.getsize(p) != nbytes:
+                return False
+        return True
+    except Exception:  # noqa: BLE001 - probe only, staging path still works
+        return False
+
+
 def try_load(layer_idx: int,
              sizes: dict[str, int]) -> dict[str, torch.Tensor] | None:
     """CPU u8 tensors for a cached layer, or None (miss). Never raises."""

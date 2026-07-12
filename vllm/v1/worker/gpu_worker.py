@@ -629,6 +629,18 @@ class Worker(WorkerBase):
         except Exception as e:  # noqa: BLE001 - opt-in path, never fatal
             logger.warning("moe_w2 delta auto-sizing failed: %s", e)
 
+        # moe_w2 BASE pool warm-start (VLLM_MOE_W2_POOL_HEAT): preload the
+        # previous run's hot ownership into the GPU slot pool. Same timing
+        # contract as finalize_auto: after weight load (host store staged)
+        # and BEFORE cudagraph capture (slot_table writes precede bake-in).
+        try:
+            from vllm.model_executor.layers.quantization.utils import (
+                moe_w2_delta)
+            if moe_w2_delta._BASE_TIER is not None:
+                moe_w2_delta._BASE_TIER.preload_pool()
+        except Exception as e:  # noqa: BLE001 - warm-start is best-effort
+            logger.warning("moe_w2 pool warm-start failed: %s", e)
+
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         warmup_sizes: list[int] = []
@@ -800,6 +812,16 @@ class Worker(WorkerBase):
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
+
+    def get_dspark_dynamic_sd_table(self) -> list[tuple[int, int, int]] | None:
+        getter = getattr(self.model_runner, "get_dspark_dynamic_sd_table", None)
+        return getter() if getter is not None else None
+
+    def get_dspark_cost_profile(
+        self,
+    ) -> tuple[list[int], list[list[float]]] | None:
+        getter = getattr(self.model_runner, "get_dspark_cost_profile", None)
+        return getter() if getter is not None else None
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()

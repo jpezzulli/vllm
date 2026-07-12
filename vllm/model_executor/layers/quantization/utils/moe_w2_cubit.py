@@ -89,6 +89,55 @@ def _to_fragment_major(a: torch.Tensor, pairs: int, K: int) -> torch.Tensor:
 _LAYERS: dict[int, dict] = {}
 _WS: dict = {}                  # shared workspaces, sized lazily
 
+# ---- adaptive expert top-p (VLLM_MOE_W2_TOPP, colibri's --topp) ----------
+# Keep each token's routed experts only up to cumulative router weight p:
+# the tail of the top-k carries little output mass but full fetch/compute
+# cost. Measured on colibri (GLM-5.2, same sigmoid+norm_topk router family):
+# p=0.7 cut expert loads 30-40% and bought 1.6x end-to-end on a cold cache.
+# Here it shrinks the per-step expert union — on the BASE cache that is
+# fewer misses and fewer replay triggers; GPU-resident it is less HBM
+# traffic. 0 (default) = off, exact stock routing.
+#   VLLM_MOE_W2_TOPP        cumulative-weight cutoff p in (0,1)
+#   VLLM_MOE_W2_TOPP_MIN    experts always kept per token (default 2)
+#   VLLM_MOE_W2_TOPP_RENORM 1 (default): renormalize kept weights so the
+#                           token's total routed weight is preserved
+#                           (colibri semantics for norm_topk models);
+#                           0: keep original weights (mass shrinks).
+_TOPP = float(os.getenv("VLLM_MOE_W2_TOPP", "0"))
+_TOPP_MIN = max(1, int(os.getenv("VLLM_MOE_W2_TOPP_MIN", "2")))
+_TOPP_RENORM = os.getenv("VLLM_MOE_W2_TOPP_RENORM", "1") == "1"
+
+
+def _apply_topp(topk_weights: torch.Tensor, topk_ids: torch.Tensor):
+    """Drop each token's routed-weight tail past cumulative fraction _TOPP.
+
+    Dropped entries get weight 0 and their expert id REDIRECTED to the
+    token's heaviest expert — the redirected pair never fetches a new
+    expert (top-1 is always kept) and its zero weight makes the unpermute
+    contribution exactly zero, so the drop needs no kernel changes and is
+    invisible to moe_align/desc. Pure static-shape tensor ops:
+    CUDA-graph-capture-safe. Returns (weights, ids) untouched when off."""
+    k = topk_ids.shape[1]
+    if not (0.0 < _TOPP < 1.0) or k <= _TOPP_MIN:
+        return topk_weights, topk_ids
+    w = topk_weights.float()
+    order = torch.argsort(w, dim=1, descending=True)
+    w_sorted = w.gather(1, order)
+    cum = torch.cumsum(w_sorted, dim=1)
+    tot = cum[:, -1:]
+    # keep ranks whose PRECEDING cumulative mass is still below p*tot
+    # (the first expert crossing the threshold is kept, colibri semantics)
+    keep_sorted = (cum - w_sorted) < (_TOPP * tot)
+    keep_sorted[:, :_TOPP_MIN] = True
+    keep = torch.zeros_like(keep_sorted).scatter(1, order, keep_sorted)
+    if _TOPP_RENORM:
+        kept_sum = (w * keep).sum(dim=1, keepdim=True).clamp_min(1e-20)
+        w = w * (tot / kept_sum)
+    top1 = topk_ids.gather(1, order[:, :1])
+    new_ids = torch.where(keep, topk_ids, top1.expand_as(topk_ids))
+    new_w = torch.where(keep, w, torch.zeros_like(w)).to(topk_weights.dtype)
+    return new_w, new_ids
+
 
 def enabled() -> bool:
     return os.getenv("VLLM_MOE_W2", "0") == "1"
@@ -274,6 +323,217 @@ def _pack_fp4_plane(nib):
     return pack_fp4_fragment_major(nib)
 
 
+# Loader-level skip (the planes-cache/pack "v1.5 follow-up"): layers the
+# pack already serves never need their checkpoint experts in host RAM at
+# all. Decided at CREATE time (sidecar probe), executed by stubbing the big
+# params + no-op'ing their weight loaders — the vLLM loader then streams
+# past those tensors without allocating or copying. Measured motivation
+# (GLM-5.2 TP2 boot-from-pack): ~190 s of giant host allocations before the
+# shard read, 222 s of staged copies during it, and a ~0.5 TB transient
+# that intermittently OOM'd the box when boots overlapped.
+_n_created = 0
+_skip_logged = False
+
+
+def _noop_loader(*args, **kwargs):
+    """Weight-loader stand-in for pack-skipped params: the expert loading
+    loop calls with return_success=True and must see truthy, or it treats
+    the shard as unmapped and keeps probing replicas."""
+    return True if kwargs.get("return_success") else None
+
+
+def plan_pack_skip(layer) -> bool:
+    """CREATE-time twin of the boot-from-cache paths: assign this layer's
+    key (the same build-order counter process_weights_after_loading uses),
+    probe whichever store this config will serve from — the pack sidecars
+    (BASE cache / host-resident) or the planes cache (GPU-resident) — and
+    when the layer is already served, stub the four big params and disarm
+    their loaders. Returns True when the layer boots with zero checkpoint
+    staging."""
+    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+    from vllm.model_executor.layers.quantization.utils import (
+        moe_w2_planes_cache as _pc)
+    from vllm.model_executor.layers.quantization.utils.moe_w2_store import (
+        pack_has_layer)
+    global _n_created
+    key = _n_created
+    _n_created += 1
+    layer._moe_w2_create_key = key
+    if not enabled():
+        return False
+    try:
+        E, N13, K13h = layer.w13_weight.shape
+        _, N2, K2h = layer.w2_weight.shape
+    except Exception:  # noqa: BLE001 - unexpected layout: stage as before
+        return False
+    K13, K2 = K13h * 2, K2h * 2
+    c13len, s13len = N13 * K13 // 4, N13 * K13 // 32
+    c2len, s2len = N2 * K2 // 4, N2 * K2 // 32
+    if moe_w2_delta.base_enabled():
+        # host-resident: the pack store serves the base (and the FP4
+        # need-pool when configured) — probe the sidecars.
+        n_keys = _layer_cutoff() + 1
+        if not pack_has_layer("base", key, n_keys, E,
+                              c13len + s13len + c2len + s2len):
+            return False
+        if moe_w2_delta.enabled():
+            # over-base FP4 need-pool: its slots carry their own scales
+            # ([fp4_13|sc13|fp4_2|sc2]) — mirror _fp4_tier_for_build's sizing
+            fslot = (N13 * K13 // 2 + s13len) + (N2 * K2 // 2 + s2len)
+            if not pack_has_layer("fp4", key, n_keys, E, fslot):
+                return False
+    else:
+        # GPU-resident: the planes cache is the only source that can
+        # replace the checkpoint requant — probe it (keyed by transformer
+        # layer index, sized exactly like process-time try_load).
+        lidx = _pc.layer_idx_from_name(getattr(layer, "layer_name", ""))
+        if lidx is None or not _pc.cache_has_layer(
+                lidx, _pc.expected_sizes(
+                    E, N13, K13, N2, K2, want_fp4=moe_w2_delta.enabled())):
+            return False
+    for pname in ("w13_weight", "w13_weight_scale",
+                  "w2_weight", "w2_weight_scale"):
+        p = getattr(layer, pname)
+        p.data = torch.empty(0, dtype=p.data.dtype, device="cpu")
+        p.weight_loader = _noop_loader
+    layer._moe_w2_shapes = (E, N13, K13, N2, K2)
+    layer._moe_w2_pack_skip = True
+    global _skip_logged
+    if not _skip_logged:
+        _skip_logged = True
+        logger.info(
+            "moe_w2 LOADER-SKIP armed: pack-resident expert layers are "
+            "neither host-staged nor copied from the checkpoint "
+            "(first: key %d)", key)
+    logger.debug("moe_w2: layer key %d loader-skipped", key)
+    return True
+
+
+# ---- streaming FIRST boot (VLLM_MOE_W2_STREAM_BUILD, default on) ---------
+# With no pack and no planes cache to skip from, the loader used to stage
+# the FULL expert checkpoint in host RAM before a single layer was
+# requantized — ~400+ GB transient on GLM-5.2, reported as a 4-5 h
+# swap-through first boot on a 354 GB host. Streaming build requants each
+# layer the moment its LAST expected expert tensor lands (exact per-param
+# load counting, no ordering assumptions) and stubs its staging right
+# after: peak staging = O(one layer) ≈ 6 GB instead of the checkpoint.
+# The GPU is idle during load anyway, so the per-layer requant overlaps
+# shard I/O instead of serializing after it. VLLM_MOE_W2_STREAM_BUILD=0
+# restores the stage-everything-then-build behaviour.
+_STREAM = os.getenv("VLLM_MOE_W2_STREAM_BUILD", "1") == "1"
+_stream_logged = False
+
+
+class _StreamLoader:
+    """Per-param weight_loader wrapper: counts SUCCESSFUL (expert, shard)
+    loads and triggers the layer build when every big param is complete.
+    A load arriving after the build would be silent data loss (the params
+    are stubs by then) — fail loudly instead."""
+
+    def __init__(self, layer, pname, inner):
+        self._layer = layer
+        self._pname = pname
+        self._inner = inner
+
+    def __call__(self, param, loaded_weight, *args, **kwargs):
+        # LAZY staging: the create hook left this param as a 0-byte stub
+        # (allocating every layer's host buffer up front peaked at ~300+ GB
+        # before the first shard was even read — measured). Materialize the
+        # layer's buffer the moment its first tensor arrives; with a
+        # layer-major checkpoint only a couple of layers are ever
+        # in-flight, an unordered one merely degrades to the old profile.
+        if param.data.numel() == 0:
+            shape = self._layer._moe_w2_stream_shapes[self._pname]
+            param.data = torch.empty(shape, dtype=param.data.dtype,
+                                     device="cpu")
+        ret = self._inner(param, loaded_weight, *args, **kwargs)
+        ok = (ret is True) if kwargs.get("return_success") else True
+        if not ok:
+            return ret
+        pend = self._layer._moe_w2_pending
+        if pend.get(self._pname, 0) <= 0:
+            raise RuntimeError(
+                f"moe_w2 stream-build: {self._pname} load arrived after "
+                f"the layer was already built — more (expert, shard) "
+                f"tensors than expected; set VLLM_MOE_W2_STREAM_BUILD=0 "
+                f"and report the checkpoint")
+        pend[self._pname] -= 1
+        if all(v == 0 for v in pend.values()):
+            key = self._layer._moe_w2_create_key
+            build_layer_planes_nvfp4(self._layer, key)
+            # Drop the staging storage IN PLACE on the ORIGINAL Parameter
+            # objects. _finish_layer replaced the layer's attributes with
+            # stub Parameters, but load_weights' params_dict (built once,
+            # up front) still references the originals for the rest of the
+            # load — without this, nothing frees until load_weights returns
+            # and the "streaming" peak is the whole checkpoint again
+            # (measured: 517 GB at 29/47 shards on GLM TP2).
+            for p in self._layer._moe_w2_stream_orig:
+                p.data = torch.empty(0, dtype=p.data.dtype, device="cpu")
+            self._layer._moe_w2_stream_orig = ()
+            self._layer._moe_w2_stream_built = True
+            logger.debug("moe_w2: layer key %d stream-built during load",
+                         key)
+        return ret
+
+
+def arm_stream_build(layer) -> bool:
+    """Arm the streaming per-layer build on a layer plan_pack_skip missed
+    (first boot, or a store that does not yet hold it). Expected loads per
+    param: w13-side shards land twice per expert (w1, w3), w2-side once —
+    exact counts over ALL SIX params the requant reads (including scale_2:
+    building before they land would bake uninitialized per-tensor scales
+    into the planes AND the caches), so completeness needs no
+    checkpoint-ordering assumption.
+
+    Staging is LAZY: the four big params become 0-byte stubs here and a
+    layer's buffers materialize on its FIRST loaded tensor (the up-front
+    create_weights allocation of every layer peaked at ~300 GB before the
+    first shard was read — measured), then drop IN PLACE at build (the
+    attribute swap alone frees nothing: load_weights' params_dict holds
+    the original objects until the load returns — measured 517 GB).
+    Returns True when armed (the caller then skips its own staging).
+    No-op unless VLLM_MOE_W2_STREAM_BUILD=1 (default)."""
+    global _stream_logged
+    if not (_STREAM and enabled()):
+        return False
+    try:
+        E = layer.w13_weight.shape[0]
+    except Exception:  # noqa: BLE001 - unexpected layout: staged path
+        return False
+    expected = {"w13_weight": 2 * E, "w13_weight_scale": 2 * E,
+                "w13_weight_scale_2": 2 * E,
+                "w2_weight": E, "w2_weight_scale": E,
+                "w2_weight_scale_2": E}
+    big = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+    wrappers = {}
+    for pname in expected:
+        p = getattr(layer, pname, None)
+        inner = getattr(p, "weight_loader", None)
+        if p is None or inner is None:
+            return False                # leave the layer fully staged
+        wrappers[pname] = (p, _StreamLoader(layer, pname, inner))
+    layer._moe_w2_pending = expected
+    # originals of the BIG params: their storage is dropped in place at
+    # build time, and their SHAPES feed the lazy materialization
+    layer._moe_w2_stream_orig = tuple(getattr(layer, p) for p in big)
+    layer._moe_w2_stream_shapes = {
+        p: tuple(getattr(layer, p).shape) for p in big}
+    for pname in big:                   # lazy: nothing staged until loaded
+        p = getattr(layer, pname)
+        p.data = torch.empty(0, dtype=p.data.dtype, device="cpu")
+    for pname, (p, wrap) in wrappers.items():
+        p.weight_loader = wrap
+    if not _stream_logged:
+        _stream_logged = True
+        logger.info(
+            "moe_w2 STREAM-BUILD armed: layer staging materializes on its "
+            "first loaded tensor and requants on its last (peak staging = "
+            "layers in flight, not the checkpoint); "
+            "VLLM_MOE_W2_STREAM_BUILD=0 restores the old path")
+    return True
+
+
 def _try_skip_requant(layer, layer_key: int, E: int, N13: int, K13: int,
                       N2: int, K2: int, param_names) -> bool:
     """Boot-from-pack: when every host store this config serves from already
@@ -307,8 +567,11 @@ def _try_skip_requant(layer, layer_key: int, E: int, N13: int, K13: int,
     tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
     if tier is not None and layer_key not in tier._store:
         return False
+    from vllm.model_executor.layers.quantization.utils import (
+        moe_w2_planes_cache as _pc)
     _LAYERS[layer_key] = dict(
         N13=N13, K13=K13, N2=N2, K2=K2, E=E, base=True,
+        tl_idx=_pc.layer_idx_from_name(getattr(layer, "layer_name", "")),
         off_s13=c13len, off_c2=c13len + s13len,
         off_s2=c13len + s13len + c2len,
         off4_s13=2 * c13len, off4_c2=2 * c13len + s13len,
@@ -477,6 +740,40 @@ def build_layer_planes_fp8(layer, layer_key: int,
                    f"w2_{scale_suffix}"))
 
 
+def _consume_planes_cache(layer, layer_key: int, dev,
+                          E: int, N13: int, K13: int, N2: int,
+                          K2: int) -> bool:
+    """Serve one layer's planes from the planes cache (GPU-resident
+    configs). CPU tensors from the cache feed the same _stage_fp4_host/
+    _finish_layer sinks as a fresh requant (their copy_ calls are
+    device-agnostic). Shared by the staged path (cache hit replaces the
+    requant) and the loader-skip path (stubs; the cache is the ONLY
+    source). Returns True on a hit."""
+    from vllm.model_executor.layers.quantization.utils import (
+        moe_w2_planes_cache as planes_cache)
+    lidx = planes_cache.layer_idx_from_name(getattr(layer, "layer_name", ""))
+    if not planes_cache.enabled() or lidx is None:
+        return False
+    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
+    cached = planes_cache.try_load(lidx, planes_cache.expected_sizes(
+        E, N13, K13, N2, K2, want_fp4=tier is not None))
+    if cached is None:
+        return False
+    planes13 = cached["planes13"].view(E, -1).to(dev)
+    sc13 = cached["sc13"].view(E, -1).to(dev)
+    planes2 = cached["planes2"].view(E, -1).to(dev)
+    sc2 = cached["sc2"].view(E, -1).to(dev)
+    if tier is not None:
+        _stage_fp4_host(tier, layer_key, cached["fp13"].view(E, -1),
+                        sc13, cached["fp2"].view(E, -1), sc2)
+    _finish_layer(layer, layer_key, dev, planes13, sc13, planes2,
+                  sc2, N13, K13, N2, K2, E,
+                  ("w13_weight", "w13_weight_scale", "w2_weight",
+                   "w2_weight_scale"))
+    logger.info("moe_w2: layer %d planes from cache", lidx)
+    return True
+
+
 def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
     """NVFP4 (modelopt) checkpoint variant of build_layer_planes
     (ModelOptNvFp4FusedMoE: nvidia/GLM-5.2-NVFP4 — e2m1 codes + e4m3
@@ -495,6 +792,32 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
 
     assert _ensure_ready(), "moe_w2 cubins missing"
     dev = torch.device("cuda")
+    if getattr(layer, "_moe_w2_pack_skip", False):
+        # loader-level skip: the params are 0-byte stubs (plan_pack_skip),
+        # shapes travel via the create-time stash. The probed store MUST
+        # still serve the layer — there is no checkpoint copy to fall
+        # back to.
+        E, N13, K13, N2, K2 = layer._moe_w2_shapes
+        _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
+        if moe_w2_delta.base_enabled():
+            assert _try_skip_requant(
+                layer, layer_key, E, N13, K13, N2, K2,
+                ("w13_weight", "w13_weight_scale", "w2_weight",
+                 "w2_weight_scale")), (
+                f"moe_w2: layer {layer_key} was loader-skipped on a pack "
+                f"sidecar hit but the pack no longer serves it "
+                f"(dir/sidecar changed mid-load?) — restart without the "
+                f"stale VLLM_MOE_W2_STORE_DIR state")
+            return
+        # GPU-resident: materialize the planes from the planes cache
+        # (probed at create time; a miss here means the cache dir changed
+        # under a live load).
+        assert _consume_planes_cache(layer, layer_key, dev,
+                                     E, N13, K13, N2, K2), (
+            f"moe_w2: layer {layer_key} was loader-skipped on a planes-"
+            f"cache hit but the cache no longer serves it — restart "
+            f"without the stale VLLM_MOE_W2_PLANES_CACHE state")
+        return
     w13 = layer.w13_weight.data                 # [E, 2I, H/2] u8 (cpu)
     s13 = layer.w13_weight_scale.data           # [E, 2I, H/16] e4m3
     s13_2 = layer.w13_weight_scale_2.data       # [E, 2] f32 (w1, w3)
@@ -520,30 +843,13 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
     # Kimi-K2.7 restarts). Complements the pack store's boot-from-pack
     # above: the cache serves GPU-RESIDENT plane configs (planes must be
     # materialized), the pack store serves host-resident tiers (planes
-    # never materialize). CPU tensors from the cache feed the same
-    # _stage_fp4_host/_finish_layer sinks (their copy_ calls are
-    # device-agnostic).
+    # never materialize).
+    if _consume_planes_cache(layer, layer_key, dev, E, N13, K13, N2, K2):
+        return
     from vllm.model_executor.layers.quantization.utils import (
         moe_w2_planes_cache as planes_cache)
-    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
     lidx = planes_cache.layer_idx_from_name(getattr(layer, "layer_name", ""))
-    if planes_cache.enabled() and lidx is not None:
-        cached = planes_cache.try_load(lidx, planes_cache.expected_sizes(
-            E, N13, K13, N2, K2, want_fp4=tier is not None))
-        if cached is not None:
-            planes13 = cached["planes13"].view(E, -1).to(dev)
-            sc13 = cached["sc13"].view(E, -1).to(dev)
-            planes2 = cached["planes2"].view(E, -1).to(dev)
-            sc2 = cached["sc2"].view(E, -1).to(dev)
-            if tier is not None:
-                _stage_fp4_host(tier, layer_key, cached["fp13"].view(E, -1),
-                                sc13, cached["fp2"].view(E, -1), sc2)
-            _finish_layer(layer, layer_key, dev, planes13, sc13, planes2,
-                          sc2, N13, K13, N2, K2, E,
-                          ("w13_weight", "w13_weight_scale", "w2_weight",
-                           "w2_weight_scale"))
-            logger.info("moe_w2: layer %d planes from cache", lidx)
-            return
+    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
 
     planes13 = torch.empty(E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
     sc13 = torch.empty(E, N13 * K13 // 32, dtype=torch.uint8, device=dev)
@@ -605,6 +911,12 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
 def _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
                   N13, K13, N2, K2, E, param_names) -> None:
     from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+    # transformer layer index of this layer_key (dense-offset models: GLM's
+    # first sparse layer 3 -> key 0). LOOKA uses it to pair each key with
+    # its transformer layer's router (mlp.gate) weights.
+    from vllm.model_executor.layers.quantization.utils import (
+        moe_w2_planes_cache as _pc)
+    _tl = _pc.layer_idx_from_name(getattr(layer, "layer_name", ""))
     if moe_w2_delta.base_enabled():
         # BASE cache (inverted delta): the 2-bit planes go to PINNED HOST RAM
         # instead of staying GPU-resident; the GPU holds only the base tier's
@@ -621,7 +933,7 @@ def _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
             torch.cat((planes13, sc13), dim=1),
             torch.cat((planes2, sc2), dim=1))
         _LAYERS[layer_key] = dict(
-            N13=N13, K13=K13, N2=N2, K2=K2, E=E, base=True,
+            N13=N13, K13=K13, N2=N2, K2=K2, E=E, base=True, tl_idx=_tl,
             off_s13=c13len, off_c2=c13len + s13len,
             off_s2=c13len + s13len + c2len,
             # FP4 need-pool slot sections ([fp4_13|sc13|fp4_2|sc2]; fp4 codes
@@ -642,7 +954,7 @@ def _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
 
     _LAYERS[layer_key] = dict(
         planes13=planes13, sc13=sc13, planes2=planes2, sc2=sc2,
-        N13=N13, K13=K13, N2=N2, K2=K2, E=E,
+        N13=N13, K13=K13, N2=N2, K2=K2, E=E, tl_idx=_tl,
     )
     # Release checkpoint copies; keep CUDA stubs so device probes stay happy.
     stub = torch.empty(0, dtype=torch.uint8, device=dev)
@@ -1019,6 +1331,10 @@ def _moe_w2_forward_timed(
 
     st = _LAYERS[layer_key]
     T, H = x.shape
+    # adaptive expert top-p (env-gated; identity when off). Must run before
+    # moe_align/mark_seen/route_log so dropped experts are neither fetched
+    # nor counted as routed.
+    topk_weights, topk_ids = _apply_topp(topk_weights, topk_ids)
     top_k = topk_ids.shape[1]
     dev = x.device
     stream = ctypes.c_void_p(torch.cuda.current_stream(dev).cuda_stream)
@@ -1087,6 +1403,16 @@ def _moe_w2_forward_timed(
             # the gate's force_promote reads the FP4 tier's own seen scatter
             moe_w2_delta.mark_seen(tier.seen[layer_key],
                                    topk_ids.view(-1).long())
+        if not prefill:
+            # LOOKA/PILOT (router-lookahead): score predictors + write the
+            # next layer's prediction. Must run BEFORE the route_log
+            # overwrite below (predictor [0] reads last step's ids from it).
+            # In-graph safe (persistent buffers, static shapes); no-op
+            # unless armed.
+            from vllm.model_executor.layers.quantization.utils import (
+                moe_w2_looka)
+            if moe_w2_looka.enabled():
+                moe_w2_looka.record(layer_key, x, topk_ids, btier.route_log)
         if not prefill and btier.route_log is not None:
             # per-(token,layer) routing log for the draft-prefetch predictor:
             # a static [n_layers, T_cap, k_cap] buffer the runner reads back

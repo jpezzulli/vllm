@@ -130,6 +130,12 @@ def should_reforward(logits: torch.Tensor) -> bool:
     """
     global _n_steps, _n_fired
     _n_steps += 1
+    # Step-boundary signal for the tier managers: this is the one gate call
+    # guaranteed once per decode step, so delta-only configs (no base tier,
+    # hence no runner step_begin) still get event-driven manager passes
+    # instead of the legacy free-running poll.
+    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+    moe_w2_delta.wake_all()
     if logits is None or logits.numel() == 0:
         return False
     if logits.dim() == 1:

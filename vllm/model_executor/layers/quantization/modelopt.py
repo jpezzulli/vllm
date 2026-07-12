@@ -1650,12 +1650,24 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         # process_weights_after_loading. Mutating .data keeps the vLLM
         # parameter classes and their loader attributes intact (scale_2 /
         # input_scale are tiny and stay put).
+        # Loader-level skip first: a layer the pack store already serves
+        # (boot-from-pack sidecar hit) needs NO checkpoint staging at all —
+        # plan_pack_skip stubs the big params and disarms their loaders,
+        # removing both the ~0.5 TB host-RAM transient and the staged
+        # copies (the intermittent-OOM / slow-boot root cause on GLM TP2).
         from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
         if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
-            for pname in ("w13_weight", "w13_weight_scale",
-                          "w2_weight", "w2_weight_scale"):
-                p_ = getattr(layer, pname)
-                p_.data = p_.data.cpu()
+            if not moe_w2_cubit.plan_pack_skip(layer):
+                # first boot / store miss: stream-build stages lazily
+                # (buffers materialize per layer as its tensors load,
+                # requant fires on the last, staging drops in place) —
+                # peak host RAM stays O(layers in flight), not
+                # O(checkpoint). Fallback: classic all-layers CPU staging.
+                if not moe_w2_cubit.arm_stream_build(layer):
+                    for pname in ("w13_weight", "w13_weight_scale",
+                                  "w2_weight", "w2_weight_scale"):
+                        p_ = getattr(layer, pname)
+                        p_.data = p_.data.cpu()
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         """
@@ -1672,8 +1684,12 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
             from vllm.model_executor.layers.fused_moe.config import (
                 FUSED_MOE_UNQUANTIZED_CONFIG)
-            key = len(moe_w2_cubit._LAYERS)
-            moe_w2_cubit.build_layer_planes_nvfp4(layer, key)
+            # the CREATE-time counter when the loader-skip planner ran
+            # (identical build order); len(_LAYERS) for older paths
+            key = getattr(layer, "_moe_w2_create_key",
+                          len(moe_w2_cubit._LAYERS))
+            if not getattr(layer, "_moe_w2_stream_built", False):
+                moe_w2_cubit.build_layer_planes_nvfp4(layer, key)
             layer._moe_w2_key = key
             self._moe_w2_active = True
             self.moe_quant_config = FUSED_MOE_UNQUANTIZED_CONFIG
