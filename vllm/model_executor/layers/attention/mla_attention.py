@@ -801,7 +801,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             else:
                 mqa_q = (mqa_ql_nope, mqa_q_pe)
             if self.impl.dcp_world_size > 1:
-                assert not fp8_attention, "DCP not support fp8 kvcache now."
+                # Quantized KV caches are fine under DCP as long as the query
+                # that rides the all-gather stays bf16 (packed-cache sparse
+                # impls); impls that quantize the query itself are not wired.
+                assert not (fp8_attention and self.impl.supports_quant_query_input), (
+                    "DCP does not support fp8-quantized query input."
+                )
                 # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
                 mqa_q = torch.cat(mqa_q, dim=-1)
                 # mqa_q do allgather in head dim.
@@ -814,19 +819,22 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
+                # Kernels differ in LSE convention: FA3-style impls emit
+                # natural-log LSE, the SM120 sparse kernels emit log2.
+                lse_base_e = not getattr(self.impl, "returns_base2_lse", False)
                 if self.dcp_a2a:
                     attn_out = dcp_a2a_lse_reduce(
                         attn_out,
                         lse,
                         get_dcp_group(),
-                        is_lse_base_on_e=True,
+                        is_lse_base_on_e=lse_base_e,
                     )
                 else:
                     attn_out = cp_lse_ag_out_rs(
                         attn_out,
                         lse,
                         get_dcp_group(),
-                        is_lse_base_on_e=True,
+                        is_lse_base_on_e=lse_base_e,
                     )
 
             # v_up projection

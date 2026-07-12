@@ -32,6 +32,13 @@ def _kv_scale_format_for_model(model_type: str | None) -> str:
 class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata]):
     """SM120 FlashInfer sparse-MLA implementation."""
 
+    # DCP support: the SM120 sparse kernels emit a per-(token, head) LSE that
+    # the MLA layer merges across ranks. NOTE: the kernels store LSE in the
+    # log2 domain (log2f(sum) + max, sentinel -1e30 for empty rows); the
+    # merge must run with is_lse_base_on_e=False (see returns_base2_lse).
+    can_return_lse_for_decode: bool = True
+    returns_base2_lse: bool = True
+
     def __init__(
         self,
         num_heads: int,
@@ -105,6 +112,12 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
         self.supports_quant_query_input = False
         self._workspace_buffer: torch.Tensor | None = None
 
+        # DCP: the shared topk buffer holds *global* positions merged by the
+        # indexer; forward_mqa filters them down to this rank's local slots.
+        self.cp_kv_cache_interleave_size = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
+
     def do_kv_cache_update(
         self,
         kv_c_normed: torch.Tensor,
@@ -141,23 +154,43 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
             q = torch.cat(q, dim=-1)
 
         num_actual_toks = q.shape[0]
+        # Under DCP the MLA layer all-gathers q along the head dim, so this
+        # rank attends with every head over its local KV shard; the layer
+        # LSE-merges and reduce-scatters the partial outputs afterwards.
+        num_heads = q.shape[1] if self.dcp_world_size > 1 else self.num_heads
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        topk_indices_physical = cast(
-            torch.Tensor,
-            triton_convert_req_index_to_global_index(
-                attn_metadata.req_id_per_token[:num_actual_toks],
-                attn_metadata.block_table,
-                topk_indices,
-                BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
-            ),
+        # With DCP the buffer holds globally merged positions; entries owned
+        # by other ranks resolve to -1 and are skipped by the sparse kernel
+        # (interspersed -1 indices are masked, not just tail padding).
+        return_lse = self.need_to_return_lse_for_decode
+        valid_counts: torch.Tensor | None = None
+        conv = triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token[:num_actual_toks],
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            dcp_world_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+            # Rows with no locally owned candidate are skipped by the kernel
+            # (their LSE lands at the -1e30 sentinel but the output row may
+            # keep stale pool memory) - track them so they can be zeroed
+            # before the cross-rank merge.
+            return_valid_counts=return_lse,
         )
+        if return_lse:
+            topk_indices_physical, valid_counts = cast(
+                tuple[torch.Tensor, torch.Tensor], conv
+            )
+        else:
+            topk_indices_physical = cast(torch.Tensor, conv)
 
         output = q.new_empty(
-            (num_actual_toks, self.num_heads, self.kv_lora_rank),
+            (num_actual_toks, num_heads, self.kv_lora_rank),
             dtype=q.dtype,
         )
 
@@ -183,5 +216,17 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
             bmm2_scale=1.0,
             sparse_mla_top_k=attn_metadata.topk_tokens,
             kv_scale_format=self.kv_scale_format,
+            return_lse=return_lse,
         )
+        if return_lse:
+            out, lse = out
+            out = out.squeeze(1)
+            # lse: [num_tokens, num_heads] fp32, log2 domain. Rows where this
+            # rank owns no selected candidate report the -1e30 LSE sentinel
+            # (zero weight in the merge), but their *output* rows are
+            # uninitialized pool memory - zero them so a stray NaN/Inf can't
+            # leak through the 0-weight multiply in the LSE correction.
+            assert valid_counts is not None
+            out.masked_fill_((valid_counts == 0).view(-1, 1, 1), 0.0)
+            return out, lse
         return out.squeeze(1), None

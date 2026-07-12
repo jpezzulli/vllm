@@ -23,6 +23,12 @@ def _convert_req_index_to_global_index_kernel(
     BLOCK_N: tl.constexpr,  # tile width along columns
     HAS_PREFILL: tl.constexpr,
     COUNT_VALID: tl.constexpr,  # whether to count valid indices
+    # decode-context-parallel sharding: token_indices hold *global* positions;
+    # only positions owned by DCP_RANK resolve to local slots, the rest emit
+    # -1 (skipped by the sparse kernels). DCP_WORLD == 1 folds to a no-op.
+    DCP_WORLD: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
     # strides (in elements)
     bt_stride0,
     bt_stride1,
@@ -52,6 +58,12 @@ def _convert_req_index_to_global_index_kernel(
     if HAS_PREFILL:
         prefill_req_id = tl.load(prefill_request_id_ptr + token_id)
         is_prefill = prefill_req_id >= 0
+    if DCP_WORLD > 1:
+        # Global position -> (owner rank, local position) under interleaved
+        # sharding; foreign positions become -1.
+        unit = tok // CP_INTERLEAVE
+        is_invalid_tok |= (unit % DCP_WORLD) != DCP_RANK
+        tok = (unit // DCP_WORLD) * CP_INTERLEAVE + tok % CP_INTERLEAVE
     # Compute block id and in-block offset
     block_id = tok // BLOCK_SIZE
     inblock_off = tok % BLOCK_SIZE
@@ -93,6 +105,9 @@ def triton_convert_req_index_to_global_index(
     prefill_workspace_request_ids: torch.Tensor | None = None,
     prefill_workspace_starts: torch.Tensor | None = None,
     return_valid_counts: bool = False,
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     out[token_id, indice_id] =
@@ -115,6 +130,11 @@ def triton_convert_req_index_to_global_index(
 
     When return_valid_counts is True, also returns the count of valid (non -1)
     indices per row, computed during the same kernel pass (no extra overhead).
+
+    When dcp_world_size > 1, token_indices are *global* token positions under
+    interleaved decode-context-parallel sharding: entries owned by other
+    ranks become -1 and owned entries are translated to this rank's local
+    slot ids via the (local) block_table.
     """
     assert req_id.dtype == torch.int32
     assert block_table.dtype == torch.int32
@@ -176,6 +196,9 @@ def triton_convert_req_index_to_global_index(
         BLOCK_N,
         HAS_PREFILL_WORKSPACE,
         return_valid_counts,
+        dcp_world_size,
+        dcp_rank,
+        cp_kv_cache_interleave_size,
         # strides
         bt_stride0,
         bt_stride1,

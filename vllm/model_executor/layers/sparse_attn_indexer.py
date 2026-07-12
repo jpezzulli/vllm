@@ -27,6 +27,12 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.dcp_sparse_topk import (
+    MAX_FP32_EXACT_ID,
+    dcp_gather_topk_scores,
+    dcp_local_pos_to_global,
+    dcp_merge_global_topk,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
@@ -78,6 +84,36 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+def _dcp_merge_topk_into_buffer(
+    logits: torch.Tensor,
+    topk_indices: torch.Tensor,
+    interleave: int,
+    col_offset: torch.Tensor | None = None,
+) -> None:
+    """Lift local top-k winners to global ids and reduce across the DCP group.
+
+    ``topk_indices`` (int32, ``-1`` pad) hold *local-shard* positions and are
+    overwritten in place with the merged *global* top-k (identical on every
+    rank). ``col_offset`` rebases per-row positions into the shared prefill
+    logits workspace for the score gather; decode logits are already
+    request-relative.
+    """
+    from vllm.distributed.parallel_state import get_dcp_group
+
+    dcp_group = get_dcp_group()
+    scores = dcp_gather_topk_scores(logits, topk_indices, col_offset=col_offset)
+    global_ids = dcp_local_pos_to_global(
+        topk_indices,
+        dcp_group.world_size,
+        dcp_group.rank_in_group,
+        interleave,
+    )
+    merged = dcp_merge_global_topk(
+        global_ids, scores, topk_indices.shape[1], dcp_group
+    )
+    topk_indices.copy_(merged)
+
+
 @eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -96,6 +132,8 @@ def sparse_attn_indexer(
     topk_indices_buffer: torch.Tensor,
     skip_k_cache_insert: bool,
     use_fp4_cache: bool = False,
+    dcp_world_size: int = 1,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -138,6 +176,8 @@ def sparse_attn_indexer(
             topk_indices_buffer,
             skip_k_cache_insert,
             use_fp4_cache,
+            dcp_world_size,
+            cp_kv_cache_interleave_size,
         )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
@@ -190,6 +230,26 @@ def sparse_attn_indexer(
             scales_spec,
         )
         for chunk in prefill_metadata.chunks:
+            num_chunk_rows = chunk.token_end - chunk.token_start
+            if dcp_world_size > 1 and chunk.total_seq_lens == 0:
+                # This rank's shard is empty for the whole chunk, but the
+                # cross-rank merge below is a collective: contribute an all
+                # invalid candidate list (buffer rows are already -1).
+                empty_logits = torch.full(
+                    (num_chunk_rows, 1),
+                    float("-inf"),
+                    dtype=torch.float32,
+                    device=q_quant.device,
+                )
+                _dcp_merge_topk_into_buffer(
+                    empty_logits,
+                    topk_indices_buffer[
+                        chunk.token_start : chunk.token_end, :topk_tokens
+                    ],
+                    cp_kv_cache_interleave_size,
+                )
+                continue
+
             k_quant = k_quant_full[: chunk.total_seq_lens]
             k_scale = k_scale_full[: chunk.total_seq_lens]
 
@@ -254,6 +314,17 @@ def sparse_attn_indexer(
                 logits.stride(1),
                 topk_tokens,
             )
+
+            if dcp_world_size > 1:
+                # Local winners -> global ids -> group-wide top-k. The score
+                # gather needs workspace columns, so rebase the per-request
+                # positions by each row's K start (cu_seqlen_ks).
+                _dcp_merge_topk_into_buffer(
+                    logits,
+                    topk_indices,
+                    cp_kv_cache_interleave_size,
+                    col_offset=chunk.cu_seqlen_ks,
+                )
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -387,6 +458,16 @@ def sparse_attn_indexer(
                 topk_tokens,
             )
 
+        if dcp_world_size > 1:
+            # Decode logits columns are local-shard positions per row; merge
+            # before the (optional) unpack so padded rows simply ride along
+            # with -inf scores and stay -1.
+            _dcp_merge_topk_into_buffer(
+                logits,
+                topk_indices,
+                cp_kv_cache_interleave_size,
+            )
+
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
             # the topk indices removing padded tokens
@@ -418,6 +499,8 @@ def sparse_attn_indexer_fake(
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool,
     use_fp4_cache: bool = False,
+    dcp_world_size: int = 1,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -474,6 +557,30 @@ class SparseAttnIndexer(CustomOp):
                 "the current vLLM environment."
             )
 
+        # Decode context parallelism: the op scores the local KV shard only
+        # and merges per-rank top-k candidates across the DCP group.
+        try:
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            self.dcp_world_size = get_dcp_group().world_size
+        except AssertionError:
+            self.dcp_world_size = 1
+        from vllm.config import get_current_vllm_config
+
+        self.cp_kv_cache_interleave_size = (
+            get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
+        )
+        if self.dcp_world_size > 1:
+            assert max_model_len < MAX_FP32_EXACT_ID, (
+                "DCP sparse-topk exchanges candidate ids as exact fp32 "
+                f"values, which caps max_model_len at {MAX_FP32_EXACT_ID}; "
+                f"got {max_model_len}."
+            )
+            assert not use_fp4_cache, (
+                "DCP for the DSA indexer is not wired up for the FP4 "
+                "indexer cache."
+            )
+
     def forward_native(
         self,
         hidden_states: torch.Tensor,
@@ -521,6 +628,8 @@ class SparseAttnIndexer(CustomOp):
             self.topk_indices_buffer,
             self.skip_k_cache_insert,
             self.use_fp4_cache,
+            self.dcp_world_size,
+            self.cp_kv_cache_interleave_size,
         )
 
     def forward_xpu(
@@ -540,6 +649,9 @@ class SparseAttnIndexer(CustomOp):
         weights: torch.Tensor,
     ):
         assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"
+        assert self.dcp_world_size == 1, (
+            "DCP is not supported by the ROCm sparse_attn_indexer path."
+        )
         assert isinstance(q_quant, torch.Tensor), (
             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
