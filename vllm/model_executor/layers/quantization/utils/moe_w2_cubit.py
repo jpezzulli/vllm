@@ -167,6 +167,7 @@ def _ensure_ready() -> bool:
         torch.zeros(1, device="cuda")
         cu = _driver()
         for tier, kern in (("w2", b"moe_w2_mm"), ("w4", b"moe_w4_mm"),
+                           ("w4s", b"moe_w4s_mm"),
                            ("w2mc2", b"moe_w2_mm"), ("w2mc4", b"moe_w2_mm")):
             # GEMM contraction K: gate-up needs K=hidden (4096 DS4-Flash,
             # 6144 GLM-5.x, 7168 Kimi-K2.x); down needs K=I/TP (2048 @ TP1,
@@ -223,9 +224,11 @@ def _ensure_ready() -> bool:
 def _require_kernels(K13: int, K2: int, need_w4: bool) -> None:
     """Fail loudly at weight load when the cubins this model's shapes need are
     missing from _DIR (they are loaded opportunistically in _ensure_ready)."""
+    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
     need = [("w2", K13), ("w2", K2), ("w2mc4", K13), ("w2mc4", K2)]
     if need_w4:
-        need += [("w4", K13), ("w4", K2)]
+        w4tier = "w4s" if moe_w2_delta.split_enabled() else "w4"
+        need += [(w4tier, K13), (w4tier, K2)]
     missing = [f"{t}_k{k}" for t, k in need if (t, k) not in _fns]
     assert not missing, (
         f"moe_w2_cubit: missing cubins for K13={K13}/K2={K2}: {missing} "
@@ -237,13 +240,15 @@ def _fp4_tier_for_build(E: int, dev, n13k13: int, n2k2: int):
     N13*K13, n2k2 = N2*K2 elements). Over the base cache the FP4 slots must
     carry their OWN block-32 scale sections ([fp4_13|sc13|fp4_2|sc2]) — the
     base planes, and with them the GPU-resident scale planes the standalone
-    delta shares, are host-resident there."""
+    delta shares, are host-resident there. Split mode (DELTA_SPLIT): slots
+    hold 2-bit REFINEMENT planes — half the nibble bytes."""
     from vllm.model_executor.layers.quantization.utils import moe_w2_delta
     sc13, sc2 = ((n13k13 // 32, n2k2 // 32)
                  if moe_w2_delta.base_enabled() else (0, 0))
+    div = 4 if moe_w2_delta.split_enabled() else 2
     return moe_w2_delta.get_tier(n_experts=E, dev=dev,
-                                 w13_bytes=n13k13 // 2 + sc13,
-                                 w2_bytes=n2k2 // 2 + sc2)
+                                 w13_bytes=n13k13 // div + sc13,
+                                 w2_bytes=n2k2 // div + sc2)
 
 
 def _stage_fp4_host(tier, layer_key: int, fp13, sc13, fp2, sc2) -> None:
@@ -255,6 +260,18 @@ def _stage_fp4_host(tier, layer_key: int, fp13, sc13, fp2, sc2) -> None:
         tier.add_layer_host_sections(layer_key, (fp13, sc13), (fp2, sc2))
     else:
         tier.add_layer_host_planes(layer_key, fp13, fp2)
+
+
+def _pack_fp4_plane(nib):
+    """One expert's FP4-tier plane row from its e2m1 nibbles: the full
+    fragment-major nibble plane (moe_w4_mm), or — split mode — the 2-bit
+    REFINEMENT plane (moe_w4s_mm reads it alongside the resident base)."""
+    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
+        nibbles_to_refinement, pack_fp4_fragment_major)
+    if moe_w2_delta.split_enabled():
+        return pack_fragment_major(nibbles_to_refinement(nib))
+    return pack_fp4_fragment_major(nib)
 
 
 def _try_skip_requant(layer, layer_key: int, E: int, N13: int, K13: int,
@@ -344,8 +361,10 @@ def build_layer_planes(layer, layer_key: int) -> None:
     tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
     fp13 = fp2 = None
     if tier is not None:
-        fp13 = torch.empty(E, N13 * K13 // 2, dtype=torch.uint8, device=dev)
-        fp2 = torch.empty(E, N2 * K2 // 2, dtype=torch.uint8, device=dev)
+        # full nibble planes (w4) or 2-bit refinement planes (w4s, split)
+        _div = 4 if moe_w2_delta.split_enabled() else 2
+        fp13 = torch.empty(E, N13 * K13 // _div, dtype=torch.uint8, device=dev)
+        fp2 = torch.empty(E, N2 * K2 // _div, dtype=torch.uint8, device=dev)
 
     chunk = 32
     for e0 in range(0, E, chunk):
@@ -357,7 +376,7 @@ def build_layer_planes(layer, layer_key: int) -> None:
             planes13[e0 + i] = pack_fragment_major(mxfp4_to_codes(wg[i]))
             sc13[e0 + i] = pack_scales(sg[i])
             if fp13 is not None:
-                fp13[e0 + i] = pack_fp4_fragment_major(nib)
+                fp13[e0 + i] = _pack_fp4_plane(nib)
         wg = w2[e0:e1].to(dev, non_blocking=True)
         sg = s2[e0:e1].to(dev, non_blocking=True)
         for i in range(e1 - e0):
@@ -365,7 +384,7 @@ def build_layer_planes(layer, layer_key: int) -> None:
             planes2[e0 + i] = pack_fragment_major(mxfp4_to_codes(wg[i]))
             sc2[e0 + i] = pack_scales(sg[i])
             if fp2 is not None:
-                fp2[e0 + i] = pack_fp4_fragment_major(nib)
+                fp2[e0 + i] = _pack_fp4_plane(nib)
 
     if tier is not None:
         _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
@@ -419,8 +438,10 @@ def build_layer_planes_fp8(layer, layer_key: int,
     tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
     fp13 = fp2 = None
     if tier is not None:
-        fp13 = torch.empty(E, N13 * K13 // 2, dtype=torch.uint8, device=dev)
-        fp2 = torch.empty(E, N2 * K2 // 2, dtype=torch.uint8, device=dev)
+        # full nibble planes (w4) or 2-bit refinement planes (w4s, split)
+        _div = 4 if moe_w2_delta.split_enabled() else 2
+        fp13 = torch.empty(E, N13 * K13 // _div, dtype=torch.uint8, device=dev)
+        fp2 = torch.empty(E, N2 * K2 // _div, dtype=torch.uint8, device=dev)
 
     # fp8 experts are 4x the bytes of the mxfp4 path and the requant makes f32
     # temporaries -> smaller H2D chunks, per-expert quantize.
@@ -435,7 +456,7 @@ def build_layer_planes_fp8(layer, layer_key: int,
             planes13[e0 + i] = pack_fragment_major(codes)
             sc13[e0 + i] = pack_scales(sbytes)
             if fp13 is not None:
-                fp13[e0 + i] = pack_fp4_fragment_major(nib)
+                fp13[e0 + i] = _pack_fp4_plane(nib)
         wg = w2[e0:e1].to(dev, non_blocking=True)
         sg = s2[e0:e1].to(dev, non_blocking=True)
         for i in range(e1 - e0):
@@ -444,7 +465,7 @@ def build_layer_planes_fp8(layer, layer_key: int,
             planes2[e0 + i] = pack_fragment_major(codes)
             sc2[e0 + i] = pack_scales(sbytes)
             if fp2 is not None:
-                fp2[e0 + i] = pack_fp4_fragment_major(nib)
+                fp2[e0 + i] = _pack_fp4_plane(nib)
 
     if tier is not None:
         _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
@@ -531,8 +552,10 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
 
     fp13 = fp2 = None
     if tier is not None:
-        fp13 = torch.empty(E, N13 * K13 // 2, dtype=torch.uint8, device=dev)
-        fp2 = torch.empty(E, N2 * K2 // 2, dtype=torch.uint8, device=dev)
+        # full nibble planes (w4) or 2-bit refinement planes (w4s, split)
+        _div = 4 if moe_w2_delta.split_enabled() else 2
+        fp13 = torch.empty(E, N13 * K13 // _div, dtype=torch.uint8, device=dev)
+        fp2 = torch.empty(E, N2 * K2 // _div, dtype=torch.uint8, device=dev)
 
     # f64 temporaries are 16x the packed nibbles -> small H2D chunks,
     # per-expert quantize (mirrors the fp8 loader).
@@ -551,7 +574,7 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
             planes13[e0 + i] = pack_fragment_major(codes)
             sc13[e0 + i] = pack_scales(sbytes)
             if fp13 is not None:
-                fp13[e0 + i] = pack_fp4_fragment_major(nib)
+                fp13[e0 + i] = _pack_fp4_plane(nib)
         wg = w2[e0:e1].to(dev, non_blocking=True)
         sg = s2[e0:e1].to(dev, non_blocking=True)
         s2g = s2_2[e0:e1].to(dev, non_blocking=True)
@@ -562,7 +585,7 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
             planes2[e0 + i] = pack_fragment_major(codes)
             sc2[e0 + i] = pack_scales(sbytes)
             if fp2 is not None:
-                fp2[e0 + i] = pack_fp4_fragment_major(nib)
+                fp2[e0 + i] = _pack_fp4_plane(nib)
 
     if planes_cache.enabled() and lidx is not None:
         planes_cache.store(lidx, dict(planes13=planes13, sc13=sc13,
@@ -680,6 +703,9 @@ def _workspaces(slots: int, tokens: int, dev, inter: int = 2048,
                            device=dev),
             desc=torch.empty(4, slots // _BLOCK, 6, dtype=torch.int64,
                              device=dev),
+            # split-FP4 (moe_w4s_mm) desc tables: 8 u64 per pair, 64 B ABI
+            desc4s=torch.empty(2, slots // _BLOCK, 8, dtype=torch.int64,
+                               device=dev),
             # -1 slot row for the tier-less desc path; sized to the MODEL's
             # expert count (256 = DS4 default; 384 Kimi-K2.x reads past a
             # fixed 256-row table).
@@ -788,6 +814,58 @@ def _desc_build_kernel(
         tl.store(d + 3, s, mask=mask)
         tl.store(d + 4, c, mask=mask)
         tl.store(d + 5, m, mask=mask)
+
+
+@triton.jit
+def _desc_build_kernel_w4s(
+    eids_ptr, npost_ptr, slot_ptr, d_ptr,
+    a1b, as1b, c13b, a2b, as2b, c2b,
+    p13b, s13b, p2b, s2b, poolb,
+    p13s, s13s, p2s, s2s,
+    slot_bytes, w13r_bytes,
+    a1_rb, as1_rb, c13_rb, a2_rb, as2_rb, c2_rb,
+    n_experts, pairs, cap8, mblock,
+    BLOCK: tl.constexpr,
+):
+    """Split-FP4 desc tables (moe_w4s_mm, 8 x u64 per pair, 64 B ABI):
+    {a, as, base, ref, bs, c, m_rows, pad}. `base`/`bs` point at the
+    RESIDENT 2-bit plane / scale rows (exactly the w2 tier's pointers);
+    `ref` at the delta slot's refinement sections ([ref13 | ref2],
+    w13r_bytes = ref13 section size). Written alongside the main kernel's
+    w2 tables; pairs not FP4-resident get m=0 (w4s early-EXITs)."""
+    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = p < pairs
+    e = tl.load(eids_ptr + p, mask=mask, other=0).to(tl.int64)
+    e = tl.minimum(tl.maximum(e, 0), n_experts - 1)
+    slot = tl.load(slot_ptr + e, mask=mask, other=-1).to(tl.int64)
+    npost = tl.load(npost_ptr).to(tl.int64)
+    live = p < npost // mblock
+    is4 = slot >= 0
+    m4 = tl.where(live & is4, mblock, 0).to(tl.int64)
+    base = p.to(tl.int64) * mblock
+    ref = poolb + tl.maximum(slot, 0) * slot_bytes
+    a1 = a1b + base * a1_rb
+    as1 = as1b + base * as1_rb
+    c13 = c13b + base * c13_rb
+    a2 = a2b + base * a2_rb
+    as2 = as2b + base * as2_rb
+    c2 = c2b + base * c2_rb
+    for gi in tl.static_range(2):
+        d = d_ptr + gi * cap8 + p * 8
+        if gi == 0:
+            bb, rr, ss, a, as_, c = (p13b + e * p13s, ref, s13b + e * s13s,
+                                     a1, as1, c13)
+        else:
+            bb, rr, ss, a, as_, c = (p2b + e * p2s, ref + w13r_bytes,
+                                     s2b + e * s2s, a2, as2, c2)
+        tl.store(d + 0, a, mask=mask)
+        tl.store(d + 1, as_, mask=mask)
+        tl.store(d + 2, bb, mask=mask)
+        tl.store(d + 3, rr, mask=mask)
+        tl.store(d + 4, ss, mask=mask)
+        tl.store(d + 5, c, mask=mask)
+        tl.store(d + 6, m4, mask=mask)
+        tl.store(d + 7, tl.zeros_like(m4), mask=mask)
 
 
 @triton.jit
@@ -1093,6 +1171,23 @@ def _moe_w2_forward_timed(
             st["K13"], (st["K13"] // 128) * 4, 4 * st["K2"], st["K2"],
             (st["K2"] // 128) * 4, 2 * st["K13"],
             st["E"], pairs, cap * 6, mblock, BLOCK=256)
+        if tier is not None and not prefill and moe_w2_delta.split_enabled():
+            # split-FP4: the extra 8-field tables for moe_w4s_mm (base/bs =
+            # the resident plane rows, ref = the slot's refinement sections)
+            d4s = ws["desc4s"]
+            _desc_build_kernel_w4s[(triton.cdiv(pairs, 256),)](
+                expert_blocks, num_post, slot_row, d4s,
+                a1_base.data_ptr(), ws["as1"].data_ptr(),
+                ws["c13"].data_ptr(), a2_base.data_ptr(),
+                ws["as2"].data_ptr(), ws["c2"].data_ptr(),
+                st["planes13"].data_ptr(), st["sc13"].data_ptr(),
+                st["planes2"].data_ptr(), st["sc2"].data_ptr(), pool_ptr,
+                st["planes13"].shape[1], st["sc13"].shape[1],
+                st["planes2"].shape[1], st["sc2"].shape[1],
+                tier.slot_bytes, tier.w13_bytes,
+                st["K13"], (st["K13"] // 128) * 4, 4 * st["K2"], st["K2"],
+                (st["K2"] // 128) * 4, 2 * st["K13"],
+                st["E"], pairs, d4s.shape[1] * 8, mblock, BLOCK=256)
 
     # ---- w13 GEMMs (both tiers) -> fused silu*up -> quant -> w2 GEMMs
     # AFRAG prefill: single-pass triton repack row-major a1/a2 -> fragment-major
@@ -1107,8 +1202,14 @@ def _moe_w2_forward_timed(
     if use_afrag:
         _afrag_repack(ws["a1"], ws["a1f"], pairs, st["K13"])
     _launch(w2tier, st["K13"], d[0], st["N13"], pairs, stream)
+    use_w4s = (tier is not None and not prefill and not base_mode
+               and moe_w2_delta.split_enabled())
     if tier is not None and not prefill:
-        _launch("w4", st["K13"], d[2], st["N13"], pairs, stream)
+        if use_w4s:
+            _launch("w4s", st["K13"], ws["desc4s"][0], st["N13"], pairs,
+                    stream)
+        else:
+            _launch("w4", st["K13"], d[2], st["N13"], pairs, stream)
     act = ws["act"][:slots]
     torch.ops._C.silu_and_mul(act, ws["c13"][:slots])
     _, qs2 = per_token_group_quant_fp8(act, 128, out_q=ws["a2"][:slots])
@@ -1117,7 +1218,10 @@ def _moe_w2_forward_timed(
         _afrag_repack(ws["a2"], ws["a2f"], pairs, st["K2"])
     _launch(w2tier, st["K2"], d[1], st["N2"], pairs, stream)
     if tier is not None and not prefill:
-        _launch("w4", st["K2"], d[3], st["N2"], pairs, stream)
+        if use_w4s:
+            _launch("w4s", st["K2"], ws["desc4s"][1], st["N2"], pairs, stream)
+        else:
+            _launch("w4", st["K2"], d[3], st["N2"], pairs, stream)
 
     # ---- weighted unpermute (pad slots masked out), DETERMINISTIC.
     # The old `out.index_add_(0, rows, c2*w)` scattered with atomics, so the

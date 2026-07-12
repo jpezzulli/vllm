@@ -81,6 +81,7 @@ def _ckpt_id() -> str:
 
 
 def _meta() -> dict:
+    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
     world, rank = _tp_ids()
     return dict(
         version=_VERSION,
@@ -88,6 +89,9 @@ def _meta() -> dict:
         world=world,
         rank=rank,
         zero_mode=os.getenv("VLLM_MOE_W2_ZERO_MODE", "auto"),
+        # split-FP4 stores 2-bit refinement planes in fp13/fp2 (half the
+        # bytes) — a cache built in the other mode must MISS wholesale
+        fp4_split=moe_w2_delta.split_enabled(),
     )
 
 
@@ -99,6 +103,7 @@ def _rank_dir() -> str:
 
 def expected_sizes(E: int, N13: int, K13: int, N2: int, K2: int,
                    want_fp4: bool) -> dict[str, int]:
+    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
     exp = {
         "planes13": E * N13 * K13 // 4,
         "sc13": E * N13 * K13 // 32,
@@ -106,8 +111,9 @@ def expected_sizes(E: int, N13: int, K13: int, N2: int, K2: int,
         "sc2": E * N2 * K2 // 32,
     }
     if want_fp4:
-        exp["fp13"] = E * N13 * K13 // 2
-        exp["fp2"] = E * N2 * K2 // 2
+        div = 4 if moe_w2_delta.split_enabled() else 2
+        exp["fp13"] = E * N13 * K13 // div
+        exp["fp2"] = E * N2 * K2 // div
     return exp
 
 

@@ -39,6 +39,39 @@ _NIBBLE_TO_CODE = torch.tensor(
 # 2-bit code -> e2m1 nibble of the reconstructed level (for golden tests)
 _CODE_TO_NIBBLE = torch.tensor([0xE, 0xA, 0x2, 0x6], dtype=torch.uint8)
 
+# --- split-FP4 refinement (moe_w4s_mm) -------------------------------------
+# e2m1 magnitude index -> 2-bit refinement code within the base-code class.
+# Small classes (codes +-1, mags {0,.5,1,1.5,2}) have 5 members for 4 codes:
+# magnitude 0 MERGES into 0.5 (measured least-mass adjacent pair on real GLM
+# packs, 3.6% of elements; unit err 0.5 where the 2-bit base gives them 1.0).
+# Big classes (codes +-4, mags {3,4,6}) fit with a spare code. The kernel's
+# decode pools are pool_S={.5,1,1.5,2} and pool_B={3,4,6,6} indexed by ref;
+# sign comes from the base code. Nesting invariant (code is a pure function
+# of the nibble) holds pack-wide: kernels/gen/moe_w4s_nesting_study.py.
+_MAG_TO_REF = torch.tensor([0, 0, 1, 2, 3, 0, 1, 2], dtype=torch.uint8)
+# ref -> reconstructed |value|, per class (golden tests / references)
+_REF_TO_VAL_SMALL = torch.tensor([0.5, 1.0, 1.5, 2.0])
+_REF_TO_VAL_BIG = torch.tensor([3.0, 4.0, 6.0, 6.0])
+
+
+def nibbles_to_refinement(nib: torch.Tensor) -> torch.Tensor:
+    """e2m1 nibbles (u8, 0..15) -> 2-bit refinement codes for moe_w4s_mm
+    (the base 2-bit plane supplies class+sign; see _MAG_TO_REF above)."""
+    return _MAG_TO_REF.to(nib.device)[(nib & 7).long()]
+
+
+def split_fp4_dequant(nib: torch.Tensor) -> torch.Tensor:
+    """Values the SPLIT decode reconstructs from e2m1 nibbles (mag 0 -> 0.5
+    merge included) — the reference for split-path golden tests."""
+    dev = nib.device
+    mag = (nib & 7).long()
+    code = _NIBBLE_TO_CODE.to(dev)[nib.long()]
+    ref = _MAG_TO_REF.to(dev)[mag].long()
+    big = (code == 0) | (code == 3)
+    val = torch.where(big, _REF_TO_VAL_BIG.to(dev)[ref],
+                      _REF_TO_VAL_SMALL.to(dev)[ref])
+    return torch.where(code <= 1, -val, val)
+
 # 2-bit code -> e4m3 byte (the kernel's PRMT LUT): -4,-1,1,4
 PRMT_LUT_WORD = 0x4838B8C8
 

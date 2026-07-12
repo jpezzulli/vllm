@@ -1191,6 +1191,30 @@ _KPI_EVERY = int(os.getenv("VLLM_MOE_W2_KPI_EVERY", "500"))
 # set DELTA_GB and must not silently grow an FP4 pool out of the default.
 _GB_EXPLICIT = "VLLM_MOE_W2_DELTA_GB" in os.environ
 
+# SPLIT FP4 (VLLM_MOE_W2_DELTA_SPLIT=1, default off): the delta tier stores
+# 2-bit REFINEMENT planes instead of full e2m1 nibble planes and dispatches
+# moe_w4s_mm, which reads them alongside the GPU-RESIDENT 2-bit base planes
+# (nested codebook; see moe_w2_planes.nibbles_to_refinement) — half the
+# pool bytes per expert = 2x FP4 coverage at equal VRAM, at ~+16-23%
+# kernel-time on the FP4-served pairs (decode ALU; read bytes unchanged).
+# Requires the base planes resident on GPU, so it is INERT over the base
+# cache (the base slot could be evicted under the refinement's feet;
+# residency coupling is future work).
+_SPLIT = os.getenv("VLLM_MOE_W2_DELTA_SPLIT", "0") == "1"
+
+
+def split_enabled() -> bool:
+    if not _SPLIT:
+        return False
+    if base_enabled():
+        logger.warning_once(
+            "VLLM_MOE_W2_DELTA_SPLIT=1 is unsupported over the base cache "
+            "(VLLM_MOE_W2_BASE_CACHE_GB>0) — the resident 2-bit base the "
+            "split kernel refines does not exist there. Flag ignored; the "
+            "FP4 tier serves full nibble planes via moe_w4_mm.")
+        return False
+    return True
+
 
 def enabled() -> bool:
     if os.getenv("VLLM_MOE_W2_DELTA", "1") != "1":
