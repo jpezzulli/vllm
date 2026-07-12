@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -134,6 +136,7 @@ def sparse_attn_indexer(
     use_fp4_cache: bool = False,
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
+    dcp_local_topk: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -178,6 +181,7 @@ def sparse_attn_indexer(
             use_fp4_cache,
             dcp_world_size,
             cp_kv_cache_interleave_size,
+            dcp_local_topk,
         )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
@@ -403,11 +407,21 @@ def sparse_attn_indexer(
                 clean_logits=False,
             )
         num_rows = logits.shape[0]
-        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+
+        # DCP local-quota mode: select each rank's local top-(k/N) and skip
+        # the per-layer cross-rank merge entirely (~21 sync points per decode
+        # step otherwise). The attention-side LSE merge weights the per-rank
+        # partial outputs exactly; only the candidate SET is approximate
+        # (union of per-rank quotas instead of the global top-k, a close
+        # match under interleave=1 striping). The buffer tail beyond the
+        # quota stays -1 and is skipped by the sparse kernel.
+        dcp_local_quota = dcp_world_size > 1 and dcp_local_topk
+        k_select = topk_tokens // dcp_world_size if dcp_local_quota else topk_tokens
+        topk_indices = topk_indices_buffer[:num_padded_tokens, :k_select]
 
         use_cooperative_topk = (
             current_platform.is_cuda()
-            and topk_tokens in (512, 1024, 2048)
+            and k_select in (512, 1024, 2048)
             and num_rows <= 32
             and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
             and current_platform.has_device_capability(90)
@@ -415,7 +429,7 @@ def sparse_attn_indexer(
             # Blackwell (SM12x) rejects it with "invalid argument"
             and not current_platform.is_device_capability_family(120)
         )
-        use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
+        use_persistent_topk = current_platform.is_cuda() and k_select in (
             512,
             1024,
             2048,
@@ -430,7 +444,7 @@ def sparse_attn_indexer(
                 seq_lens,
                 topk_indices,
                 topk_workspace,
-                topk_tokens,
+                k_select,
                 attn_metadata_narrowed.max_seq_len,
             )
         elif use_persistent_topk:
@@ -443,7 +457,7 @@ def sparse_attn_indexer(
                 seq_lens,
                 topk_indices,
                 topk_workspace,
-                topk_tokens,
+                k_select,
                 attn_metadata_narrowed.max_seq_len,
             )
         else:
@@ -455,13 +469,29 @@ def sparse_attn_indexer(
                 num_rows,
                 logits.stride(0),
                 logits.stride(1),
-                topk_tokens,
+                k_select,
             )
 
-        if dcp_world_size > 1:
-            # Decode logits columns are local-shard positions per row; merge
-            # before the (optional) unpack so padded rows simply ride along
-            # with -inf scores and stay -1.
+        if dcp_local_quota:
+            # Quota tail is dead space for this step; keep the -1 padding
+            # convention so downstream conversion and the sparse kernel
+            # skip it (the buffer may hold stale ids from earlier steps).
+            topk_indices_buffer[:num_padded_tokens, k_select:topk_tokens] = -1
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            dcp_group = get_dcp_group()
+            topk_indices.copy_(
+                dcp_local_pos_to_global(
+                    topk_indices,
+                    dcp_group.world_size,
+                    dcp_group.rank_in_group,
+                    cp_kv_cache_interleave_size,
+                )
+            )
+        elif dcp_world_size > 1:
+            # Exact mode: decode logits columns are local-shard positions per
+            # row; merge before the (optional) unpack so padded rows simply
+            # ride along with -inf scores and stay -1.
             _dcp_merge_topk_into_buffer(
                 logits,
                 topk_indices,
@@ -501,6 +531,7 @@ def sparse_attn_indexer_fake(
     use_fp4_cache: bool = False,
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
+    dcp_local_topk: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -570,6 +601,21 @@ class SparseAttnIndexer(CustomOp):
         self.cp_kv_cache_interleave_size = (
             get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
         )
+        # Decode top-k mode under DCP. Default (exact): local top-k, then an
+        # all-gather + re-select of the global top-k on every indexer layer
+        # (~21 collectives per decode step). Measured on GLM-5.2 @ 4x PRO
+        # 6000 they are CONSTANT-cost and off the critical path (steps/s is
+        # flat from 8K to 891K context), so exact stays the default.
+        # VLLM_DCP_SPARSE_LOCAL_TOPK=1 switches decode to a per-rank local
+        # top-(k/N) quota with no collective at all. Only for MTP-off
+        # configs: the approximate candidate set decorrelates the shared-
+        # index MTP drafter from the target (acceptance 2.9 -> 1.5) and
+        # costs more end-to-end than the collectives it saves. Prefill
+        # always uses the exact merge.
+        self.dcp_local_topk = (
+            self.dcp_world_size > 1
+            and os.environ.get("VLLM_DCP_SPARSE_LOCAL_TOPK", "0") == "1"
+        )
         if self.dcp_world_size > 1:
             assert max_model_len < MAX_FP32_EXACT_ID, (
                 "DCP sparse-topk exchanges candidate ids as exact fp32 "
@@ -580,6 +626,14 @@ class SparseAttnIndexer(CustomOp):
                 "DCP for the DSA indexer is not wired up for the FP4 "
                 "indexer cache."
             )
+            if self.dcp_local_topk:
+                logger.info_once(
+                    "DCP DSA indexer decode top-k: LOCAL quota "
+                    "(top-%d per rank, no per-layer collective). "
+                    "Not recommended with MTP - the approximate candidate "
+                    "set collapses draft acceptance.",
+                    topk_tokens // self.dcp_world_size,
+                )
 
     def forward_native(
         self,
@@ -630,6 +684,7 @@ class SparseAttnIndexer(CustomOp):
             self.use_fp4_cache,
             self.dcp_world_size,
             self.cp_kv_cache_interleave_size,
+            self.dcp_local_topk,
         )
 
     def forward_xpu(
