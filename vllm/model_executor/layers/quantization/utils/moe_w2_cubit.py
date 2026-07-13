@@ -216,7 +216,7 @@ def _ensure_ready() -> bool:
         torch.zeros(1, device="cuda")
         cu = _driver()
         for tier, kern in (("w2", b"moe_w2_mm"), ("w4", b"moe_w4_mm"),
-                           ("w4s", b"moe_w4s_mm"),
+                           ("w4q", b"moe_w4q_mm"),
                            ("w2mc2", b"moe_w2_mm"), ("w2mc4", b"moe_w2_mm")):
             # GEMM contraction K: gate-up needs K=hidden (4096 DS4-Flash,
             # 6144 GLM-5.x, 7168 Kimi-K2.x); down needs K=I/TP (2048 @ TP1,
@@ -276,7 +276,7 @@ def _require_kernels(K13: int, K2: int, need_w4: bool) -> None:
     from vllm.model_executor.layers.quantization.utils import moe_w2_delta
     need = [("w2", K13), ("w2", K2), ("w2mc4", K13), ("w2mc4", K2)]
     if need_w4:
-        w4tier = "w4s" if moe_w2_delta.split_enabled() else "w4"
+        w4tier = "w4q" if moe_w2_delta.split_enabled() else "w4"
         need += [(w4tier, K13), (w4tier, K2)]
     missing = [f"{t}_k{k}" for t, k in need if (t, k) not in _fns]
     assert not missing, (
@@ -290,17 +290,21 @@ def _fp4_tier_for_build(E: int, dev, n13k13: int, n2k2: int):
     carry their OWN block-32 scale sections ([fp4_13|sc13|fp4_2|sc2]) — the
     base planes, and with them the GPU-resident scale planes the standalone
     delta shares, are host-resident there. Split mode (DELTA_SPLIT): slots
-    hold 2-bit REFINEMENT planes (half the nibble bytes) and NO scale
-    sections even over the base cache — the split kernel reads scales from
+    hold RADIX-5 quintal planes (2.5 bits/elem, bit-exact e2m1 — see
+    moe_w2_planes.pack_quintal_fragment_major) and NO scale sections even
+    over the base cache — the quintal kernel reads class/sign/scales from
     the base slot the refinement is residency-coupled to."""
     from vllm.model_executor.layers.quantization.utils import moe_w2_delta
     split = moe_w2_delta.split_enabled()
     sc13, sc2 = ((n13k13 // 32, n2k2 // 32)
                  if moe_w2_delta.base_enabled() and not split else (0, 0))
-    div = 4 if split else 2
+    if split:
+        return moe_w2_delta.get_tier(n_experts=E, dev=dev,
+                                     w13_bytes=n13k13 * 5 // 16,
+                                     w2_bytes=n2k2 * 5 // 16)
     return moe_w2_delta.get_tier(n_experts=E, dev=dev,
-                                 w13_bytes=n13k13 // div + sc13,
-                                 w2_bytes=n2k2 // div + sc2)
+                                 w13_bytes=n13k13 // 2 + sc13,
+                                 w2_bytes=n2k2 // 2 + sc2)
 
 
 def _stage_fp4_host(tier, layer_key: int, fp13, sc13, fp2, sc2) -> None:
@@ -317,14 +321,22 @@ def _stage_fp4_host(tier, layer_key: int, fp13, sc13, fp2, sc2) -> None:
 
 def _pack_fp4_plane(nib):
     """One expert's FP4-tier plane row from its e2m1 nibbles: the full
-    fragment-major nibble plane (moe_w4_mm), or — split mode — the 2-bit
-    REFINEMENT plane (moe_w4s_mm reads it alongside the resident base)."""
+    fragment-major nibble plane (moe_w4_mm), or — split mode — the radix-5
+    QUINTAL plane (moe_w4q_mm reads it alongside the resident base;
+    bit-exact e2m1 at 2.5 bits/elem)."""
     from vllm.model_executor.layers.quantization.utils import moe_w2_delta
     from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
-        nibbles_to_refinement, pack_fp4_fragment_major)
+        pack_fp4_fragment_major, pack_quintal_fragment_major)
     if moe_w2_delta.split_enabled():
-        return pack_fragment_major(nibbles_to_refinement(nib))
+        return pack_quintal_fragment_major(nib)
     return pack_fp4_fragment_major(nib)
+
+
+def _fp4_plane_nbytes(n: int, k: int) -> int:
+    """Per-expert FP4-tier plane bytes for one [n, k] matrix: nibbles
+    (n*k/2) or the split quintal plane (n*k*5/16)."""
+    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+    return n * k * 5 // 16 if moe_w2_delta.split_enabled() else n * k // 2
 
 
 # Loader-level skip (the planes-cache/pack "v1.5 follow-up"): layers the
@@ -382,10 +394,11 @@ def plan_pack_skip(layer) -> bool:
             return False
         if moe_w2_delta.enabled():
             # over-base FP4 need-pool: mirror _fp4_tier_for_build's sizing
-            # and get_tier's pack tag (split refinement slots live in a
-            # SEPARATE pack — different geometry, "fp4s")
+            # and get_tier's pack tag (split quintal slots live in a
+            # SEPARATE pack — different geometry, "fp4q")
             if moe_w2_delta.split_enabled():
-                ftag, fslot = "fp4s", N13 * K13 // 4 + N2 * K2 // 4
+                ftag = "fp4q"
+                fslot = N13 * K13 * 5 // 16 + N2 * K2 * 5 // 16
             else:
                 ftag = "fp4"
                 fslot = (N13 * K13 // 2 + s13len) + (N2 * K2 // 2 + s2len)
@@ -633,10 +646,11 @@ def build_layer_planes(layer, layer_key: int) -> None:
     tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
     fp13 = fp2 = None
     if tier is not None:
-        # full nibble planes (w4) or 2-bit refinement planes (w4s, split)
-        _div = 4 if moe_w2_delta.split_enabled() else 2
-        fp13 = torch.empty(E, N13 * K13 // _div, dtype=torch.uint8, device=dev)
-        fp2 = torch.empty(E, N2 * K2 // _div, dtype=torch.uint8, device=dev)
+        # full nibble planes (w4) or quintal planes (w4q, split)
+        fp13 = torch.empty(E, _fp4_plane_nbytes(N13, K13),
+                           dtype=torch.uint8, device=dev)
+        fp2 = torch.empty(E, _fp4_plane_nbytes(N2, K2),
+                          dtype=torch.uint8, device=dev)
 
     chunk = 32
     for e0 in range(0, E, chunk):
@@ -710,10 +724,11 @@ def build_layer_planes_fp8(layer, layer_key: int,
     tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
     fp13 = fp2 = None
     if tier is not None:
-        # full nibble planes (w4) or 2-bit refinement planes (w4s, split)
-        _div = 4 if moe_w2_delta.split_enabled() else 2
-        fp13 = torch.empty(E, N13 * K13 // _div, dtype=torch.uint8, device=dev)
-        fp2 = torch.empty(E, N2 * K2 // _div, dtype=torch.uint8, device=dev)
+        # full nibble planes (w4) or quintal planes (w4q, split)
+        fp13 = torch.empty(E, _fp4_plane_nbytes(N13, K13),
+                           dtype=torch.uint8, device=dev)
+        fp2 = torch.empty(E, _fp4_plane_nbytes(N2, K2),
+                          dtype=torch.uint8, device=dev)
 
     # fp8 experts are 4x the bytes of the mxfp4 path and the requant makes f32
     # temporaries -> smaller H2D chunks, per-expert quantize.
@@ -867,10 +882,11 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
 
     fp13 = fp2 = None
     if tier is not None:
-        # full nibble planes (w4) or 2-bit refinement planes (w4s, split)
-        _div = 4 if moe_w2_delta.split_enabled() else 2
-        fp13 = torch.empty(E, N13 * K13 // _div, dtype=torch.uint8, device=dev)
-        fp2 = torch.empty(E, N2 * K2 // _div, dtype=torch.uint8, device=dev)
+        # full nibble planes (w4) or quintal planes (w4q, split)
+        fp13 = torch.empty(E, _fp4_plane_nbytes(N13, K13),
+                           dtype=torch.uint8, device=dev)
+        fp2 = torch.empty(E, _fp4_plane_nbytes(N2, K2),
+                          dtype=torch.uint8, device=dev)
 
     # f64 temporaries are 16x the packed nibbles -> small H2D chunks,
     # per-expert quantize (mirrors the fp8 loader).

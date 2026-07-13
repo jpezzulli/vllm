@@ -1853,16 +1853,31 @@ def check_pool_floor(top_k: int, n_spec: int, max_num_seqs: int) -> None:
                 t.n_slots, gib, comfort, pairs)
     d = _TIER
     if d is not None and gate_armed() and len(d._store) > 0:
-        step_set = int(len(d._store) * top_k * (1 + n_spec))
-        if d.n_slots < step_set:
-            logger.warning(
-                "moe_w2 FP4 need-pool (%d slots) is smaller than one "
-                "step's routed set (~%d pairs): gate fires can only "
-                "PARTIALLY upgrade their own step regardless of "
-                "GATE_MAX_PROMOTE. Quality recovery is degraded (not "
-                "corrupted). For clean fires raise VLLM_MOE_W2_DELTA_GB "
-                "to >= %.1f GiB.", d.n_slots, step_set,
-                step_set * d.slot_bytes / 2**30)
+        # FIRE FLOOR (hard): the fire contract - "this step was uncertain,
+        # re-decide it with its routed set upgraded" - requires the pool to
+        # hold ONE step's routed union (victims are pinned/seen-excluded to
+        # non-this-step owners, so the union must fit outright). Below the
+        # floor a fire can only partially upgrade the very token it exists
+        # to fix, and tau->1 does NOT converge to native: the config is
+        # structurally broken, not merely slow (measured DS4: sub-floor
+        # pools scored 94.5% / +110% token inflation vs 96.5-97.5% above).
+        fire_floor = int(len(d._store) * top_k * (1 + n_spec) * seq_f)
+        if d.n_slots < fire_floor:
+            msg = (
+                f"moe_w2 FP4 need-pool is BELOW the FIRE FLOOR: "
+                f"{d.n_slots} slots < {fire_floor} required to hold one "
+                f"step's routed union ({len(d._store)} MoE layers x "
+                f"top-{top_k} x (1+{n_spec} spec) x {max_num_seqs} seqs) "
+                f"= ~{fire_floor * d.slot_bytes / 2**30:.1f} GiB. A gate "
+                f"fire cannot cover the step it is meant to fix - the "
+                f"gate contract is structurally broken at ANY tau. Raise "
+                f"VLLM_MOE_W2_DELTA_GB, reduce num_speculative_tokens / "
+                f"max_num_seqs, disable the gate, or set "
+                f"VLLM_MOE_W2_FORCE_POOL=1 to serve anyway in DEGRADED "
+                f"mode (incremental promotion via GATE_MAX_PROMOTE).")
+            if not force:
+                raise ValueError(msg)
+            logger.warning("%s (FORCED past the check)", msg)
 
 
 def gate_armed() -> bool:

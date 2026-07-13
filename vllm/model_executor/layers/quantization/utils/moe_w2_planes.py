@@ -27,71 +27,48 @@ Plane layout (fragment-major, per expert weight matrix [N, K]):
   => plane bytes = N/16 * K/64 * 32 lanes * 8 = N*K/4.
 """
 
-import os
-
 import torch
 
-# VLLM_MOE_W2_MAG2_BIG=1 — variant-A candidate fix for the split-FP4 zero
-# loss (internal/SPLIT_FP4_ZERO_LOSS_NEXT_SESSION.md): magnitude 2 moves
-# from the small to the big class -> small = {0,.5,1,1.5}, big = {2,3,4,6},
-# 8+8 nibbles on 8+8 (code,ref) states — the split refinement becomes a
-# BIJECTION (the mag-0 merge disappears; zeros reconstruct exactly).
-# Cost: the 2-bit BASE serves |w|=2 as +-4 instead of the proximity +-1
-# (unit err 2 vs 1 on ~16% of elements; sign-symmetry — and with it the
-# ~0 bias — is preserved). Gated by the cold-tier GSM8K A/B protocol; OFF
-# by default. Pack/planes-cache consumers must key on this flag.
-_MAG2_BIG = os.getenv("VLLM_MOE_W2_MAG2_BIG", "0") == "1"
-
 # e2m1 nibble -> 2-bit code (tensor-sym {-4,-1,1,4}), validated against
-# tools/repack_expert_bits.py in tools/test_moe_w2_planes.py
+# tools/repack_expert_bits.py in tools/test_moe_w2_planes.py.
+# The classification is proximity: mags {0,.5,1,1.5,2} -> +-1 (small),
+# {3,4,6} -> +-4 (big). Re-classifying mag 2 into the big class (the
+# "variant A" bijection candidate for the split-FP4 zero loss) was
+# MEASURED AND REJECTED 2026-07-13: base rel-RMS +35% (DS4) / +29% (GLM),
+# cold-tier needle 32k FAIL with degeneration loops — see
+# internal/SPLIT_FP4_ZERO_LOSS_NEXT_SESSION.md.
 _NIBBLE_TO_CODE = torch.tensor(
-    ([2, 2, 2, 2, 3, 3, 3, 3,   # +0,.5,1,1.5 -> +1 ; +2,3,4,6 -> +4
-      1, 1, 1, 1, 0, 0, 0, 0]   # (mag2big: |2| re-classified big)
-     if _MAG2_BIG else
-     [2, 2, 2, 2, 2, 3, 3, 3,   # +0,.5,1,1.5,2,3,4,6
-      1, 1, 1, 1, 1, 0, 0, 0]),  # -0,-.5,-1,-1.5,-2,-3,-4,-6
+    [2, 2, 2, 2, 2, 3, 3, 3,   # +0,.5,1,1.5,2,3,4,6
+     1, 1, 1, 1, 1, 0, 0, 0],  # -0,-.5,-1,-1.5,-2,-3,-4,-6
     dtype=torch.uint8)
 
 # 2-bit code -> e2m1 nibble of the reconstructed level (for golden tests)
 _CODE_TO_NIBBLE = torch.tensor([0xE, 0xA, 0x2, 0x6], dtype=torch.uint8)
 
-# --- split-FP4 refinement (moe_w4s_mm) -------------------------------------
-# e2m1 magnitude index -> 2-bit refinement code within the base-code class.
-# Default classification: small classes (codes +-1, mags {0,.5,1,1.5,2})
-# have 5 members for 4 codes: magnitude 0 MERGES into 0.5 (chosen on GLM
-# packs at 3.6% zeros — but 11.6% on DS4, the measured split-FP4 quality
-# loss). Big classes (codes +-4, mags {3,4,6}) fit with a spare code. The
-# kernel's decode pools are pool_S={.5,1,1.5,2} and pool_B={3,4,6,6}
-# indexed by ref; sign comes from the base code. Nesting invariant (code
-# is a pure function of the nibble) holds pack-wide:
-# kernels/gen/moe_w4s_nesting_study.py.
-# mag2big: both classes have exactly 4 members — ref = mag & 3, decode
-# pools pool_S={0,.5,1,1.5} (zero IN the pool), pool_B={2,3,4,6}; the
-# reconstruction is bit-exact e2m1 for all 16 nibbles.
-_MAG_TO_REF = torch.tensor(
-    [0, 1, 2, 3, 0, 1, 2, 3] if _MAG2_BIG else
-    [0, 0, 1, 2, 3, 0, 1, 2], dtype=torch.uint8)
+# --- split-FP4 refinement, LEGACY 2-bit (moe_w4s_mm) ------------------------
+# SUPERSEDED by the radix-5 quintal planes below (moe_w4q_mm): the 2-bit
+# refinement has 4 states for the small class's 5 magnitudes, so mag 0
+# MERGES into 0.5 — every zero weight serves as +-0.5 x 2^(scale-127).
+# Chosen on GLM packs (3.6% zeros); on DS4 zeros are 11.6% of elements and
+# the merge measurably decays GSM8K with FP4-pool coverage. Kept only for
+# the historical kernel's tests; serving dispatches moe_w4q_mm.
+_MAG_TO_REF = torch.tensor([0, 0, 1, 2, 3, 0, 1, 2], dtype=torch.uint8)
 # ref -> reconstructed |value|, per class (golden tests / references)
-_REF_TO_VAL_SMALL = torch.tensor(
-    [0.0, 0.5, 1.0, 1.5] if _MAG2_BIG else [0.5, 1.0, 1.5, 2.0])
-_REF_TO_VAL_BIG = torch.tensor(
-    [2.0, 3.0, 4.0, 6.0] if _MAG2_BIG else [3.0, 4.0, 6.0, 6.0])
+_REF_TO_VAL_SMALL = torch.tensor([0.5, 1.0, 1.5, 2.0])
+_REF_TO_VAL_BIG = torch.tensor([3.0, 4.0, 6.0, 6.0])
 
 
 def nibbles_to_refinement(nib: torch.Tensor) -> torch.Tensor:
-    """e2m1 nibbles (u8, 0..15) -> 2-bit refinement codes for moe_w4s_mm
-    (the base 2-bit plane supplies class+sign; see _MAG_TO_REF above)."""
-    # The shipped moe_w4s cubins bake the DEFAULT pools; mag2big refinement
-    # planes need the regenerated kernels (pool_S carries a true zero).
-    assert not _MAG2_BIG, (
-        "VLLM_MOE_W2_MAG2_BIG=1 has no split-FP4 kernels yet — run with "
-        "the FP4 delta tier off (VLLM_MOE_W2_DELTA_GB=0) or split off")
+    """e2m1 nibbles (u8, 0..15) -> 2-bit refinement codes for the LEGACY
+    moe_w4s_mm (mag-0 merge included; superseded by the quintal planes)."""
     return _MAG_TO_REF.to(nib.device)[(nib & 7).long()]
 
 
 def split_fp4_dequant(nib: torch.Tensor) -> torch.Tensor:
-    """Values the SPLIT decode reconstructs from e2m1 nibbles (mag 0 -> 0.5
-    merge included) — the reference for split-path golden tests."""
+    """Values the LEGACY 2-bit SPLIT decode reconstructs from e2m1 nibbles
+    (mag 0 -> 0.5 merge included) — the reference for moe_w4s golden tests.
+    The quintal path (moe_w4q_mm) reconstructs TRUE e2m1 — its reference
+    is quintal_dequant below."""
     dev = nib.device
     mag = (nib & 7).long()
     code = _NIBBLE_TO_CODE.to(dev)[nib.long()]
@@ -100,6 +77,83 @@ def split_fp4_dequant(nib: torch.Tensor) -> torch.Tensor:
     val = torch.where(big, _REF_TO_VAL_BIG.to(dev)[ref],
                       _REF_TO_VAL_SMALL.to(dev)[ref])
     return torch.where(code <= 1, -val, val)
+
+
+# --- split-FP4 refinement, RADIX-5 quintal planes (moe_w4q_mm) --------------
+# BIT-EXACT split at 2.5 bits/elem: the decoder reconstructs the e2m1
+# magnitude INDEX — the base code narrows it to the small ({0,.5,1,1.5,2})
+# or big ({3,4,6}) class, so a base-5 digit per element covers both, and
+# 4 digits pack into one 10-bit word per QMMA quad (5^4 = 625 <= 1024).
+# Kernel decode: magic /5 ((x*0x334)>>12, exact for x<1024, brute-forced
+# in gen_moe_w4q.py) -> selector = digit + 5*is_big(base) = mag idx ->
+# one PRMT over the FULL e2m1 magnitude pool {0,.5,1,1.5 | 2,3,4,6}; sign
+# from the base code. All 16 nibbles reconstruct exactly (zeros included).
+# Slot = 5/8 of the non-split nibble plane -> 1.6x experts/GiB (1.7x over
+# the base cache, where non-split slots also carry scale sections).
+_QUINTAL_POW = torch.tensor([1, 5, 25, 125], dtype=torch.int64)
+
+
+def nibbles_to_quintal_digits(nib: torch.Tensor) -> torch.Tensor:
+    """e2m1 nibbles (u8, 0..15) -> base-5 digits (i64, 0..4): the e2m1
+    magnitude index within the element's base-code class (small: mag idx
+    0..4; big: mag idx - 5 in 0..2)."""
+    mag = (nib & 7).long()
+    code = _NIBBLE_TO_CODE.to(nib.device)[nib.long()]
+    big = (code == 0) | (code == 3)
+    return torch.where(big, mag - 5, mag)
+
+
+def pack_quintal_fragment_major(nib: torch.Tensor) -> torch.Tensor:
+    """[N, K] u8 e2m1 nibbles -> quintal FP4 plane [N*K*5/16] u8.
+
+    moe_w4q_mm layout, per (nb, kb64) block (320 B): a 32-lane x 8 B "P8"
+    section (record bits 0..64) then a 32-lane x 2 B "P2" section (bits
+    64..80). A lane's 80-bit record = 8 words x 10 bits, little-endian;
+    word w = base-5 pack (d0 + 5 d1 + 25 d2 + 125 d3) of the 4 elements
+    of the w2-layout plane byte w (same [nb,kb,g,t,tile,k32,half,k4]
+    permutation as pack_fragment_major)."""
+    N, K = nib.shape
+    assert N % 16 == 0 and K % 64 == 0
+    d = nibbles_to_quintal_digits(nib)
+    d = d.view(N // 16, 2, 8, K // 64, 2, 2, 4, 4)
+    d = d.permute(0, 3, 2, 6, 1, 4, 5, 7).contiguous().view(-1, 8, 4)
+    words = (d * _QUINTAL_POW.to(d.device)).sum(-1)          # [lanes, 8]
+    # 8 x 10-bit words -> 5 x u16 shorts of the 80-bit LE stream
+    shorts = torch.zeros(words.shape[0], 5, dtype=torch.int64,
+                         device=d.device)
+    for w in range(8):
+        b = 10 * w
+        s, off = b // 16, b % 16
+        shorts[:, s] |= words[:, w] << off
+        if off > 6:
+            shorts[:, s + 1] |= words[:, w] >> (16 - off)
+    shorts &= 0xFFFF
+    by = torch.stack([shorts & 0xFF, shorts >> 8], dim=-1).view(-1, 10)
+    by = by.view(-1, 32, 10).to(torch.uint8)                 # [blk, lane, 10]
+    return torch.cat([by[:, :, :8].reshape(-1, 256),
+                      by[:, :, 8:].reshape(-1, 64)], dim=1).flatten()
+
+
+def quintal_fp4_plane_bytes(n: int, k: int) -> int:
+    """Slot bytes of one [n, k] quintal plane (2.5 bits/elem)."""
+    assert (n * k) % 16 == 0
+    return n * k * 5 // 16
+
+
+def quintal_dequant(nib: torch.Tensor) -> torch.Tensor:
+    """Values the QUINTAL decode reconstructs from e2m1 nibbles — true
+    e2m1, merge-free (the golden reference for moe_w4q tests; equality
+    with the E2M1 table IS the bit-exactness criterion)."""
+    dev = nib.device
+    digit = nibbles_to_quintal_digits(nib)
+    code = _NIBBLE_TO_CODE.to(dev)[nib.long()]
+    big = (code == 0) | (code == 3)
+    mag_idx = torch.where(big, digit + 5, digit)             # decode side
+    mags = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+                        device=dev)
+    val = mags[mag_idx]
+    return torch.where(code <= 1, -val, val)
+
 
 # 2-bit code -> e4m3 byte (the kernel's PRMT LUT): -4,-1,1,4
 PRMT_LUT_WORD = 0x4838B8C8
