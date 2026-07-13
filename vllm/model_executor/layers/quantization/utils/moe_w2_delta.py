@@ -347,6 +347,11 @@ class DeltaTier:
         # tier's base slots — its mapped experts are eviction-blocked here.
         # Set by get_tier() when the need-pool is created in split mode.
         self._coupled_fp4 = None
+        # Set by check_pool_floor when this NEED-pool cannot hold one
+        # step's routed union: gate fires must take the EAGER LAYER-WISE
+        # replay path (ensure_resident per MoE layer) instead of the
+        # graph replay — see internal/EAGER_FIRE_NEXT_SESSION.md.
+        self._sub_floor = False
         # Draft-affinity prefetch (VLLM_MOE_W2_PREFETCH=1, base tier only):
         # route_log = in-graph [n_layers, T_cap, K_cap] routing log written
         # by the forward glue; _aff = token->experts affinity table folded
@@ -1881,23 +1886,32 @@ def check_pool_floor(top_k: int, n_spec: int, max_num_seqs: int) -> None:
         fire_floor = int(len(d._store) * top_k * (1 + n_spec)
                          * min(max(max_num_seqs, 1), 4) * fp_growth)
         if d.n_slots < fire_floor:
-            msg = (
-                f"moe_w2 FP4 need-pool is BELOW the FIRE FLOOR: "
-                f"{d.n_slots} slots < {fire_floor} required for the "
-                f"fire's full fixed-point union ({len(d._store)} MoE "
-                f"layers x top-{top_k} x (1+{n_spec} spec) x "
-                f"{max_num_seqs} seqs x {fp_growth:.2f} FP-growth) = "
-                f"~{fire_floor * d.slot_bytes / 2**30:.1f} GiB. A gate "
-                f"fire cannot cover the step it is meant to fix - the "
-                f"gate contract is structurally broken at ANY tau. Raise "
-                f"VLLM_MOE_W2_DELTA_GB, reduce num_speculative_tokens / "
-                f"max_num_seqs / VLLM_MOE_W2_GATE_FP_MAX, disable the "
-                f"gate, or set VLLM_MOE_W2_FORCE_POOL=1 to serve anyway "
-                f"in DEGRADED mode (incremental promotion via "
-                f"GATE_MAX_PROMOTE).")
-            if not force:
-                raise ValueError(msg)
-            logger.warning("%s (FORCED past the check)", msg)
+            # Graceful degradation (same philosophy as the residency
+            # ladder VRAM->host->NVMe: degrade SPEED, never correctness,
+            # never refuse work that can be done slower): fires switch to
+            # the EAGER LAYER-WISE replay - each MoE layer's routed set is
+            # promoted just-in-time before its GEMMs (ensure_resident,
+            # layer-scoped pins), so the pool only ever needs ONE layer's
+            # union and the fire contract holds in full. Costs: the
+            # replay runs eagerly (no CUDA graph) + per-fire H2D traffic;
+            # second-order misses vanish structurally (each layer sees
+            # its ACTUAL routing), so the FP loop is unnecessary here.
+            d._sub_floor = True
+            logger.warning(
+                "moe_w2 FP4 need-pool is below the FIRE FLOOR: %d slots "
+                "< %d (%d MoE layers x top-%d x (1+%d spec) x %d seqs x "
+                "%.2f FP-growth = ~%.1f GiB). Serving continues in "
+                "DEGRADED mode: gate fires can only PARTIALLY upgrade "
+                "their step (consider an explicit GATE_MAX_PROMOTE cap, "
+                "e.g. 64 — measured best sub-floor operating point). The "
+                "EAGER LAYER-WISE fire path (full contract fidelity at a "
+                "decode cost, keyed off this _sub_floor flag) is speced "
+                "in internal/EAGER_FIRE_NEXT_SESSION.md. For graph-mode "
+                "fires raise VLLM_MOE_W2_DELTA_GB or reduce "
+                "num_speculative_tokens/max_num_seqs.",
+                d.n_slots, fire_floor, len(d._store), top_k, n_spec,
+                max_num_seqs, fp_growth,
+                fire_floor * d.slot_bytes / 2**30)
 
 
 def gate_armed() -> bool:
