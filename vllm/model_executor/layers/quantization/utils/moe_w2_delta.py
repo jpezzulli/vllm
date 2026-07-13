@@ -1764,21 +1764,25 @@ _KPI_EVERY = int(os.getenv("VLLM_MOE_W2_KPI_EVERY", "500"))
 _GB_EXPLICIT = "VLLM_MOE_W2_DELTA_GB" in os.environ
 
 # SPLIT FP4 (VLLM_MOE_W2_DELTA_SPLIT=1, default off): the delta tier stores
-# 2-bit REFINEMENT planes instead of full e2m1 nibble planes and dispatches
-# moe_w4s_mm, which reads them alongside the 2-bit base (nested codebook;
-# see moe_w2_planes.nibbles_to_refinement) — half the pool bytes per expert
-# (over the base cache: less — the refinement slot also drops the private
-# scale sections, the base slot's serve both GEMMs) = 2x+ FP4 coverage at
-# equal VRAM, at ~+16-23% kernel-time on the FP4-served pairs (decode ALU;
-# read bytes unchanged).
+# RADIX-5 QUINTAL planes (2.5 bits/elem) instead of full e2m1 nibble planes
+# and dispatches moe_w4q_mm, which reads them alongside the 2-bit base and
+# reconstructs e2m1 BIT-EXACTLY — all 16 nibbles, zeros included (see
+# moe_w2_planes.pack_quintal_fragment_major; the historical 2-bit
+# refinement merged mag 0 into 0.5 and measurably decayed GSM8K with pool
+# coverage — internal/SPLIT_FP4_ZERO_LOSS_NEXT_SESSION.md). 5/8 of the
+# nibble bytes per expert — 1.6x experts/GiB
+# (over the base cache: 1.7x — the quintal slot also drops the private
+# scale sections, the base slot's serve both GEMMs) at ~+11/6/6% kernel
+# time vs moe_w4s at K=4096/2048/512 (decode ALU; slot read bytes 10 B vs
+# 8 B per lane-k64).
 #
 # GPU-resident-base configs read the resident planes directly. Over the
 # BASE CACHE the base codes+scales come from the base tier's pool slot, so
-# split serving is RESIDENCY-COUPLED: the desc kernel routes a pair to w4s
+# split serving is RESIDENCY-COUPLED: the desc kernel routes a pair to w4q
 # only when the expert is resident in BOTH slot tables (FP4-mapped but
 # base-missing counts as a miss -> the standard fetch+replay restores it),
 # and the base tier's eviction hard-excludes experts mapped in the FP4
-# tier (_coupled_fp4) so a mapped refinement never outlives its base row.
+# tier (_coupled_fp4) so a mapped quintal row never outlives its base row.
 _SPLIT = os.getenv("VLLM_MOE_W2_DELTA_SPLIT", "0") == "1"
 
 
@@ -1975,12 +1979,13 @@ def get_tier(n_layers=None, n_experts=256, dev=None,
         policy = None
         if base_enabled():
             policy = os.getenv("VLLM_MOE_W2_DELTA_POLICY", "need")
-        # Split refinement slots have a DIFFERENT geometry than full-FP4
-        # slots; a distinct pack tag ("fp4s") keeps the two modes' pack
-        # files apart — a shared pack dir otherwise ping-pong-rebuilds one
-        # file under the other config's feet (the page-cache store reads
-        # it live at serve time -> garbage FP4 rows on BOTH; measured).
-        fp4_tag = "fp4s" if split_enabled() else "fp4"
+        # Split quintal slots have a DIFFERENT geometry than full-FP4
+        # slots; a distinct pack tag ("fp4q"; the superseded 2-bit
+        # refinement used "fp4s") keeps the modes' pack files apart — a
+        # shared pack dir otherwise ping-pong-rebuilds one file under the
+        # other config's feet (the page-cache store reads it live at
+        # serve time -> garbage FP4 rows on BOTH; measured).
+        fp4_tag = "fp4q" if split_enabled() else "fp4"
         _TIER = DeltaTier(
             n_layers, n_experts, dev or torch.device("cuda"),
             w13_bytes=W13_BYTES if w13_bytes is None else w13_bytes,

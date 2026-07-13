@@ -4755,13 +4755,32 @@ class GPUModelRunner(
 
                     fire = _or_tp(fire)
                     if fire:
-                        # Promote this rank's COLD routed experts (per-rank
-                        # shard side effect, never a per-rank replay gate).
-                        n_promoted = moe_w2_gate.force_promote_step()
-                        # Replay only if SOME rank upgraded a cold expert ->
-                        # the result can actually change; if everything routed
-                        # was already FP4 the replay is wasted HBM bandwidth.
-                        if _or_tp(n_promoted > 0) and moe_w2_gate.reforward_enabled():
+                        # FIXED-POINT fire (2026-07-13): a single replay is
+                        # only FIRST-order — upgraded early layers re-route
+                        # later layers onto still-cold experts INSIDE the
+                        # replay, and those decide the token at 2-bit
+                        # (measured on GPQA: tau=1.00 scored 66.2% vs 72.2%
+                        # for a pool big enough to hide the residue behind
+                        # standing coverage; GSM8K, with stable routing,
+                        # showed no gap). Iterate promote->replay until no
+                        # rank promotes (routed set fully upgraded) or the
+                        # bound trips — restoring tau->1 convergence to the
+                        # mxfp4 ceiling regardless of pool size (above the
+                        # fire floor).
+                        _gate_iters = 0
+                        while _gate_iters < moe_w2_gate.fire_fp_max():
+                            # Promote this rank's COLD routed experts
+                            # (per-rank shard side effect, never a per-rank
+                            # replay gate).
+                            n_promoted = moe_w2_gate.force_promote_step()
+                            # Replay only if SOME rank upgraded a cold
+                            # expert -> the result can actually change; if
+                            # everything routed was already FP4 the replay
+                            # is wasted HBM bandwidth.
+                            if not (_or_tp(n_promoted > 0)
+                                    and moe_w2_gate.reforward_enabled()):
+                                break
+                            _gate_iters += 1
                             with set_forward_context(
                                 attn_metadata,
                                 self.vllm_config,

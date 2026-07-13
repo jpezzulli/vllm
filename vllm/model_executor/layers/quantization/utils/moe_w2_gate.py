@@ -58,6 +58,15 @@ Env knobs:
                                 measured 200-1400 promotes = ~6 GiB H2D
                                 per fire = 56->3 tok/s).
   VLLM_MOE_W2_GATE_TRACE   0 (default) | 1 log each fire/re-forward.
+  VLLM_MOE_W2_GATE_FP_MAX  max promote->replay iterations per fired step
+                           (default 3). A single replay is only FIRST-order:
+                           upgraded early layers re-route later layers onto
+                           still-cold experts inside the replay, which then
+                           decide the token at 2-bit (measured on GPQA:
+                           tau=1.00 66.2% vs 72.2% when a big pool hid the
+                           residue; GSM8K showed no gap - stable routing).
+                           The loop iterates until no rank promotes; steady
+                           state costs nothing (first check promotes 0).
 """
 
 import os
@@ -73,11 +82,17 @@ _SIGNAL = os.getenv("VLLM_MOE_W2_GATE_SIGNAL", "max_prob")
 _DEFAULT_TAU = {"max_prob": 0.60, "margin": 1.5}
 _TAU = float(os.getenv("VLLM_MOE_W2_GATE_TAU", str(_DEFAULT_TAU.get(_SIGNAL, 0.60))))
 # Default 0 = UNLIMITED. The cap is a pure PERF knob (bounds a fire's H2D
-# tail); quality-wise it must be neutral. The value-monotone ADMISSION
-# CONTROL in DeltaTier.force_promote (need policy) is what prevents
-# uncapped fires from bulk-evicting the high-need core at a full pool —
-# the pathology the old cap-64 default was inadvertently masking.
+# tail); quality-wise it must be neutral. Configs whose pool cannot hold
+# one step's routed union are refused at boot (the FIRE FLOOR hardstop in
+# moe_w2_delta.check_pool_floor); FORCE_POOL=1 configs run degraded and
+# should set an explicit cap.
 _MAX_PROMOTE = int(os.getenv("VLLM_MOE_W2_GATE_MAX_PROMOTE", "0"))
+_FIRE_FP_MAX = max(int(os.getenv("VLLM_MOE_W2_GATE_FP_MAX", "3")), 1)
+
+
+def fire_fp_max() -> int:
+    """Bound on promote->replay iterations per fired step (see header)."""
+    return _FIRE_FP_MAX
 _TRACE = os.getenv("VLLM_MOE_W2_GATE_TRACE", "0") == "1"
 # Measurement mode: on a fired step, COUNT routed experts (delta._need) instead of
 # promoting/re-forwarding -> study whether 2-bit difficulty concentrates on few

@@ -1040,7 +1040,7 @@ def _workspaces(slots: int, tokens: int, dev, inter: int = 2048,
                            device=dev),
             desc=torch.empty(4, slots // _BLOCK, 6, dtype=torch.int64,
                              device=dev),
-            # split-FP4 (moe_w4s_mm) desc tables: 8 u64 per pair, 64 B ABI
+            # split-FP4 (moe_w4q_mm) desc tables: 8 u64 per pair, 64 B ABI
             desc4s=torch.empty(2, slots // _BLOCK, 8, dtype=torch.int64,
                                device=dev),
             # -1 slot row for the tier-less desc path; sized to the MODEL's
@@ -1164,12 +1164,12 @@ def _desc_build_kernel_w4s(
     n_experts, pairs, cap8, mblock,
     BLOCK: tl.constexpr,
 ):
-    """Split-FP4 desc tables (moe_w4s_mm, 8 x u64 per pair, 64 B ABI):
+    """Split-FP4 desc tables (moe_w4q_mm, 8 x u64 per pair, 64 B ABI):
     {a, as, base, ref, bs, c, m_rows, pad}. `base`/`bs` point at the
     RESIDENT 2-bit plane / scale rows (exactly the w2 tier's pointers);
-    `ref` at the delta slot's refinement sections ([ref13 | ref2],
-    w13r_bytes = ref13 section size). Written alongside the main kernel's
-    w2 tables; pairs not FP4-resident get m=0 (w4s early-EXITs)."""
+    `ref` at the delta slot's quintal sections ([q13 | q2], w13r_bytes =
+    q13 section size). Written alongside the main kernel's w2 tables;
+    pairs not FP4-resident get m=0 (w4q early-EXITs)."""
     p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = p < pairs
     e = tl.load(eids_ptr + p, mask=mask, other=0).to(tl.int64)
@@ -1325,14 +1325,14 @@ def _desc_build_kernel_base_delta_split(
     n_experts, pairs, cap6, cap8, mblock,
     BLOCK: tl.constexpr,
 ):
-    """Base cache + SPLIT FP4 need-pool: refinement slots are read AGAINST
-    the base pool slot (codes + scales), so a pair routes to the w4s tier
+    """Base cache + SPLIT FP4 need-pool: quintal slots are read AGAINST
+    the base pool slot (codes + scales), so a pair routes to the w4q tier
     only when its expert is resident in BOTH slot tables. FP4-mapped but
     base-missing counts as a MISS (contributes zero, bumps miss_ptr — the
     runner's base fetch + replay restores it; the base tier's eviction
     hard-excludes FP4-mapped experts so this is a transient, not a steady
     state). w2 tables (d_ptr[0..1], 6-field) serve base-resident pairs not
-    in FP4; w4s tables (d4s_ptr[0..1], 8-field/64 B) carry
+    in FP4; w4q tables (d4s_ptr[0..1], 8-field/64 B) carry
     {a, as, base=bslot codes section, ref=fslot section,
     bs=bslot scale section, c, m, pad}."""
     p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -1612,8 +1612,8 @@ def _moe_w2_forward_timed(
             (st["K2"] // 128) * 4, 2 * st["K13"],
             st["E"], pairs, cap * 6, mblock, BLOCK=256)
         if tier is not None and not prefill and moe_w2_delta.split_enabled():
-            # split-FP4: the extra 8-field tables for moe_w4s_mm (base/bs =
-            # the resident plane rows, ref = the slot's refinement sections)
+            # split-FP4: the extra 8-field tables for moe_w4q_mm (base/bs =
+            # the resident plane rows, ref = the slot's quintal sections)
             d4s = ws["desc4s"]
             _desc_build_kernel_w4s[(triton.cdiv(pairs, 256),)](
                 expert_blocks, num_post, slot_row, d4s,
@@ -1649,7 +1649,7 @@ def _moe_w2_forward_timed(
                and moe_w2_delta.split_enabled())
     if tier is not None and not prefill:
         if use_w4s:
-            _launch("w4s", st["K13"], ws["desc4s"][0], st["N13"], pairs,
+            _launch("w4q", st["K13"], ws["desc4s"][0], st["N13"], pairs,
                     stream)
         else:
             _launch("w4", st["K13"], d[2], st["N13"], pairs, stream)
@@ -1662,7 +1662,7 @@ def _moe_w2_forward_timed(
     _launch(w2tier, st["K2"], d[1], st["N2"], pairs, stream)
     if tier is not None and not prefill:
         if use_w4s:
-            _launch("w4s", st["K2"], ws["desc4s"][1], st["N2"], pairs, stream)
+            _launch("w4q", st["K2"], ws["desc4s"][1], st["N2"], pairs, stream)
         else:
             _launch("w4", st["K2"], d[3], st["N2"], pairs, stream)
 

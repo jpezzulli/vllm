@@ -89,9 +89,11 @@ def _meta() -> dict:
         world=world,
         rank=rank,
         zero_mode=os.getenv("VLLM_MOE_W2_ZERO_MODE", "auto"),
-        # split-FP4 stores 2-bit refinement planes in fp13/fp2 (half the
-        # bytes) — a cache built in the other mode must MISS wholesale
-        fp4_split=moe_w2_delta.split_enabled(),
+        # split-FP4 stores radix-5 quintal planes in fp13/fp2 (5/8 of the
+        # nibble bytes) — a cache built in another mode must MISS
+        # wholesale. "w4q" also invalidates caches of the superseded
+        # 2-bit-refinement split (stored fp4_split=True).
+        fp4_split="w4q" if moe_w2_delta.split_enabled() else False,
     )
 
 
@@ -111,9 +113,12 @@ def expected_sizes(E: int, N13: int, K13: int, N2: int, K2: int,
         "sc2": E * N2 * K2 // 32,
     }
     if want_fp4:
-        div = 4 if moe_w2_delta.split_enabled() else 2
-        exp["fp13"] = E * N13 * K13 // div
-        exp["fp2"] = E * N2 * K2 // div
+        if moe_w2_delta.split_enabled():
+            exp["fp13"] = E * N13 * K13 * 5 // 16
+            exp["fp2"] = E * N2 * K2 * 5 // 16
+        else:
+            exp["fp13"] = E * N13 * K13 // 2
+            exp["fp2"] = E * N2 * K2 // 2
     return exp
 
 
