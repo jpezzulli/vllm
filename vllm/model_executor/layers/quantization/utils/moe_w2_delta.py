@@ -1859,26 +1859,42 @@ def check_pool_floor(top_k: int, n_spec: int, max_num_seqs: int) -> None:
     if d is not None and gate_armed() and len(d._store) > 0:
         # FIRE FLOOR (hard): the fire contract - "this step was uncertain,
         # re-decide it with its routed set upgraded" - requires the pool to
-        # hold ONE step's routed union (victims are pinned/seen-excluded to
-        # non-this-step owners, so the union must fit outright). Below the
-        # floor a fire can only partially upgrade the very token it exists
-        # to fix, and tau->1 does NOT converge to native: the config is
-        # structurally broken, not merely slow (measured DS4: sub-floor
-        # pools scored 94.5% / +110% token inflation vs 96.5-97.5% above).
-        fire_floor = int(len(d._store) * top_k * (1 + n_spec) * seq_f)
+        # hold the step's routed union ACROSS ALL of the fire's fixed-point
+        # iterations (pins persist through the step, so every pass's hits
+        # and fetches stay unevictable while later passes promote the
+        # re-routed remainder). Components:
+        #   - one seq's union: moe_layers x top_k x (1 + n_spec);
+        #   - seqs: LINEAR (worst case: independent prompts share nothing —
+        #     measured on GPQA C=2: demand 2590 slots vs sqrt-scaled
+        #     estimate 1899, pool 2048 fully pinned + 542 denied);
+        #   - fixed-point growth: each extra replay re-routes onto new
+        #     experts; measured ~0.32 x union per iteration on GPQA ->
+        #     factor 1 + 0.35 x (GATE_FP_MAX - 1).
+        # Below the floor a fire can only partially upgrade the very token
+        # it exists to fix, and tau->1 does NOT converge: structurally
+        # broken, not merely slow (measured: sub-floor pools 94.5% /
+        # +110% token inflation vs 96.5-97.5% above; 12 GiB at C=2 GPQA
+        # 66.2-67.7% vs 72.2% for a floor-satisfying 24 GiB).
+        from vllm.model_executor.layers.quantization.utils import (
+            moe_w2_gate)
+        fp_growth = 1.0 + 0.35 * max(moe_w2_gate.fire_fp_max() - 1, 0)
+        fire_floor = int(len(d._store) * top_k * (1 + n_spec)
+                         * min(max(max_num_seqs, 1), 4) * fp_growth)
         if d.n_slots < fire_floor:
             msg = (
                 f"moe_w2 FP4 need-pool is BELOW the FIRE FLOOR: "
-                f"{d.n_slots} slots < {fire_floor} required to hold one "
-                f"step's routed union ({len(d._store)} MoE layers x "
-                f"top-{top_k} x (1+{n_spec} spec) x {max_num_seqs} seqs) "
-                f"= ~{fire_floor * d.slot_bytes / 2**30:.1f} GiB. A gate "
+                f"{d.n_slots} slots < {fire_floor} required for the "
+                f"fire's full fixed-point union ({len(d._store)} MoE "
+                f"layers x top-{top_k} x (1+{n_spec} spec) x "
+                f"{max_num_seqs} seqs x {fp_growth:.2f} FP-growth) = "
+                f"~{fire_floor * d.slot_bytes / 2**30:.1f} GiB. A gate "
                 f"fire cannot cover the step it is meant to fix - the "
                 f"gate contract is structurally broken at ANY tau. Raise "
                 f"VLLM_MOE_W2_DELTA_GB, reduce num_speculative_tokens / "
-                f"max_num_seqs, disable the gate, or set "
-                f"VLLM_MOE_W2_FORCE_POOL=1 to serve anyway in DEGRADED "
-                f"mode (incremental promotion via GATE_MAX_PROMOTE).")
+                f"max_num_seqs / VLLM_MOE_W2_GATE_FP_MAX, disable the "
+                f"gate, or set VLLM_MOE_W2_FORCE_POOL=1 to serve anyway "
+                f"in DEGRADED mode (incremental promotion via "
+                f"GATE_MAX_PROMOTE).")
             if not force:
                 raise ValueError(msg)
             logger.warning("%s (FORCED past the check)", msg)
