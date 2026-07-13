@@ -1970,10 +1970,14 @@ def get_base_tier(n_layers: int, n_experts: int, dev,
                         ", looka/pilot=%s)", tuple(_BASE_TIER.route_log.shape),
                         os.getenv("VLLM_MOE_W2_PREFETCH", "0"),
                         moe_w2_looka.wants_route_log())
-        n_step = n_layers * 16      # decode working set (top-k<=16) headroom
-        assert _BASE_TIER.n_slots >= max(2 * 256, n_step), (
-            f"moe_w2 base cache: pool of {_BASE_TIER.n_slots} slots is smaller "
-            f"than a step's worst-case working set; raise "
+        # Mechanical minimum only (one prefill layer's worst case): the
+        # CALIBRATED working-set floor (real top_k/spec/seqs) is verdicted
+        # by check_pool_floor at end-of-load — the old layers*16 heuristic
+        # here double-floored valid configs (e.g. DS4 no-spec single-seq:
+        # calibrated floor 304 slots, heuristic demanded 704).
+        assert _BASE_TIER.n_slots >= 2 * n_experts, (
+            f"moe_w2 base cache: pool of {_BASE_TIER.n_slots} slots cannot "
+            f"hold even one prefill layer (2*E={2 * n_experts}); raise "
             f"VLLM_MOE_W2_BASE_CACHE_GB")
         _BASE_TIER.start()
         cov = 100.0 * _BASE_TIER.n_slots / (n_layers * n_experts)
