@@ -977,6 +977,9 @@ def _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
                     E * btier.slot_bytes / 2**30)
         return
 
+    _check_resident_fit(layer_key, dev,
+                        planes13.nbytes + sc13.nbytes
+                        + planes2.nbytes + sc2.nbytes)
     _LAYERS[layer_key] = dict(
         planes13=planes13, sc13=sc13, planes2=planes2, sc2=sc2,
         N13=N13, K13=K13, N2=N2, K2=K2, E=E, tl_idx=_tl,
@@ -989,6 +992,69 @@ def _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
     logger.info("moe_w2: layer %d planes built (%.2f GiB)", layer_key,
                 (planes13.nbytes + sc13.nbytes + planes2.nbytes + sc2.nbytes)
                 / 2**30)
+
+
+_resident_fit_checked = False
+
+
+def _check_resident_fit(layer_key: int, dev, bytes_per_layer: int) -> None:
+    """RESIDENCY HARDSTOP (user directive 2026-07-13): if resident planes
+    cannot fit in VRAM without degrading serving (no room for KV/graphs),
+    refuse EARLY with actionable guidance instead of a raw CUDA OOM deep
+    into the requant. Mirrors the base-cache working-set hardstop one rung
+    down the residency ladder.
+
+    Runs once, at the FIRST resident layer (its exact per-layer bytes x
+    the model's remaining MoE layer count = total plane demand; uniform
+    layers assumed - true for DS4/GLM/Kimi). Reserves are estimates and
+    deliberately conservative in the SAFE direction only (a false PASS
+    just falls through to the torch OOM backstop below; a false FAIL is
+    avoided by keeping reserves minimal: 2 GiB graphs/workspaces + ~1.7
+    GiB MTP drafter scratch when speculative decoding is on + a KV floor
+    of one max_model_len sequence at the measured fp8 MLA rate)."""
+    global _resident_fit_checked
+    if _resident_fit_checked:
+        return
+    _resident_fit_checked = True
+    try:
+        from vllm.config import get_current_vllm_config
+        vcfg = get_current_vllm_config()
+        hf = vcfg.model_config.hf_text_config
+        n_layers = int(getattr(hf, "num_hidden_layers", 0) or 0)
+        n_dense = int(getattr(hf, "first_k_dense_replace", 0) or 0)
+        n_moe = max(n_layers - n_dense, 1)
+        max_len = int(vcfg.model_config.max_model_len)
+        spec_on = vcfg.speculative_config is not None
+        free_b, _total_b = torch.cuda.mem_get_info(dev)
+        planes_total = bytes_per_layer * (n_moe - len(_LAYERS))
+        kv_floor = max_len * 16 * 1024            # ~15.6 KB/tok measured
+        reserve = 2 * 2**30 + (int(1.7 * 2**30) if spec_on else 0) + kv_floor
+        budget = free_b - reserve
+        if planes_total > budget:
+            deficit = (planes_total - budget) / 2**30
+            # suggested pool: what actually fits, rounded down to .5 GiB
+            fit_gb = max((budget + bytes_per_layer * len(_LAYERS))
+                         / 2**30, 0.0)
+            sug = max(int(fit_gb * 2) / 2, 1.0)
+            raise ValueError(
+                f"moe_w2 RESIDENT planes do not fit: {n_moe} MoE layers x "
+                f"{bytes_per_layer / 2**30:.2f} GiB = "
+                f"{n_moe * bytes_per_layer / 2**30:.1f} GiB of 2-bit "
+                f"planes vs ~{budget / 2**30:.1f} GiB of VRAM budget "
+                f"(free {free_b / 2**30:.1f} minus KV floor for "
+                f"{max_len} tokens, graphs/workspaces"
+                f"{' and MTP scratch' if spec_on else ''}) - short by "
+                f"~{deficit:.1f} GiB. Serving would OOM or degrade. Use "
+                f"the BASE-CACHE rung of the residency ladder instead: "
+                f"VLLM_MOE_W2_BASE_CACHE_GB={sug:.1f} (host-resident "
+                f"planes, GPU expert cache; add VLLM_MOE_W2_STORE_DIR + "
+                f"VLLM_MOE_W2_BASE_RAM_GB for the NVMe tier if host RAM "
+                f"is short). The boot guard will then verify the pool "
+                f"against its working-set floor.")
+    except ValueError:
+        raise
+    except Exception as e:  # noqa: BLE001 - the check must not break boot
+        logger.warning("moe_w2 resident-fit check skipped: %s", e)
 
 
 # --------------------------------------------------------------------------
