@@ -1199,19 +1199,21 @@ class DeltaTier:
             # emergency=True: this is the synchronous runner-thread path with
             # no forward in flight — leaving a miss UNRESTORED is worse than
             # evicting a warm-but-idle slot (see _take_slots_batch).
-            # Admission control for the OPPORTUNISTIC tier ("need" policy,
-            # FP4 pool): candidates are need-sorted descending; evictions
-            # are granted only while candidate need exceeds the victim's
-            # key, so an uncapped fire can never lower the pool's value
-            # (a 2-bit-served expert is correct — promotion is an upgrade,
-            # not a correctness requirement). The BASE cache keeps
-            # unconditional emergency semantics: a missing base expert
-            # would be ZEROED by the replay.
-            adm = None
-            if self._policy == "need":
-                adm = [float(self._need[li, ei]) for li, ei in cand]
-            slots = self._take_slots_batch(len(cand), emergency=True,
-                                           admission_keys=adm)
+            # NO admission control here — the FIRE CONTRACT forbids it
+            # (2026-07-13): the gate fired because THIS token is uncertain
+            # and the imminent replay must see the step's routed set
+            # upgraded. Step pins + the seen window already restrict
+            # victims to experts NOT routed in this step, so unconditional
+            # promotion cannot corrupt the fired step; a "bad" eviction
+            # only costs future re-promotions (speed). At high tau this
+            # converges to native regardless of eviction policy — an
+            # admission veto breaks exactly that limit (the uncertain
+            # token would keep its 2-bit expert forever). Standing
+            # coverage for NON-fired steps is a POOL SIZE knob, not a
+            # promotion-policy knob. (admission_keys plumbing remains in
+            # _take_slots_batch for lazy/manager promotions, which carry
+            # no fire contract.)
+            slots = self._take_slots_batch(len(cand), emergency=True)
             plan = [((li, ei), slot) for (li, ei), slot in zip(cand, slots)]
             if not plan:
                 return 0
