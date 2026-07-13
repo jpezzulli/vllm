@@ -27,13 +27,29 @@ Plane layout (fragment-major, per expert weight matrix [N, K]):
   => plane bytes = N/16 * K/64 * 32 lanes * 8 = N*K/4.
 """
 
+import os
+
 import torch
+
+# VLLM_MOE_W2_MAG2_BIG=1 — variant-A candidate fix for the split-FP4 zero
+# loss (internal/SPLIT_FP4_ZERO_LOSS_NEXT_SESSION.md): magnitude 2 moves
+# from the small to the big class -> small = {0,.5,1,1.5}, big = {2,3,4,6},
+# 8+8 nibbles on 8+8 (code,ref) states — the split refinement becomes a
+# BIJECTION (the mag-0 merge disappears; zeros reconstruct exactly).
+# Cost: the 2-bit BASE serves |w|=2 as +-4 instead of the proximity +-1
+# (unit err 2 vs 1 on ~16% of elements; sign-symmetry — and with it the
+# ~0 bias — is preserved). Gated by the cold-tier GSM8K A/B protocol; OFF
+# by default. Pack/planes-cache consumers must key on this flag.
+_MAG2_BIG = os.getenv("VLLM_MOE_W2_MAG2_BIG", "0") == "1"
 
 # e2m1 nibble -> 2-bit code (tensor-sym {-4,-1,1,4}), validated against
 # tools/repack_expert_bits.py in tools/test_moe_w2_planes.py
 _NIBBLE_TO_CODE = torch.tensor(
-    [2, 2, 2, 2, 2, 3, 3, 3,   # +0,.5,1,1.5,2,3,4,6
-     1, 1, 1, 1, 1, 0, 0, 0],  # -0,-.5,-1,-1.5,-2,-3,-4,-6
+    ([2, 2, 2, 2, 3, 3, 3, 3,   # +0,.5,1,1.5 -> +1 ; +2,3,4,6 -> +4
+      1, 1, 1, 1, 0, 0, 0, 0]   # (mag2big: |2| re-classified big)
+     if _MAG2_BIG else
+     [2, 2, 2, 2, 2, 3, 3, 3,   # +0,.5,1,1.5,2,3,4,6
+      1, 1, 1, 1, 1, 0, 0, 0]),  # -0,-.5,-1,-1.5,-2,-3,-4,-6
     dtype=torch.uint8)
 
 # 2-bit code -> e2m1 nibble of the reconstructed level (for golden tests)
@@ -41,22 +57,35 @@ _CODE_TO_NIBBLE = torch.tensor([0xE, 0xA, 0x2, 0x6], dtype=torch.uint8)
 
 # --- split-FP4 refinement (moe_w4s_mm) -------------------------------------
 # e2m1 magnitude index -> 2-bit refinement code within the base-code class.
-# Small classes (codes +-1, mags {0,.5,1,1.5,2}) have 5 members for 4 codes:
-# magnitude 0 MERGES into 0.5 (measured least-mass adjacent pair on real GLM
-# packs, 3.6% of elements; unit err 0.5 where the 2-bit base gives them 1.0).
-# Big classes (codes +-4, mags {3,4,6}) fit with a spare code. The kernel's
-# decode pools are pool_S={.5,1,1.5,2} and pool_B={3,4,6,6} indexed by ref;
-# sign comes from the base code. Nesting invariant (code is a pure function
-# of the nibble) holds pack-wide: kernels/gen/moe_w4s_nesting_study.py.
-_MAG_TO_REF = torch.tensor([0, 0, 1, 2, 3, 0, 1, 2], dtype=torch.uint8)
+# Default classification: small classes (codes +-1, mags {0,.5,1,1.5,2})
+# have 5 members for 4 codes: magnitude 0 MERGES into 0.5 (chosen on GLM
+# packs at 3.6% zeros — but 11.6% on DS4, the measured split-FP4 quality
+# loss). Big classes (codes +-4, mags {3,4,6}) fit with a spare code. The
+# kernel's decode pools are pool_S={.5,1,1.5,2} and pool_B={3,4,6,6}
+# indexed by ref; sign comes from the base code. Nesting invariant (code
+# is a pure function of the nibble) holds pack-wide:
+# kernels/gen/moe_w4s_nesting_study.py.
+# mag2big: both classes have exactly 4 members — ref = mag & 3, decode
+# pools pool_S={0,.5,1,1.5} (zero IN the pool), pool_B={2,3,4,6}; the
+# reconstruction is bit-exact e2m1 for all 16 nibbles.
+_MAG_TO_REF = torch.tensor(
+    [0, 1, 2, 3, 0, 1, 2, 3] if _MAG2_BIG else
+    [0, 0, 1, 2, 3, 0, 1, 2], dtype=torch.uint8)
 # ref -> reconstructed |value|, per class (golden tests / references)
-_REF_TO_VAL_SMALL = torch.tensor([0.5, 1.0, 1.5, 2.0])
-_REF_TO_VAL_BIG = torch.tensor([3.0, 4.0, 6.0, 6.0])
+_REF_TO_VAL_SMALL = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5] if _MAG2_BIG else [0.5, 1.0, 1.5, 2.0])
+_REF_TO_VAL_BIG = torch.tensor(
+    [2.0, 3.0, 4.0, 6.0] if _MAG2_BIG else [3.0, 4.0, 6.0, 6.0])
 
 
 def nibbles_to_refinement(nib: torch.Tensor) -> torch.Tensor:
     """e2m1 nibbles (u8, 0..15) -> 2-bit refinement codes for moe_w4s_mm
     (the base 2-bit plane supplies class+sign; see _MAG_TO_REF above)."""
+    # The shipped moe_w4s cubins bake the DEFAULT pools; mag2big refinement
+    # planes need the regenerated kernels (pool_S carries a true zero).
+    assert not _MAG2_BIG, (
+        "VLLM_MOE_W2_MAG2_BIG=1 has no split-FP4 kernels yet — run with "
+        "the FP4 delta tier off (VLLM_MOE_W2_DELTA_GB=0) or split off")
     return _MAG_TO_REF.to(nib.device)[(nib & 7).long()]
 
 

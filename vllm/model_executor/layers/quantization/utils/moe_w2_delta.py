@@ -782,7 +782,8 @@ class DeltaTier:
             return 0
 
     def _take_slots_batch(self, k: int, emergency: bool = False,
-                          min_cold: int = 2) -> list[int]:
+                          min_cold: int = 2,
+                          admission_keys=None) -> list[int]:
         """Take up to k slots (lock held by caller): free list first, then ONE
         vectorized eviction pass over all slots. Replaces the old per-slot
         python scan per promotion — O(n_slots) per TAKEN slot — which at GLM
@@ -807,12 +808,23 @@ class DeltaTier:
         the call sites always passed a set built from exactly that) and cold
         >= 2 ticks, so in-flight graph reads never hit a rewritten slot.
         Victims are unmapped here (graphs stop dispatching w4 before bytes
-        change); the caller reserves _owner for each returned slot."""
+        change); the caller reserves _owner for each returned slot.
+
+        `admission_keys` (opportunistic tiers ONLY — the FP4 need-pool,
+        never the base cache): per-candidate priority values aligned with
+        the caller's candidate order (descending). Free slots are granted
+        unconditionally; an EVICTION is granted only while the candidate's
+        priority EXCEEDS the victim's key — pool value never decreases.
+        Without this, an uncapped gate fire at a full pool bulk-evicted
+        the accumulated high-need core for once-routed candidates
+        (wholesale churn; the old MAX_PROMOTE cap merely masked it)."""
         out: list[int] = []
         while self._free and len(out) < k:
             out.append(self._free.pop())
         k_evict = k - len(out)
         if k_evict <= 0:
+            return out
+        if admission_keys is not None and len(out) >= len(admission_keys):
             return out
         li, ei = self._owner_li, self._owner_ei
         tk = self._owner_tick
@@ -887,8 +899,19 @@ class DeltaTier:
             take = min(need, int((~mask).sum()))
             if take <= 0:
                 continue
-            victims = torch.topk(kk, take, largest=False).indices.tolist()
-            for s in victims:
+            victims = torch.topk(kk, take, largest=False)
+            vidx = victims.indices.tolist()
+            vkey = victims.values.tolist()
+            for s, vk in zip(vidx, vkey):
+                if admission_keys is not None:
+                    # value-monotone admission: the slot granted next serves
+                    # candidate #len(out) (callers zip candidates with the
+                    # returned slots in order). Victims come cheapest-first
+                    # and candidate priorities descend, so the first losing
+                    # pairing ends the whole take (later pairs only worse).
+                    if len(out) >= len(admission_keys) or \
+                            not (admission_keys[len(out)] > vk):
+                        return out
                 vli = int(self._owner_li[s])
                 vei = int(self._owner_ei[s])
                 self.slot_table[vli, vei] = -1
@@ -1176,7 +1199,19 @@ class DeltaTier:
             # emergency=True: this is the synchronous runner-thread path with
             # no forward in flight — leaving a miss UNRESTORED is worse than
             # evicting a warm-but-idle slot (see _take_slots_batch).
-            slots = self._take_slots_batch(len(cand), emergency=True)
+            # Admission control for the OPPORTUNISTIC tier ("need" policy,
+            # FP4 pool): candidates are need-sorted descending; evictions
+            # are granted only while candidate need exceeds the victim's
+            # key, so an uncapped fire can never lower the pool's value
+            # (a 2-bit-served expert is correct — promotion is an upgrade,
+            # not a correctness requirement). The BASE cache keeps
+            # unconditional emergency semantics: a missing base expert
+            # would be ZEROED by the replay.
+            adm = None
+            if self._policy == "need":
+                adm = [float(self._need[li, ei]) for li, ei in cand]
+            slots = self._take_slots_batch(len(cand), emergency=True,
+                                           admission_keys=adm)
             plan = [((li, ei), slot) for (li, ei), slot in zip(cand, slots)]
             if not plan:
                 return 0
@@ -1201,7 +1236,13 @@ class DeltaTier:
             self._n_promoted += len(plan)
             self._win_promoted += len(plan)
         if len(plan) < len(cand):
-            if not pin:
+            if self._policy == "need":
+                # Opportunistic tier: the shortfall is admission control
+                # doing its job (candidates below the pool's value floor
+                # stay 2-bit — correct, just not upgraded). Not a quality
+                # event; visible via the deferred KPI.
+                self._kpi_deferred += len(cand) - len(plan)
+            elif not pin:
                 # No reader follows this call in the current step (see the
                 # pin doc): a slotless candidate is a DEFERRED warm-up
                 # fetch, not a quality event — the next step that routes it

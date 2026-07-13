@@ -72,7 +72,12 @@ _ENABLED = os.getenv("VLLM_MOE_W2_GATE", "0") == "1"
 _SIGNAL = os.getenv("VLLM_MOE_W2_GATE_SIGNAL", "max_prob")
 _DEFAULT_TAU = {"max_prob": 0.60, "margin": 1.5}
 _TAU = float(os.getenv("VLLM_MOE_W2_GATE_TAU", str(_DEFAULT_TAU.get(_SIGNAL, 0.60))))
-_MAX_PROMOTE = int(os.getenv("VLLM_MOE_W2_GATE_MAX_PROMOTE", "64"))
+# Default 0 = UNLIMITED. The cap is a pure PERF knob (bounds a fire's H2D
+# tail); quality-wise it must be neutral. The value-monotone ADMISSION
+# CONTROL in DeltaTier.force_promote (need policy) is what prevents
+# uncapped fires from bulk-evicting the high-need core at a full pool —
+# the pathology the old cap-64 default was inadvertently masking.
+_MAX_PROMOTE = int(os.getenv("VLLM_MOE_W2_GATE_MAX_PROMOTE", "0"))
 _TRACE = os.getenv("VLLM_MOE_W2_GATE_TRACE", "0") == "1"
 # Measurement mode: on a fired step, COUNT routed experts (delta._need) instead of
 # promoting/re-forwarding -> study whether 2-bit difficulty concentrates on few
