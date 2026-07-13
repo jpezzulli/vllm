@@ -135,7 +135,14 @@ class DFlashSpeculator(DraftModelSpeculator):
         ]
         assert self.draft_kv_cache_group_ids, "No draft attention groups found."
         self.draft_kv_cache_group_id = self.draft_kv_cache_group_ids[0]
-        self.draft_block_size = self.block_tables.block_sizes[
+        # KERNEL block size, not the manager block size: input_block_tables
+        # rows hold kernel-page ids (manager blocks are expanded by
+        # blocks_per_kv_block), so all slot math in the prepare kernel must
+        # use the same unit. With --block-size 256 over a 64-token FlashInfer
+        # page the two differ by 4x and the context K/V would land in pages
+        # the draft attention never reads (measured: all-zero context, all
+        # draft positions collapse to one prediction, acceptance 0).
+        self.draft_block_size = self.block_tables.kernel_block_sizes[
             self.draft_kv_cache_group_id
         ]
 
@@ -337,7 +344,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 last_sampled,
                 next_prefill_tokens,
                 self.block_tables.input_block_tables[gid],
-                self.block_tables.block_sizes[gid],
+                self.block_tables.kernel_block_sizes[gid],
                 self.parallel_drafting_token_id,
                 self.num_query_per_req,
                 self.num_speculative_steps,
