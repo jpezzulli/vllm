@@ -76,6 +76,21 @@ _state = "uninit"
 # (loader degrades to mc4 when missing). Opt out: VLLM_MOE_W2_AFRAG=0.
 _AFRAG = os.getenv("VLLM_MOE_W2_AFRAG", "1") == "1"
 _afrag_ok = False
+# PREFILL QUALITY LEVER (default ON): prefill-sized calls consume the FP4
+# delta tier exactly like decode — pairs whose expert is FP4-resident divert
+# to moe_w4(q)_mm, the rest stay on the 2-bit planes. Before this, prefill
+# ALWAYS computed on bare 2-bit planes, which was measured to be the whole
+# source of the +8-11% completion-token inflation vs native (GSM8K-200 DS4
+# TP2 tau1.0: 125 tok -> 116-117 = native parity when prefill reads the FP4
+# tier; the KV built from 2-bit prefill flattens decode logits cumulatively
+# with context length — internal/PREFILL_KV_INFLATION_FINDINGS.md). The
+# w4/w4q kernels take M<=4, so each 16-token prefill pair dispatches as 4
+# sub-entries; the 2-bit majority keeps the MC4/AFRAG fast path. Prefill
+# quality tracks pool coverage (partial pool = partial recovery — graceful).
+# Cost: FP4-resident pairs read the slot plane once per sub-entry (4x plane
+# traffic on the diverted minority). Opt out: VLLM_MOE_W2_PREFILL_FP4=0.
+# BASE-cache prefill is untouched (its need-pool is gate-scoped and tiny).
+_PREFILL_FP4 = os.getenv("VLLM_MOE_W2_PREFILL_FP4", "1") == "1"
 
 
 def _to_fragment_major(a: torch.Tensor, pairs: int, K: int) -> torch.Tensor:
@@ -1348,6 +1363,129 @@ def _desc_build_kernel_w4s(
 
 
 @triton.jit
+def _desc_build_kernel_prefill4(
+    eids_ptr, npost_ptr, slot_ptr, d_ptr,
+    a1b, as1b, c13b, a2b, as2b, c2b,
+    a1b_rm, a2b_rm,
+    p13b, s13b, p2b, s2b, poolb,
+    p13s, s13s, p2s, s2s,
+    slot_bytes, w13_bytes,
+    a1_rb, as1_rb, c13_rb, a2_rb, as2_rb, c2_rb,
+    n_experts, pairs, cap6, mblock,
+    BLOCK: tl.constexpr,
+):
+    """Prefill variant of _desc_build_kernel (VLLM_MOE_W2_PREFILL_FP4):
+    FP4-resident pairs divert to the w4 tier like decode, but the w4/w4q
+    kernels take M<=4, so each diverted mblock(16)-token pair is emitted as
+    FOUR w4 sub-entries (rows +0/+4/+8/+12, m=4 each) at desc index
+    p*4+sub — capacity fits because prefill pairs = slots/16 and the desc
+    tables are sized slots/4. The w2 tables keep pair granularity (m=0 for
+    diverted pairs -> MC4/AFRAG early-EXIT). w2 A-pointers follow the
+    (possibly fragment-major) a1b/a2b bases; the w4 sub-entries always read
+    the ROW-MAJOR a1b_rm/a2b_rm (repack leaves them intact)."""
+    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = p < pairs
+    e = tl.load(eids_ptr + p, mask=mask, other=0).to(tl.int64)
+    e = tl.minimum(tl.maximum(e, 0), n_experts - 1)
+    slot = tl.load(slot_ptr + e, mask=mask, other=-1).to(tl.int64)
+    npost = tl.load(npost_ptr).to(tl.int64)
+    live = p < npost // mblock
+    is4 = slot >= 0
+    m2 = tl.where(live & ~is4, mblock, 0).to(tl.int64)
+    base = p.to(tl.int64) * mblock
+    slot_c = tl.maximum(slot, 0)
+    bs13 = s13b + e * s13s
+    bs2 = s2b + e * s2s
+    # w2 tables (pair granularity, diverted pairs zeroed)
+    for gi in tl.static_range(2):
+        d = d_ptr + gi * cap6 + p * 6
+        if gi == 0:
+            b, s, a, as_, c = (p13b + e * p13s, bs13, a1b + base * a1_rb,
+                               as1b + base * as1_rb, c13b + base * c13_rb)
+        else:
+            b, s, a, as_, c = (p2b + e * p2s, bs2, a2b + base * a2_rb,
+                               as2b + base * as2_rb, c2b + base * c2_rb)
+        tl.store(d + 0, a, mask=mask)
+        tl.store(d + 1, as_, mask=mask)
+        tl.store(d + 2, b, mask=mask)
+        tl.store(d + 3, s, mask=mask)
+        tl.store(d + 4, c, mask=mask)
+        tl.store(d + 5, m2, mask=mask)
+    # w4 tables (sub-entry granularity: 4 x m<=4 rows per diverted pair)
+    for sub in tl.static_range(4):
+        rbase = base + sub * 4
+        m4 = tl.where(live & is4, 4, 0).to(tl.int64)
+        for gi in tl.static_range(2):
+            d = d_ptr + (2 + gi) * cap6 + (p * 4 + sub) * 6
+            if gi == 0:
+                b, s, a, as_, c = (poolb + slot_c * slot_bytes, bs13,
+                                   a1b_rm + rbase * a1_rb,
+                                   as1b + rbase * as1_rb,
+                                   c13b + rbase * c13_rb)
+            else:
+                b, s, a, as_, c = (poolb + slot_c * slot_bytes + w13_bytes,
+                                   bs2, a2b_rm + rbase * a2_rb,
+                                   as2b + rbase * as2_rb,
+                                   c2b + rbase * c2_rb)
+            tl.store(d + 0, a, mask=mask)
+            tl.store(d + 1, as_, mask=mask)
+            tl.store(d + 2, b, mask=mask)
+            tl.store(d + 3, s, mask=mask)
+            tl.store(d + 4, c, mask=mask)
+            tl.store(d + 5, m4, mask=mask)
+
+
+@triton.jit
+def _desc_build_kernel_w4s_prefill4(
+    eids_ptr, npost_ptr, slot_ptr, d_ptr,
+    a1b_rm, as1b, c13b, a2b_rm, as2b, c2b,
+    p13b, s13b, p2b, s2b, poolb,
+    p13s, s13s, p2s, s2s,
+    slot_bytes, w13r_bytes,
+    a1_rb, as1_rb, c13_rb, a2_rb, as2_rb, c2_rb,
+    n_experts, pairs, cap8, mblock,
+    BLOCK: tl.constexpr,
+):
+    """Prefill variant of _desc_build_kernel_w4s: split-FP4 sub-entries
+    (moe_w4q_mm, M<=4) at desc index p*4+sub for FP4-resident pairs. base/
+    bs stay per-expert resident-plane pointers; a/as/c take the sub-block
+    row offset (ROW-MAJOR activation bases — w4q never reads AFRAG)."""
+    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = p < pairs
+    e = tl.load(eids_ptr + p, mask=mask, other=0).to(tl.int64)
+    e = tl.minimum(tl.maximum(e, 0), n_experts - 1)
+    slot = tl.load(slot_ptr + e, mask=mask, other=-1).to(tl.int64)
+    npost = tl.load(npost_ptr).to(tl.int64)
+    live = p < npost // mblock
+    is4 = slot >= 0
+    base = p.to(tl.int64) * mblock
+    ref = poolb + tl.maximum(slot, 0) * slot_bytes
+    for sub in tl.static_range(4):
+        rbase = base + sub * 4
+        m4 = tl.where(live & is4, 4, 0).to(tl.int64)
+        for gi in tl.static_range(2):
+            d = d_ptr + gi * cap8 + (p * 4 + sub) * 8
+            if gi == 0:
+                bb, rr, ss, a, as_, c = (
+                    p13b + e * p13s, ref, s13b + e * s13s,
+                    a1b_rm + rbase * a1_rb, as1b + rbase * as1_rb,
+                    c13b + rbase * c13_rb)
+            else:
+                bb, rr, ss, a, as_, c = (
+                    p2b + e * p2s, ref + w13r_bytes, s2b + e * s2s,
+                    a2b_rm + rbase * a2_rb, as2b + rbase * as2_rb,
+                    c2b + rbase * c2_rb)
+            tl.store(d + 0, a, mask=mask)
+            tl.store(d + 1, as_, mask=mask)
+            tl.store(d + 2, bb, mask=mask)
+            tl.store(d + 3, rr, mask=mask)
+            tl.store(d + 4, ss, mask=mask)
+            tl.store(d + 5, c, mask=mask)
+            tl.store(d + 6, m4, mask=mask)
+            tl.store(d + 7, tl.zeros_like(m4), mask=mask)
+
+
+@triton.jit
 def _desc_build_kernel_basecache(
     eids_ptr, npost_ptr, slot_ptr, miss_ptr, d_ptr,
     a1b, as1b, c13b, a2b, as2b, c2b,
@@ -1610,14 +1748,17 @@ def _moe_w2_forward_timed(
     base_mode = st.get("base", False)
     # AFRAG (prefill): the GEMM reads fragment-major activations from the
     # dedicated a1f/a2f buffers (filled by the single-pass triton repack
-    # below); point the desc 'a' fields there. w4 tables are decode-only,
-    # so redirecting the shared base in prefill is safe.
+    # below); point the w2 desc 'a' fields there. The w4 tier never reads
+    # AFRAG: decode is row-major anyway and the prefill-FP4 sub-entries
+    # take the row-major bases explicitly (the repack copies OUT of a1/a2,
+    # leaving them valid).
     use_afrag = prefill and _afrag_ok
     a1_base = ws["a1f"] if use_afrag else ws["a1"]
     a2_base = ws["a2f"] if use_afrag else ws["a2"]
     d = ws["desc"]
     cap = d.shape[1]
     miss_rows = None
+    use_pf4 = False        # prefill-FP4 (resident mode only; see _PREFILL_FP4)
     if base_mode:
         # BASE cache: 2-bit planes come from the base tier's GPU pool; a live
         # pair with a non-resident expert contributes zero and bumps the miss
@@ -1720,6 +1861,9 @@ def _moe_w2_forward_timed(
             tier = None      # downstream w4 launches key off `tier`
     else:
         tier = moe_w2_delta._TIER       # peek only; created by the plane builder
+        # prefill consumes the FP4 tier too (quality lever, see _PREFILL_FP4)
+        use_pf4 = (_PREFILL_FP4 and prefill and tier is not None
+                   and tier.n_slots > 0)
         if tier is not None and not prefill:
             if torch.cuda.is_current_stream_capturing():
                 tier.notify_capture()
@@ -1729,36 +1873,76 @@ def _moe_w2_forward_timed(
                                    topk_ids.view(-1).long())
         else:
             if tier is not None:
+                # seen marks land BEFORE the desc build: the manager's
+                # victim selection excludes this window's experts, so a
+                # background pass cannot rewrite a slot between the desc
+                # build below and the GEMMs reading it (same protection
+                # class as decode's step-scoped windows).
                 moe_w2_delta.mark_seen(tier.seen[layer_key],
                                        topk_ids.view(-1).long())
-            slot_row = ws["no_slots"]
-            pool_ptr = ws["a1"].data_ptr()      # never dereferenced (m4=0)
-        _desc_build_kernel[(triton.cdiv(pairs, 256),)](
-            expert_blocks, num_post, slot_row, d,
-            a1_base.data_ptr(), ws["as1"].data_ptr(), ws["c13"].data_ptr(),
-            a2_base.data_ptr(), ws["as2"].data_ptr(), ws["c2"].data_ptr(),
-            st["planes13"].data_ptr(), st["sc13"].data_ptr(),
-            st["planes2"].data_ptr(), st["sc2"].data_ptr(), pool_ptr,
-            st["planes13"].shape[1], st["sc13"].shape[1],
-            st["planes2"].shape[1], st["sc2"].shape[1],
-            (tier.slot_bytes if tier is not None else moe_w2_delta.SLOT_BYTES),
-            (tier.w13_bytes if tier is not None else moe_w2_delta.W13_BYTES),
-            # row strides (bytes). H-side: a1 fp8 [H], as1 f32 [H/32]
-            # (a32 per-32 groups; the a128 lineage was f32 [H/128]), c2 bf16
-            # [H]. per-rank intermediate side: c13 bf16 [2I], a2 fp8 [I], as2
-            # f32 [I/32]. K13 = H, K2 = I; GLM-5.x gets H=6144, TP shards
-            # shrink I.
-            st["K13"], (st["K13"] // 32) * 4, 4 * st["K2"], st["K2"],
-            (st["K2"] // 32) * 4, 2 * st["K13"],
-            st["E"], pairs, cap * 6, mblock, BLOCK=256)
-        if tier is not None and not prefill and moe_w2_delta.split_enabled():
-            # split-FP4: the extra 8-field tables for moe_w4q_mm (base/bs =
-            # the resident plane rows, ref = the slot's quintal sections)
-            d4s = ws["desc4s"]
-            _desc_build_kernel_w4s[(triton.cdiv(pairs, 256),)](
-                expert_blocks, num_post, slot_row, d4s,
+            if use_pf4:
+                if torch.cuda.is_current_stream_capturing():
+                    tier.notify_capture()
+                slot_row = tier.slot_table[layer_key]
+                pool_ptr = tier.pool.data_ptr()
+            else:
+                slot_row = ws["no_slots"]
+                pool_ptr = ws["a1"].data_ptr()  # never dereferenced (m4=0)
+        if use_pf4:
+            # w2 tables at pair granularity (diverted pairs m=0) + w4 tables
+            # at SUB-ENTRY granularity (p*4+sub, m<=4 — the w4/w4q kernel M
+            # limit). w4 entries always read ROW-MAJOR a1/a2 (AFRAG repack
+            # leaves the row-major source buffers intact).
+            _desc_build_kernel_prefill4[(triton.cdiv(pairs, 256),)](
+                expert_blocks, num_post, slot_row, d,
                 a1_base.data_ptr(), ws["as1"].data_ptr(),
                 ws["c13"].data_ptr(), a2_base.data_ptr(),
+                ws["as2"].data_ptr(), ws["c2"].data_ptr(),
+                ws["a1"].data_ptr(), ws["a2"].data_ptr(),
+                st["planes13"].data_ptr(), st["sc13"].data_ptr(),
+                st["planes2"].data_ptr(), st["sc2"].data_ptr(), pool_ptr,
+                st["planes13"].shape[1], st["sc13"].shape[1],
+                st["planes2"].shape[1], st["sc2"].shape[1],
+                tier.slot_bytes, tier.w13_bytes,
+                st["K13"], (st["K13"] // 32) * 4, 4 * st["K2"], st["K2"],
+                (st["K2"] // 32) * 4, 2 * st["K13"],
+                st["E"], pairs, cap * 6, mblock, BLOCK=256)
+        else:
+            _desc_build_kernel[(triton.cdiv(pairs, 256),)](
+                expert_blocks, num_post, slot_row, d,
+                a1_base.data_ptr(), ws["as1"].data_ptr(),
+                ws["c13"].data_ptr(),
+                a2_base.data_ptr(), ws["as2"].data_ptr(), ws["c2"].data_ptr(),
+                st["planes13"].data_ptr(), st["sc13"].data_ptr(),
+                st["planes2"].data_ptr(), st["sc2"].data_ptr(), pool_ptr,
+                st["planes13"].shape[1], st["sc13"].shape[1],
+                st["planes2"].shape[1], st["sc2"].shape[1],
+                (tier.slot_bytes if tier is not None
+                 else moe_w2_delta.SLOT_BYTES),
+                (tier.w13_bytes if tier is not None
+                 else moe_w2_delta.W13_BYTES),
+                # row strides (bytes). H-side: a1 fp8 [H], as1 f32 [H/32]
+                # (a32 per-32 groups; the a128 lineage was f32 [H/128]), c2
+                # bf16 [H]. per-rank intermediate side: c13 bf16 [2I], a2
+                # fp8 [I], as2 f32 [I/32]. K13 = H, K2 = I; GLM-5.x gets
+                # H=6144, TP shards shrink I.
+                st["K13"], (st["K13"] // 32) * 4, 4 * st["K2"], st["K2"],
+                (st["K2"] // 32) * 4, 2 * st["K13"],
+                st["E"], pairs, cap * 6, mblock, BLOCK=256)
+        if (tier is not None and (not prefill or use_pf4)
+                and moe_w2_delta.split_enabled()):
+            # split-FP4: the extra 8-field tables for moe_w4q_mm (base/bs =
+            # the resident plane rows, ref = the slot's quintal sections).
+            # Prefill emits sub-entries (M<=4) via the prefill4 variant.
+            d4s = ws["desc4s"]
+            builder = (_desc_build_kernel_w4s_prefill4 if use_pf4
+                       else _desc_build_kernel_w4s)
+            a1_w4s = ws["a1"] if use_pf4 else a1_base
+            a2_w4s = ws["a2"] if use_pf4 else a2_base
+            builder[(triton.cdiv(pairs, 256),)](
+                expert_blocks, num_post, slot_row, d4s,
+                a1_w4s.data_ptr(), ws["as1"].data_ptr(),
+                ws["c13"].data_ptr(), a2_w4s.data_ptr(),
                 ws["as2"].data_ptr(), ws["c2"].data_ptr(),
                 st["planes13"].data_ptr(), st["sc13"].data_ptr(),
                 st["planes2"].data_ptr(), st["sc2"].data_ptr(), pool_ptr,
@@ -1784,7 +1968,9 @@ def _moe_w2_forward_timed(
     _launch(w2tier, st["K13"], d[0], st["N13"], pairs, stream)
     # split-FP4 dispatch: both residency modes fill ws["desc4s"] (classic:
     # _desc_build_kernel_w4s against resident planes; base cache:
-    # _desc_build_kernel_base_delta_split against the coupled base slots)
+    # _desc_build_kernel_base_delta_split against the coupled base slots).
+    # Prefill-FP4 launches the w4 tier over SUB-ENTRIES (4 x M<=4 rows per
+    # 16-token pair -> grid pairs*4), see _desc_build_kernel_prefill4.
     use_w4s = (tier is not None and not prefill
                and moe_w2_delta.split_enabled())
     if tier is not None and not prefill:
@@ -1793,6 +1979,12 @@ def _moe_w2_forward_timed(
                     stream)
         else:
             _launch("w4", st["K13"], d[2], st["N13"], pairs, stream)
+    elif use_pf4:
+        if moe_w2_delta.split_enabled():
+            _launch("w4q", st["K13"], ws["desc4s"][0], st["N13"], pairs * 4,
+                    stream)
+        else:
+            _launch("w4", st["K13"], d[2], st["N13"], pairs * 4, stream)
     act = ws["act"][:slots]
     torch.ops._C.silu_and_mul(act, ws["c13"][:slots])
     # mid-pipeline requant (group _G2, default 32 — the a128-era group-128
@@ -1806,6 +1998,12 @@ def _moe_w2_forward_timed(
             _launch("w4q", st["K2"], ws["desc4s"][1], st["N2"], pairs, stream)
         else:
             _launch("w4", st["K2"], d[3], st["N2"], pairs, stream)
+    elif use_pf4:
+        if moe_w2_delta.split_enabled():
+            _launch("w4q", st["K2"], ws["desc4s"][1], st["N2"], pairs * 4,
+                    stream)
+        else:
+            _launch("w4", st["K2"], d[3], st["N2"], pairs * 4, stream)
 
     # ---- weighted unpermute (pad slots masked out), DETERMINISTIC.
     # The old `out.index_add_(0, rows, c2*w)` scattered with atomics, so the
