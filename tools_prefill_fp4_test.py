@@ -170,6 +170,26 @@ moe_w2_delta._TIER = tier_s
 got = moe_w2_cubit._moe_w2_forward(x, topk_w, topk_ids, 0)
 ok &= check("prefill w4q SPLIT, AFRAG off",
             got, reference(set(promoted), dequant_split))
+
+# ---- ENSURE mode: guarantee from an EMPTY pool — every routed expert is
+# fetched synchronously per layer, so the output must equal the FULL
+# quintal reference (nothing left on 2-bit) despite zero initial residency.
+tier_g = moe_w2_delta.DeltaTier(1, E, dev,
+                                w13_bytes=2 * I * H * 5 // 16,
+                                w2_bytes=H * I * 5 // 16)
+moe_w2_delta._TIER = tier_g
+tier_g.add_layer_host_planes(0, rf13, rf2)
+torch.cuda.synchronize()
+moe_w2_cubit._PREFILL_FP4_ENSURE = True
+got = moe_w2_cubit._moe_w2_forward(x, topk_w, topk_ids, 0)
+ok &= check("prefill w4q ENSURE (empty pool -> full quintal)",
+            got, reference(set(range(E)), dequant_split))
+n_res = int((tier_g.slot_table[0] >= 0).sum())
+routed = int(topk_ids.unique().numel())
+print(f"ensure promoted {n_res} slots for {routed} routed experts",
+      "PASS" if n_res == routed else "FAIL")
+ok &= n_res == routed
+moe_w2_cubit._PREFILL_FP4_ENSURE = False
 moe_w2_delta._SPLIT = False
 
 print("RESULT:", "PASS" if ok else "FAIL")

@@ -90,7 +90,24 @@ _afrag_ok = False
 # Cost: FP4-resident pairs read the slot plane once per sub-entry (4x plane
 # traffic on the diverted minority). Opt out: VLLM_MOE_W2_PREFILL_FP4=0.
 # BASE-cache prefill is untouched (its need-pool is gate-scoped and tiny).
-_PREFILL_FP4 = os.getenv("VLLM_MOE_W2_PREFILL_FP4", "1") == "1"
+#
+# "ensure" mode (VLLM_MOE_W2_PREFILL_FP4=ensure) upgrades the opportunistic
+# lever to the DECODE-CLASS GUARANTEE: before each layer's desc build the
+# chunk's routed set is made resident via tier.ensure_resident (the base
+# cache's prefill idiom — synchronous fetch + per-layer pin scope), so
+# EVERY pair diverts to FP4 regardless of steady-state coverage. The pool
+# only needs to hold one layer's chunk working set (<= E slots); parity no
+# longer costs a step-union-sized pool. Prices: H2D on cold working sets
+# (a broad prompt can stream the whole quintal store once, ~1 s/40 GiB on
+# PCIe5), the decode hot set gets displaced by long prompts (tau-driven
+# fires re-promote it after the prompt — transient), and the guarantee
+# only holds on EAGER prefill: chunks replayed from captured piecewise
+# graphs skip host code and stay opportunistic (same boundary the base
+# cache accepts).
+_PF4_ENV = os.getenv("VLLM_MOE_W2_PREFILL_FP4", "1")
+_PREFILL_FP4 = _PF4_ENV not in ("0", "")
+_PREFILL_FP4_ENSURE = _PF4_ENV == "ensure"
+_pf4_ensure_logged = False
 
 
 def _to_fragment_major(a: torch.Tensor, pairs: int, K: int) -> torch.Tensor:
@@ -1883,6 +1900,18 @@ def _moe_w2_forward_timed(
             if use_pf4:
                 if torch.cuda.is_current_stream_capturing():
                     tier.notify_capture()
+                elif _PREFILL_FP4_ENSURE:
+                    # decode-class guarantee: fetch the chunk's routed set
+                    # into the pool before the desc build reads slot_table
+                    # (base-cache prefill idiom; layer pins rotate).
+                    global _pf4_ensure_logged
+                    if not _pf4_ensure_logged:
+                        _pf4_ensure_logged = True
+                        logger.info("moe_w2 prefill-FP4 ensure mode: eager "
+                                    "chunk working sets fetched to the FP4 "
+                                    "tier (first call: layer %d, T=%d)",
+                                    layer_key, T)
+                    tier.ensure_resident(layer_key, topk_ids.view(-1))
                 slot_row = tier.slot_table[layer_key]
                 pool_ptr = tier.pool.data_ptr()
             else:
