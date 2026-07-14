@@ -12,9 +12,15 @@ Opt-in via VLLM_MOE_W2=1. Replaces the stock routed-expert GEMM path:
             verbatim. FP8 block-quant checkpoints (DS4-FP8, GLM-5.2-FP8) are
             re-quantized at load via build_layer_planes_fp8.
   compute : cubit `moe_w2_mm` SASS GEMM (M<=4 per pair, PRMT-LUT decode,
-            QMMA.SF block-32 sfb, f32 act-scale fold) for BOTH w13 and w2.
-  glue    : moe_align_block_size(block=4) pairs, fp8 group-128 activation
-            quant, silu*up in torch, weighted scatter-add unpermute. All
+            QMMA.SF block-32 sfb, f32 act-scale fold per k32) for BOTH
+            w13 and w2.
+  glue    : moe_align_block_size(block=4) pairs, a32 activation quant
+            (fp8 e4m3 + exact f32 PER-32-GROUP scales; the a128 lineage
+            quantized per-128 — the 4x-coarser groups plus the group-128
+            mid-pipeline requant were the last measured source of the
+            +8-11% completion-token inflation vs native; the e8m0-scale
+            MXFP8-parity variant lost accuracy: GSM8K 95.5% vs 97.0%),
+            silu*up in torch, weighted scatter-add unpermute. All
             steps are tensor ops or driver launches on the current stream:
             CUDA-graph capturable, registered as one custom op.
 
@@ -66,7 +72,7 @@ _state = "uninit"
 # strided 4-byte loads). Profile showed prefill moe_w2_mm is L1/load-issue bound
 # (NOT weight-DRAM bound), so this cuts the dominant load class ~4x at identical
 # occupancy -> measured 1.30x (K=4096) / 1.27x (K=2048) on the prefill GEMM.
-# Numerics are bit-identical to mc4. Needs moe_w2_mm_mc4afrag_k{K}.cubin present
+# Numerics are bit-identical to mc4. Needs moe_w2_mm_mc4afrag_k{K}_a32.cubin present
 # (loader degrades to mc4 when missing). Opt out: VLLM_MOE_W2_AFRAG=0.
 _AFRAG = os.getenv("VLLM_MOE_W2_AFRAG", "1") == "1"
 _afrag_ok = False
@@ -106,6 +112,48 @@ _WS: dict = {}                  # shared workspaces, sized lazily
 _TOPP = float(os.getenv("VLLM_MOE_W2_TOPP", "0"))
 _TOPP_MIN = max(1, int(os.getenv("VLLM_MOE_W2_TOPP_MIN", "2")))
 _TOPP_RENORM = os.getenv("VLLM_MOE_W2_TOPP_RENORM", "1") == "1"
+
+# ---- activation-scale group size per GEMM (the a32 kernel format) --------
+# The _a32 kernels read f32 A scales at PER-32 stride; quantizing with a
+# coarser group and repeating each scale over the 32-groups it covers is
+# mathematically identical to quantizing at that coarser group — so one
+# cubin set serves any {32, 64, 128} combination. G1 = the x -> w13 GEMM,
+# G2 = the silu·up requant -> w2 GEMM; UE8M0 rounds scales up to powers of
+# two (per_token_group_quant_fp8's platform default on this stack, i.e.
+# what the retired a128 lineage actually served).
+#
+# DEFAULTS = 128/128/UE8M0: the measured-best combination. The activation-
+# precision handoff's plan A (per-32 groups) was built and E2E-FALSIFIED
+# here — GSM8K-200, 2x6000 quintal tau1.0, all with the identical stack:
+#   G1=128 G2=128 ue8m0 (a128-equivalent):  97.0%  122 tok  (flips 1<->1)
+#   G1=32  G2=128 f32:                      96.5%  124 tok
+#   G1=32  G2=32  f32:                      95.5%  127 tok
+#   G1=32  G2=32  e8m0 (native MXFP8 fmt):  95.5%  122 tok
+#   native / a128 anchors:                  97.0%  116 / 125 tok
+# Finer A groups do NOT shorten completions (the +8-11% inflation vs native
+# does not come from activation-scale granularity) and consistently cost
+# accuracy against the 2-bit/quintal weight planes. The envs stay for
+# format experiments; the per-32-capable kernels are the delivery.
+_G1 = int(os.getenv("VLLM_MOE_W2_A32_G1", "128"))
+_G2 = int(os.getenv("VLLM_MOE_W2_A32_G2", "128"))
+_A32_UE8M0 = os.getenv("VLLM_MOE_W2_A32_UE8M0", "1") == "1"
+assert _G1 in (32, 64, 128) and _G2 in (32, 64, 128), (_G1, _G2)
+
+
+def _quant_a32(x, out_q, out_s, group: int):
+    """Quantize rows of `x` into the per-32-stride a32 scale plane using
+    `group`-sized amax groups. For group > 32 the scale broadcast into the
+    strided plane is a single view-copy (no repeat_interleave temporary)."""
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8,
+    )
+    _, s = per_token_group_quant_fp8(x, group, out_q=out_q,
+                                     use_ue8m0=_A32_UE8M0)
+    r = group // 32
+    if r == 1:
+        out_s.copy_(s)
+    else:
+        out_s.view(s.shape[0], -1, r).copy_(s.unsqueeze(-1))
 
 
 def _apply_topp(topk_weights: torch.Tensor, topk_ids: torch.Tensor):
@@ -215,19 +263,26 @@ def _ensure_ready() -> bool:
         torch.cuda.init()
         torch.zeros(1, device="cuda")
         cu = _driver()
+        # ONLY `_a32` cubins load (activation format rev: f32 A scales at
+        # PER-32-GROUP granularity, folded per k32). The a128 lineage reads
+        # the desc `as` field with a (K/128)*4 row stride — feeding it the
+        # a32 (K/32)*4 plane would be silent garbage, so the filename suffix
+        # IS the format contract: a cubin dir without the complete _a32 set
+        # fails loudly in _require_kernels (no old/new mixing possible).
+        # The a128-era mc2 prefill experiment is retired (superseded by
+        # mc4/AFRAG; never launched by the serving path).
         for tier, kern in (("w2", b"moe_w2_mm"), ("w4", b"moe_w4_mm"),
-                           ("w4q", b"moe_w4q_mm"),
-                           ("w2mc2", b"moe_w2_mm"), ("w2mc4", b"moe_w2_mm")):
+                           ("w4q", b"moe_w4q_mm"), ("w2mc4", b"moe_w2_mm")):
             # GEMM contraction K: gate-up needs K=hidden (4096 DS4-Flash,
             # 6144 GLM-5.x, 7168 Kimi-K2.x); down needs K=I/TP (2048 @ TP1,
             # 1024 @ TP2, 512 @ TP4). Cubins are loaded opportunistically --
             # the plane builders assert the shapes the model actually needs
-            # are present (_assert_kernels fails loudly at weight load).
+            # are present (_require_kernels fails loudly at weight load).
             for k in (7168, 6144, 4096, 2048, 1024, 512):
-                if tier in ("w2mc2", "w2mc4"):
-                    fname = f"moe_w2_mm_{tier[2:]}_k{k}.cubin"
+                if tier == "w2mc4":
+                    fname = f"moe_w2_mm_mc4_k{k}_a32.cubin"
                 else:
-                    fname = f"moe_{tier}_mm_k{k}.cubin"
+                    fname = f"moe_{tier}_mm_k{k}_a32.cubin"
                 path = os.path.join(_DIR, fname)
                 if not os.path.exists(path):
                     continue
@@ -242,7 +297,8 @@ def _ensure_ready() -> bool:
         if _AFRAG:
             try:
                 for k in (7168, 6144, 4096, 2048, 1024, 512):
-                    path = os.path.join(_DIR, f"moe_w2_mm_mc4afrag_k{k}.cubin")
+                    path = os.path.join(
+                        _DIR, f"moe_w2_mm_mc4afrag_k{k}_a32.cubin")
                     if not os.path.exists(path):
                         continue
                     mod = ctypes.c_void_p()
@@ -1067,8 +1123,12 @@ def _workspaces(slots: int, tokens: int, dev, inter: int = 2048,
     # 512 @ TP4 as the experts shard). The hidden H (4096 DS4, 6144 GLM-5.x) is
     # NOT sharded, so the A-side (a1), x-quant (xq) and w2 output (c2) buffers
     # stay H-wide; only the gate/up output (c13 = 2I), the intermediate
-    # activation (act/a2 = I) and its group-128 scales (as2 = I/128) follow the
+    # activation (act/a2 = I) and its per-32 scales (as2 = I/32) follow the
     # shard.
+    #
+    # Activation scales are per-32-GROUP f32 (a32 cubin rev): [rows, K/32]
+    # f32 — 4x the scale elements of the retired per-128 format (row stride
+    # (K/32)*4 bytes; the desc-build strides moved with it).
     if (_WS.get("slots", 0) < slots or _WS.get("tokens", 0) < tokens
             or _WS.get("inter") != inter or _WS.get("hidden") != hidden
             or _WS.get("n_experts", 0) < n_experts):
@@ -1086,11 +1146,11 @@ def _workspaces(slots: int, tokens: int, dev, inter: int = 2048,
             # writes rows [:T].
             xq=torch.zeros(tokens + 1, hidden, dtype=torch.float8_e4m3fn,
                            device=dev),
-            xs=torch.zeros(tokens + 1, hidden // 128, dtype=torch.float32,
+            xs=torch.zeros(tokens + 1, hidden // 32, dtype=torch.float32,
                            device=dev),
             a1=torch.zeros(slots + 4, hidden, dtype=torch.float8_e4m3fn,
                            device=dev),
-            as1=torch.zeros(slots + 4, hidden // 128, dtype=torch.float32,
+            as1=torch.zeros(slots + 4, hidden // 32, dtype=torch.float32,
                             device=dev),
             # zeros, not empty: pad-pair rows are never written by the kernel
             # (early EXIT) yet flow through silu/scatter math with weight 0;
@@ -1100,7 +1160,7 @@ def _workspaces(slots: int, tokens: int, dev, inter: int = 2048,
             act=torch.zeros(slots + 4, inter, dtype=torch.bfloat16, device=dev),
             a2=torch.zeros(slots + 4, inter, dtype=torch.float8_e4m3fn,
                            device=dev),
-            as2=torch.zeros(slots + 4, max(inter // 128, 1),
+            as2=torch.zeros(slots + 4, inter // 32,
                             dtype=torch.float32, device=dev),
             c2=torch.zeros(slots + 4, hidden, dtype=torch.bfloat16,
                            device=dev),
@@ -1158,6 +1218,22 @@ def _afrag_repack(src: torch.Tensor, dst: torch.Tensor, pairs: int, K: int):
     src32 = src.view(torch.uint8).view(-1).view(torch.int32)
     dst32 = dst.view(torch.uint8).view(-1).view(torch.int32)
     _afrag_repack_kernel[(pairs, K // 64)](src32, dst32, K=K)
+
+
+def a32_dequant_ref(x: torch.Tensor, gemm: int = 1) -> torch.Tensor:
+    """Torch-only reference roundtrip of the activation quant the forward
+    serves for the given GEMM (group _G1/_G2, optional UE8M0 rounding —
+    mirrors per_token_group_quant_fp8): rows [M, K] -> f32 dequant. Used
+    by the tools/ test references so they cannot drift from the serving
+    format regardless of the VLLM_MOE_W2_A32_* envs in effect."""
+    group = _G1 if gemm == 1 else _G2
+    m, k = x.shape
+    xb = x.float().view(m, k // group, group)
+    scale = (xb.abs().amax(-1).clamp_min(1e-10) / 448.0)
+    if _A32_UE8M0:
+        scale = torch.exp2(torch.ceil(torch.log2(scale)))
+    q = (xb / scale[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return q.float().view(m, k) * scale.repeat_interleave(group, 1)
 
 
 @triton.jit
@@ -1488,9 +1564,6 @@ def _moe_w2_forward_timed(
     from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
         moe_align_block_size,
     )
-    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-        per_token_group_quant_fp8,
-    )
 
     st = _LAYERS[layer_key]
     T, H = x.shape
@@ -1519,12 +1592,12 @@ def _moe_w2_forward_timed(
     ws = _workspaces(slots, T, dev, inter=st["K2"], hidden=st["K13"],
                      n_experts=st["E"])
 
-    # ---- activation quant (group-128) into the padded buffer; the buffer's
-    # last row is the permanent zero pad row for filler slots.
+    # ---- activation quant (a32: exact f32 scales, group _G1, default 32)
+    # into the padded buffer; the buffer's last row is the permanent zero
+    # pad row for filler slots.
     xq = ws["xq"]
     pad_row = xq.shape[0] - 1
-    _, xs = per_token_group_quant_fp8(x, 128, out_q=xq[:T])
-    ws["xs"][:T] = xs
+    _quant_a32(x, xq[:T], ws["xs"][:T], _G1)
     valid = sorted_ids < T * top_k
     rows = torch.where(valid, sorted_ids // top_k,
                        torch.full_like(sorted_ids, pad_row))
@@ -1603,8 +1676,8 @@ def _moe_w2_forward_timed(
                 btier.pool.data_ptr(), btier.slot_bytes,
                 st["off_s13"], st["off_c2"], st["off_s2"],
                 tier.pool.data_ptr(), tier.slot_bytes, tier.w13_bytes,
-                st["K13"], (st["K13"] // 128) * 4, 4 * st["K2"], st["K2"],
-                (st["K2"] // 128) * 4, 2 * st["K13"],
+                st["K13"], (st["K13"] // 32) * 4, 4 * st["K2"], st["K2"],
+                (st["K2"] // 32) * 4, 2 * st["K13"],
                 st["E"], pairs, cap * 6, d4s.shape[1] * 8, mblock, BLOCK=256)
         elif use_fp4:
             fslot_row = tier.slot_table[layer_key]
@@ -1617,8 +1690,8 @@ def _moe_w2_forward_timed(
                 st["off_s13"], st["off_c2"], st["off_s2"],
                 tier.pool.data_ptr(), tier.slot_bytes,
                 st["off4_s13"], st["off4_c2"], st["off4_s2"],
-                st["K13"], (st["K13"] // 128) * 4, 4 * st["K2"], st["K2"],
-                (st["K2"] // 128) * 4, 2 * st["K13"],
+                st["K13"], (st["K13"] // 32) * 4, 4 * st["K2"], st["K2"],
+                (st["K2"] // 32) * 4, 2 * st["K13"],
                 st["E"], pairs, cap * 6, mblock, BLOCK=256)
         else:
             _desc_build_kernel_basecache[(triton.cdiv(pairs, 256),)](
@@ -1628,8 +1701,8 @@ def _moe_w2_forward_timed(
                 a2_base.data_ptr(), ws["as2"].data_ptr(), ws["c2"].data_ptr(),
                 btier.pool.data_ptr(), btier.slot_bytes,
                 st["off_s13"], st["off_c2"], st["off_s2"],
-                st["K13"], (st["K13"] // 128) * 4, 4 * st["K2"], st["K2"],
-                (st["K2"] // 128) * 4, 2 * st["K13"],
+                st["K13"], (st["K13"] // 32) * 4, 4 * st["K2"], st["K2"],
+                (st["K2"] // 32) * 4, 2 * st["K13"],
                 st["E"], pairs, cap * 6, mblock, BLOCK=256)
         # Miss pairs get scatter weight 0: the GEMMs early-EXIT on m=0 and
         # never write their c13/c2 rows, but those workspace rows hold STALE
@@ -1670,12 +1743,13 @@ def _moe_w2_forward_timed(
             st["planes2"].shape[1], st["sc2"].shape[1],
             (tier.slot_bytes if tier is not None else moe_w2_delta.SLOT_BYTES),
             (tier.w13_bytes if tier is not None else moe_w2_delta.W13_BYTES),
-            # row strides (bytes). H-side: a1 fp8 [H], as1 f32 [H/128], c2 bf16
+            # row strides (bytes). H-side: a1 fp8 [H], as1 f32 [H/32]
+            # (a32 per-32 groups; the a128 lineage was f32 [H/128]), c2 bf16
             # [H]. per-rank intermediate side: c13 bf16 [2I], a2 fp8 [I], as2
-            # f32 [I/128]. K13 = H, K2 = I -> identical to the old literals on
-            # DS4 TP1 (H=4096, I=2048); GLM-5.x gets H=6144, TP shards shrink I.
-            st["K13"], (st["K13"] // 128) * 4, 4 * st["K2"], st["K2"],
-            (st["K2"] // 128) * 4, 2 * st["K13"],
+            # f32 [I/32]. K13 = H, K2 = I; GLM-5.x gets H=6144, TP shards
+            # shrink I.
+            st["K13"], (st["K13"] // 32) * 4, 4 * st["K2"], st["K2"],
+            (st["K2"] // 32) * 4, 2 * st["K13"],
             st["E"], pairs, cap * 6, mblock, BLOCK=256)
         if tier is not None and not prefill and moe_w2_delta.split_enabled():
             # split-FP4: the extra 8-field tables for moe_w4q_mm (base/bs =
@@ -1691,8 +1765,8 @@ def _moe_w2_forward_timed(
                 st["planes13"].shape[1], st["sc13"].shape[1],
                 st["planes2"].shape[1], st["sc2"].shape[1],
                 tier.slot_bytes, tier.w13_bytes,
-                st["K13"], (st["K13"] // 128) * 4, 4 * st["K2"], st["K2"],
-                (st["K2"] // 128) * 4, 2 * st["K13"],
+                st["K13"], (st["K13"] // 32) * 4, 4 * st["K2"], st["K2"],
+                (st["K2"] // 32) * 4, 2 * st["K13"],
                 st["E"], pairs, d4s.shape[1] * 8, mblock, BLOCK=256)
 
     # ---- w13 GEMMs (both tiers) -> fused silu*up -> quant -> w2 GEMMs
@@ -1721,8 +1795,9 @@ def _moe_w2_forward_timed(
             _launch("w4", st["K13"], d[2], st["N13"], pairs, stream)
     act = ws["act"][:slots]
     torch.ops._C.silu_and_mul(act, ws["c13"][:slots])
-    _, qs2 = per_token_group_quant_fp8(act, 128, out_q=ws["a2"][:slots])
-    ws["as2"][:slots] = qs2
+    # mid-pipeline requant (group _G2, default 32 — the a128-era group-128
+    # requant here was one of the two activation-precision gaps vs native)
+    _quant_a32(act, ws["a2"][:slots], ws["as2"][:slots], _G2)
     if use_afrag:
         _afrag_repack(ws["a2"], ws["a2f"], pairs, st["K2"])
     _launch(w2tier, st["K2"], d[1], st["N2"], pairs, stream)
