@@ -983,8 +983,26 @@ class DeltaTier:
         Decode steps with misses are unaffected (force_promote already
         zeroes after its snapshot); this closes the window for miss-free
         and prefill steps. A mark lost to an in-flight scatter only delays
-        one lazy promotion (the manager's own idiom)."""
+        one lazy promotion (the manager's own idiom).
+
+        ALSO closes the step's PIN scope. step_begin (the other clear
+        site) only runs on the base-cache runner path, so on delta-only
+        configs (GPU-resident planes + FP4 tier: the DS4 1-GPU/TP2 and
+        GLM TP4 quality recipes) the gate's force_promote hit-pins
+        accumulated FOREVER — once the pool filled, every eviction pass
+        (incl. the emergency pass, whose only hard exclusion is these
+        pins) found zero victims and the gate silently stopped promoting
+        (measured on the fin-03 line at tau=1.0: 22.9k fires -> 2
+        re-forwards, [pool 341, pinned 341]). The step is fully executed
+        when the runner calls this (replays done; nothing reads the pool
+        until the next step's passes re-pin what they touch), so clearing
+        here restores the one-step scope on every config. Ported as
+        knowledge from fin-03 commit 6e4af0052 (its gate line diverged
+        pre-fire-floor; the fix concept carries verbatim)."""
         self.seen.zero_()
+        with self._lock:
+            self._step_pins.clear()
+            self._layer_pins.clear()
 
     # ---- draft-affinity prefetch (VLLM_MOE_W2_PREFETCH=1) ------------------
 

@@ -108,6 +108,17 @@ _tau_mtime = -1.0
 # Diagnostic: when 0, a fired step force-promotes (warms cache) but SKIPS the
 # 2nd forward — isolates re-forward correctness from force_promote. Default 1.
 _REFORWARD = os.getenv("VLLM_MOE_W2_GATE_REFORWARD", "1") == "1"
+# S4 verify-row masking (VLLM_MOE_W2_GATE_SPEC_MASK=1, default off): on MTP
+# verify steps the row aggregation skips rows the sampler cannot emit — the
+# min-over-ALL-rows firing otherwise pays replays for uncertainty on rows
+# that get DISCARDED after the first rejected draft. Knowledge-ported from
+# the fin-03 gate-signal session (commit 6e4af0052 there): measured on DS4
+# 1x PRO6000, MTP k=2, tau=0.60: re-forwards 24% -> 1.2% on prose
+# (-31% -> -4% tok/s) and 16.9% -> 7.5% on code, quality flat. Their wider
+# study also stands as the verdict AGAINST porting the ML signal machinery:
+# no scalar or fitted combination beat max_prob materially (live labels
+# 10.9% -> 10.3% fire@recall90), so max_prob stays the only signal here.
+_SPEC_MASK = os.getenv("VLLM_MOE_W2_GATE_SPEC_MASK", "0") == "1"
 
 # observability (cheap; only mutated when the gate is enabled)
 _n_steps = 0
@@ -148,7 +159,48 @@ def reforward_enabled() -> bool:
     return _REFORWARD
 
 
-def should_reforward(logits: torch.Tensor) -> bool:
+def _spec_relevant_mask(logits: torch.Tensor, spec) -> torch.Tensor | None:
+    """S4: rows the sampler can actually emit on an MTP verify step — the
+    prefix of would-be-accepted drafts (greedy: draft == argmax of the
+    previous row), the first rejection, and the bonus row only when every
+    draft is accepted. Pure GPU ops (argmax + per-request cumprod over
+    <= k elements), no host syncs; the decision sync below stays the only
+    one. Returns None (no masking) when shapes don't line up — masking is
+    an optimization, never a correctness dependency."""
+    try:
+        n_rows = logits.shape[0]
+        num_draft = spec.num_draft_tokens          # python list per request
+        if sum(num_draft) == 0:
+            return None
+        if n_rows != sum(num_draft) + len(num_draft):
+            return None
+        draft_ids = spec.draft_token_ids
+        am = logits.argmax(dim=-1)
+        mask = torch.zeros(n_rows, dtype=torch.bool, device=logits.device)
+        row = 0
+        dpos = 0
+        for nd in num_draft:
+            if nd == 0:
+                mask[row] = True
+                row += 1
+                continue
+            seg = am[row:row + nd]
+            drafts = draft_ids[dpos:dpos + nd]
+            acc = seg == drafts
+            prefix = torch.cumprod(acc.int(), dim=0).bool()
+            rel = torch.ones(nd, dtype=torch.bool, device=logits.device)
+            if nd > 1:
+                rel[1:] = prefix[:-1]              # row i needs 0..i-1 accepted
+            mask[row:row + nd] = rel
+            mask[row + nd] = prefix[-1]            # bonus row iff all accepted
+            row += nd + 1
+            dpos += nd
+        return mask
+    except Exception:  # noqa: BLE001 - masking is an optimization only
+        return None
+
+
+def should_reforward(logits: torch.Tensor, spec=None) -> bool:
     """Decide whether to re-forward this decode step at FP4.
 
     `logits` is the per-request next-token logits [num_reqs, vocab] from the
@@ -156,6 +208,10 @@ def should_reforward(logits: torch.Tensor) -> bool:
     whole batch shares one CUDA graph, so a re-forward recomputes all rows
     together. Costs ONE GPU->CPU sync (the `.item()` below), incurred only when
     the gate is enabled.
+
+    `spec` is the step's SpecDecodeMetadata (or None): with
+    VLLM_MOE_W2_GATE_SPEC_MASK=1 the min-aggregation skips MTP verify rows
+    the sampler cannot reach (see _SPEC_MASK above).
 
     `margin` and `max_prob` are computed directly from logits without a full
     softmax: margin = top1_logit - top2_logit == log p1 - log p2 (the softmax
@@ -176,10 +232,19 @@ def should_reforward(logits: torch.Tensor) -> bool:
     tau = _current_tau()
     top2 = torch.topk(logits, 2, dim=-1).values  # [R, 2]
     if _SIGNAL == "margin":
-        worst = (top2[:, 0] - top2[:, 1]).min()
+        rows = top2[:, 0] - top2[:, 1]
     else:  # max_prob
         lse = torch.logsumexp(logits, dim=-1)
-        worst = torch.exp(top2[:, 0] - lse).min()
+        rows = torch.exp(top2[:, 0] - lse)
+    mask = None
+    if _SPEC_MASK and spec is not None:
+        mask = _spec_relevant_mask(logits, spec)
+    if mask is not None:
+        # masked rows are pushed to +inf so the min ignores them; an
+        # all-masked batch (cannot happen: row 0 of each request is always
+        # reachable) would fall through to no-fire, which is safe.
+        rows = torch.where(mask, rows, torch.full_like(rows, float("inf")))
+    worst = rows.min()
     fire = bool((worst <= tau).item())
     if fire:
         _n_fired += 1
