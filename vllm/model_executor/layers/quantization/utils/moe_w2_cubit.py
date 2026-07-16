@@ -108,6 +108,17 @@ _PF4_ENV = os.getenv("VLLM_MOE_W2_PREFILL_FP4", "1")
 _PREFILL_FP4 = _PF4_ENV not in ("0", "")
 _PREFILL_FP4_ENSURE = _PF4_ENV == "ensure"
 _pf4_ensure_logged = False
+# Decode/prefill routing threshold: calls with T > this take the prefill
+# path (MC4/AFRAG kernels + prefill-FP4). The default 96 is the LARGEST
+# CUDAGRAPH CAPTURE SIZE of the standing multi-seq configs — a captured
+# decode graph must never cross into the prefill path. Low-concurrency
+# quality configs can lower it (e.g. 16 at max-num-seqs 1, where the
+# biggest decode step is seqs x (1+spec) = 3 tokens) so that SHORT PROMPTS
+# (a 90-token chunk has T <= 96) reach the prefill path and the ensure
+# guarantee instead of the opportunistic decode path. Keep it ABOVE the
+# config's largest captured decode size or captured decode graphs would
+# bake prefill-path behaviour.
+_PREFILL_T = int(os.getenv("VLLM_MOE_W2_PREFILL_T", "96"))
 
 
 def _to_fragment_major(a: torch.Tensor, pairs: int, K: int) -> torch.Tensor:
@@ -1118,6 +1129,19 @@ def _check_resident_fit(layer_key: int, dev, bytes_per_layer: int) -> None:
         kv_floor = max_len * 16 * 1024            # ~15.6 KB/tok measured
         reserve = 2 * 2**30 + (int(1.7 * 2**30) if spec_on else 0) + kv_floor
         budget = free_b - reserve
+        if planes_total > budget and os.getenv(
+                "VLLM_MOE_W2_FORCE_RESIDENT", "0") == "1":
+            # Explicit consent valve (the FORCE_POOL pattern): the reserve
+            # model is deliberately conservative and refuses knife-edge 1x
+            # configs that DO serve (the validated pro6000x1 recipe sits
+            # ~3-4 GiB inside this guard's reserves). Forced boots fall
+            # through to the torch OOM backstop if the guard was right.
+            logger.warning(
+                "moe_w2 RESIDENT planes exceed the estimated budget by "
+                "%.1f GiB but VLLM_MOE_W2_FORCE_RESIDENT=1 - continuing "
+                "on user consent (a real shortfall will OOM at load or "
+                "capture).", (planes_total - budget) / 2**30)
+            return
         if planes_total > budget:
             deficit = (planes_total - budget) / 2**30
             # suggested pool: what actually fits, rounded down to .5 GiB
@@ -1732,10 +1756,13 @@ def _moe_w2_forward_timed(
 
     # decode-sized calls use the proven 4-token kernel + delta tier;
     # prefill-sized calls use the MC4 kernel (16 tokens per pair-entry = full
-    # QMMA-M, plane reads amortized 4x, ~1.5x over MC2) on the 2-bit base only.
-    # 96 = the largest cudagraph capture size: anything above is necessarily a
-    # prefill chunk; short tail chunks keep the delta-quality path.
-    prefill = T > 96
+    # QMMA-M, plane reads amortized 4x, ~1.5x over MC2) plus the prefill-FP4
+    # tier dispatch. Threshold default 96 = the largest cudagraph capture
+    # size of the standing configs: anything above is necessarily a prefill
+    # chunk; short tail chunks keep the decode path. VLLM_MOE_W2_PREFILL_T
+    # lowers it on low-concurrency configs so short prompts reach the
+    # prefill path (and the ensure guarantee) — see _PREFILL_T.
+    prefill = T > _PREFILL_T
     mblock = 16 if prefill else _BLOCK
     sorted_ids, expert_blocks, num_post = moe_align_block_size(
         topk_ids, mblock, st["E"])
