@@ -1708,6 +1708,155 @@ def _desc_build_kernel_base_delta_split(
         tl.store(d + 7, tl.zeros_like(m4), mask=mask)
 
 
+@triton.jit
+def _desc_build_kernel_base_delta_prefill4(
+    eids_ptr, npost_ptr, bslot_ptr, fslot_ptr, miss_ptr, d_ptr,
+    a1b, as1b, c13b, a2b, as2b, c2b,
+    a1b_rm, a2b_rm,
+    bpoolb, bslot_bytes, off_s13, off_c2, off_s2,
+    fpoolb, fslot_bytes, off4_s13, off4_c2, off4_s2,
+    a1_rb, as1_rb, c13_rb, a2_rb, as2_rb, c2_rb,
+    n_experts, pairs, cap6, mblock,
+    BLOCK: tl.constexpr,
+):
+    """PREFILL variant of _desc_build_kernel_base_delta (prefill-FP4 over
+    the base cache): FP4-resident pairs divert to the w4 tier exactly like
+    decode, but as FOUR M<=4 sub-entries per 16-token pair (d[2]/d[3] at
+    index p*4+sub — the same capacity argument as the resident prefill4
+    builder). w2 pair entries read the BASE pool; w4 sub-entries read the
+    FP4 pool sections and the ROW-MAJOR activation bases (AFRAG repack
+    leaves them valid). A live pair resident in NEITHER pool contributes
+    zero and bumps miss_ptr (with ensure_resident on both tiers this is
+    the pool-too-small warning path, not a steady state)."""
+    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = p < pairs
+    e = tl.load(eids_ptr + p, mask=mask, other=0).to(tl.int64)
+    e = tl.minimum(tl.maximum(e, 0), n_experts - 1)
+    bslot = tl.load(bslot_ptr + e, mask=mask, other=-1).to(tl.int64)
+    fslot = tl.load(fslot_ptr + e, mask=mask, other=-1).to(tl.int64)
+    npost = tl.load(npost_ptr).to(tl.int64)
+    live = p < npost // mblock
+    is4 = fslot >= 0
+    bhit = bslot >= 0
+    m2 = tl.where(live & bhit & ~is4, mblock, 0).to(tl.int64)
+    n_miss = tl.sum(tl.where(mask & live & ~bhit & ~is4, 1, 0))
+    tl.atomic_add(miss_ptr, n_miss)
+    base = p.to(tl.int64) * mblock
+    bs = bpoolb + tl.maximum(bslot, 0) * bslot_bytes
+    fs = fpoolb + tl.maximum(fslot, 0) * fslot_bytes
+    # w2 tables (pair granularity, base pool)
+    for gi in tl.static_range(2):
+        d = d_ptr + gi * cap6 + p * 6
+        if gi == 0:
+            b, s, a, as_, c = (bs, bs + off_s13, a1b + base * a1_rb,
+                               as1b + base * as1_rb, c13b + base * c13_rb)
+        else:
+            b, s, a, as_, c = (bs + off_c2, bs + off_s2, a2b + base * a2_rb,
+                               as2b + base * as2_rb, c2b + base * c2_rb)
+        tl.store(d + 0, a, mask=mask)
+        tl.store(d + 1, as_, mask=mask)
+        tl.store(d + 2, b, mask=mask)
+        tl.store(d + 3, s, mask=mask)
+        tl.store(d + 4, c, mask=mask)
+        tl.store(d + 5, m2, mask=mask)
+    # w4 tables (sub-entries, FP4 pool sections)
+    for sub in tl.static_range(4):
+        rbase = base + sub * 4
+        m4 = tl.where(live & is4, 4, 0).to(tl.int64)
+        for gi in tl.static_range(2):
+            d = d_ptr + (2 + gi) * cap6 + (p * 4 + sub) * 6
+            if gi == 0:
+                b, s, a, as_, c = (fs, fs + off4_s13,
+                                   a1b_rm + rbase * a1_rb,
+                                   as1b + rbase * as1_rb,
+                                   c13b + rbase * c13_rb)
+            else:
+                b, s, a, as_, c = (fs + off4_c2, fs + off4_s2,
+                                   a2b_rm + rbase * a2_rb,
+                                   as2b + rbase * as2_rb,
+                                   c2b + rbase * c2_rb)
+            tl.store(d + 0, a, mask=mask)
+            tl.store(d + 1, as_, mask=mask)
+            tl.store(d + 2, b, mask=mask)
+            tl.store(d + 3, s, mask=mask)
+            tl.store(d + 4, c, mask=mask)
+            tl.store(d + 5, m4, mask=mask)
+
+
+@triton.jit
+def _desc_build_kernel_base_delta_split_prefill4(
+    eids_ptr, npost_ptr, bslot_ptr, fslot_ptr, miss_ptr, d_ptr, d4s_ptr,
+    a1b, as1b, c13b, a2b, as2b, c2b,
+    a1b_rm, a2b_rm,
+    bpoolb, bslot_bytes, off_s13, off_c2, off_s2,
+    fpoolb, fslot_bytes, w13r_bytes,
+    a1_rb, as1_rb, c13_rb, a2_rb, as2_rb, c2_rb,
+    n_experts, pairs, cap6, cap8, mblock,
+    BLOCK: tl.constexpr,
+):
+    """PREFILL variant of _desc_build_kernel_base_delta_split: quintal
+    refinement read AGAINST the base slot, so a pair diverts to w4q only
+    when resident in BOTH tables (same coupling as decode); diverted pairs
+    are emitted as FOUR M<=4 w4q sub-entries (d4s at p*4+sub) reading the
+    ROW-MAJOR activation bases. FP4-mapped/base-missing pairs count as
+    misses exactly like decode (the base tier's eviction hard-excludes
+    FP4-mapped experts, and prefill ensure_resident fetches the base first,
+    so this is transient)."""
+    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = p < pairs
+    e = tl.load(eids_ptr + p, mask=mask, other=0).to(tl.int64)
+    e = tl.minimum(tl.maximum(e, 0), n_experts - 1)
+    bslot = tl.load(bslot_ptr + e, mask=mask, other=-1).to(tl.int64)
+    fslot = tl.load(fslot_ptr + e, mask=mask, other=-1).to(tl.int64)
+    npost = tl.load(npost_ptr).to(tl.int64)
+    live = p < npost // mblock
+    bhit = bslot >= 0
+    is4 = (fslot >= 0) & bhit          # split serve needs BOTH resident
+    m2 = tl.where(live & bhit & ~is4, mblock, 0).to(tl.int64)
+    n_miss = tl.sum(tl.where(mask & live & ~bhit, 1, 0))
+    tl.atomic_add(miss_ptr, n_miss)
+    base = p.to(tl.int64) * mblock
+    bs = bpoolb + tl.maximum(bslot, 0) * bslot_bytes
+    fs = fpoolb + tl.maximum(fslot, 0) * fslot_bytes
+    for gi in tl.static_range(2):      # w2 tables (base pool sections)
+        d = d_ptr + gi * cap6 + p * 6
+        if gi == 0:
+            b, s, a, as_, c = (bs, bs + off_s13, a1b + base * a1_rb,
+                               as1b + base * as1_rb, c13b + base * c13_rb)
+        else:
+            b, s, a, as_, c = (bs + off_c2, bs + off_s2, a2b + base * a2_rb,
+                               as2b + base * as2_rb, c2b + base * c2_rb)
+        tl.store(d + 0, a, mask=mask)
+        tl.store(d + 1, as_, mask=mask)
+        tl.store(d + 2, b, mask=mask)
+        tl.store(d + 3, s, mask=mask)
+        tl.store(d + 4, c, mask=mask)
+        tl.store(d + 5, m2, mask=mask)
+    for sub in tl.static_range(4):     # w4s sub-entries (base + refinement)
+        rbase = base + sub * 4
+        m4 = tl.where(live & is4, 4, 0).to(tl.int64)
+        for gi in tl.static_range(2):
+            d = d4s_ptr + gi * cap8 + (p * 4 + sub) * 8
+            if gi == 0:
+                bb, rr, ss, a, as_, c = (
+                    bs, fs, bs + off_s13,
+                    a1b_rm + rbase * a1_rb, as1b + rbase * as1_rb,
+                    c13b + rbase * c13_rb)
+            else:
+                bb, rr, ss, a, as_, c = (
+                    bs + off_c2, fs + w13r_bytes, bs + off_s2,
+                    a2b_rm + rbase * a2_rb, as2b + rbase * as2_rb,
+                    c2b + rbase * c2_rb)
+            tl.store(d + 0, a, mask=mask)
+            tl.store(d + 1, as_, mask=mask)
+            tl.store(d + 2, bb, mask=mask)
+            tl.store(d + 3, rr, mask=mask)
+            tl.store(d + 4, ss, mask=mask)
+            tl.store(d + 5, c, mask=mask)
+            tl.store(d + 6, m4, mask=mask)
+            tl.store(d + 7, tl.zeros_like(m4), mask=mask)
+
+
 def _launch(tier: str, K: int, desc: torch.Tensor, n_rows: int, pairs: int,
             stream):
     fn = _fns[(tier, K)]
@@ -1743,6 +1892,7 @@ def _moe_w2_forward_timed(
     from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
         moe_align_block_size,
     )
+    global _pf4_ensure_logged
 
     st = _LAYERS[layer_key]
     T, H = x.shape
@@ -1802,7 +1952,7 @@ def _moe_w2_forward_timed(
     d = ws["desc"]
     cap = d.shape[1]
     miss_rows = None
-    use_pf4 = False        # prefill-FP4 (resident mode only; see _PREFILL_FP4)
+    use_pf4 = False        # prefill-FP4 (resident AND base modes; _PREFILL_FP4)
     if base_mode:
         # BASE cache: 2-bit planes come from the base tier's GPU pool; a live
         # pair with a non-resident expert contributes zero and bumps the miss
@@ -1813,12 +1963,27 @@ def _moe_w2_forward_timed(
         # decode path: FP4-resident pairs divert to the w4 tier.
         btier = moe_w2_delta._BASE_TIER
         tier = moe_w2_delta._TIER        # FP4 need-pool (None unless opted in)
+        use_pf4 = (_PREFILL_FP4 and prefill and tier is not None
+                   and tier.n_slots > 0)
         if torch.cuda.is_current_stream_capturing():
             btier.notify_capture()
             if tier is not None:
                 tier.notify_capture()
         elif prefill:
             btier.ensure_resident(layer_key, topk_ids.view(-1))
+            if use_pf4 and _PREFILL_FP4_ENSURE:
+                # decode-class guarantee for the FP4 side too: fetch the
+                # chunk's routed set into the need-pool AFTER the base rows
+                # (split w4q reads the refinement AGAINST the base slot, and
+                # the base eviction hard-excludes FP4-mapped experts, so the
+                # base ensure must land first). Layer pins rotate per tier.
+                if not _pf4_ensure_logged:
+                    _pf4_ensure_logged = True
+                    logger.info("moe_w2 prefill-FP4 ensure mode (base "
+                                "cache): eager chunk working sets fetched "
+                                "to both tiers (first call: layer %d, T=%d)",
+                                layer_key, T)
+                tier.ensure_resident(layer_key, topk_ids.view(-1))
         moe_w2_delta.mark_seen(btier.seen[layer_key], topk_ids.view(-1).long())
         if tier is not None:
             # the gate's force_promote reads the FP4 tier's own seen scatter
@@ -1850,7 +2015,44 @@ def _moe_w2_forward_timed(
         slot_row = btier.slot_table[layer_key]
         use_fp4 = tier is not None and not prefill
         use_w4s_base = use_fp4 and moe_w2_delta.split_enabled()
-        if use_w4s_base:
+        if use_pf4 and moe_w2_delta.split_enabled():
+            # prefill-FP4 over the base cache, SPLIT: w2 pair entries from
+            # the base pool + w4q SUB-entries (M<=4) coupling base codes
+            # with the quintal refinement. See the prefill4 builders.
+            fslot_row = tier.slot_table[layer_key]
+            d4s = ws["desc4s"]
+            _desc_build_kernel_base_delta_split_prefill4[
+                    (triton.cdiv(pairs, 256),)](
+                expert_blocks, num_post, slot_row, fslot_row,
+                btier.miss_count, d, d4s,
+                a1_base.data_ptr(), ws["as1"].data_ptr(), ws["c13"].data_ptr(),
+                a2_base.data_ptr(), ws["as2"].data_ptr(), ws["c2"].data_ptr(),
+                ws["a1"].data_ptr(), ws["a2"].data_ptr(),
+                btier.pool.data_ptr(), btier.slot_bytes,
+                st["off_s13"], st["off_c2"], st["off_s2"],
+                tier.pool.data_ptr(), tier.slot_bytes, tier.w13_bytes,
+                st["K13"], (st["K13"] // 32) * 4, 4 * st["K2"], st["K2"],
+                (st["K2"] // 32) * 4, 2 * st["K13"],
+                st["E"], pairs, cap * 6, d4s.shape[1] * 8, mblock, BLOCK=256)
+        elif use_pf4:
+            # prefill-FP4 over the base cache, NON-split: w4 sub-entries
+            # read full-FP4 sections from the need-pool slots.
+            fslot_row = tier.slot_table[layer_key]
+            _desc_build_kernel_base_delta_prefill4[
+                    (triton.cdiv(pairs, 256),)](
+                expert_blocks, num_post, slot_row, fslot_row,
+                btier.miss_count, d,
+                a1_base.data_ptr(), ws["as1"].data_ptr(), ws["c13"].data_ptr(),
+                a2_base.data_ptr(), ws["as2"].data_ptr(), ws["c2"].data_ptr(),
+                ws["a1"].data_ptr(), ws["a2"].data_ptr(),
+                btier.pool.data_ptr(), btier.slot_bytes,
+                st["off_s13"], st["off_c2"], st["off_s2"],
+                tier.pool.data_ptr(), tier.slot_bytes,
+                st["off4_s13"], st["off4_c2"], st["off4_s2"],
+                st["K13"], (st["K13"] // 32) * 4, 4 * st["K2"], st["K2"],
+                (st["K2"] // 32) * 4, 2 * st["K13"],
+                st["E"], pairs, cap * 6, mblock, BLOCK=256)
+        elif use_w4s_base:
             fslot_row = tier.slot_table[layer_key]
             d4s = ws["desc4s"]
             _desc_build_kernel_base_delta_split[(triton.cdiv(pairs, 256),)](
@@ -1898,10 +2100,12 @@ def _moe_w2_forward_timed(
         # FP4-mapped/base-missing pair contributed zero and must replay).
         e_pair = expert_blocks.to(torch.long).clamp_(0, st["E"] - 1)
         resident = (slot_row[e_pair] >= 0)
-        if use_fp4 and not use_w4s_base:
+        if (use_fp4 or use_pf4) and not moe_w2_delta.split_enabled():
+            # non-split: a full-FP4 slot serves the pair without its base
+            # row (decode d[2]/d[3] or the prefill4 sub-entries).
             resident |= (fslot_row[e_pair] >= 0)
         miss_rows = resident.repeat_interleave(mblock)[:slots]
-        if not use_fp4:
+        if not use_fp4 and not use_pf4:
             tier = None      # downstream w4 launches key off `tier`
     else:
         tier = moe_w2_delta._TIER       # peek only; created by the plane builder
@@ -1931,7 +2135,6 @@ def _moe_w2_forward_timed(
                     # decode-class guarantee: fetch the chunk's routed set
                     # into the pool before the desc build reads slot_table
                     # (base-cache prefill idiom; layer pins rotate).
-                    global _pf4_ensure_logged
                     if not _pf4_ensure_logged:
                         _pf4_ensure_logged = True
                         logger.info("moe_w2 prefill-FP4 ensure mode: eager "
