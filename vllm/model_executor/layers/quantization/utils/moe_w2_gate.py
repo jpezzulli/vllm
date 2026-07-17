@@ -264,9 +264,20 @@ def should_reforward(logits: torch.Tensor, spec=None) -> bool:
     return fire
 
 
-def force_promote_step(layers=None) -> int:
+def step_promote_budget():
+    """The per-STEP promotion budget for a fired step (None = unlimited).
+    The runner threads it through the fixed-point loop so GATE_MAX_PROMOTE
+    caps the STEP as documented, not each promote->replay pass."""
+    return _MAX_PROMOTE if _MAX_PROMOTE > 0 else None
+
+
+def force_promote_step(layers=None, max_promote="default") -> int:
     """Pull this step's COLD routed experts up to FP4 via the delta tier.
     Returns the number promoted (0 if the tier is absent / nothing cold).
+
+    `max_promote`: remaining budget for THIS call ("default" = the full
+    GATE_MAX_PROMOTE — legacy per-call semantics for callers outside the
+    runner's FP loop; None = unlimited; 0 short-circuits to no promotion).
 
     MEASUREMENT mode (VLLM_MOE_W2_GATE_CAPTURE=1): instead of promoting, only
     COUNT this low-confidence step's routed experts (tier.mark_need_only) and
@@ -280,7 +291,9 @@ def force_promote_step(layers=None) -> int:
     if _CAPTURE:
         tier.mark_need_only(layers=layers)
         return 0
-    cap = _MAX_PROMOTE if _MAX_PROMOTE > 0 else None
+    cap = step_promote_budget() if max_promote == "default" else max_promote
+    if cap is not None and cap <= 0:
+        return 0
     n = tier.force_promote(layers=layers, max_promote=cap)
     if n > 0:
         _n_reforwarded += 1

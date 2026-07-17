@@ -4769,15 +4769,29 @@ class GPUModelRunner(
                         # mxfp4 ceiling regardless of pool size (above the
                         # fire floor).
                         _gate_iters = 0
+                        _step_budget = moe_w2_gate.step_promote_budget()
                         while _gate_iters < moe_w2_gate.fire_fp_max():
                             # Promote this rank's COLD routed experts
                             # (per-rank shard side effect, never a per-rank
-                            # replay gate).
-                            n_promoted = moe_w2_gate.force_promote_step()
+                            # replay gate). GATE_MAX_PROMOTE is a per-STEP
+                            # budget shared across the FP passes — the
+                            # per-CALL reading multiplied the cap by the
+                            # loop count (measured on a 204-slot pool:
+                            # 64+64+48 promotions in ONE step = the whole
+                            # pool cycled per fire, [pinned 204, free 0]
+                            # refusals, 12% pool hit-rate = pure churn).
+                            n_promoted = moe_w2_gate.force_promote_step(
+                                max_promote=_step_budget)
+                            if _step_budget is not None:
+                                _step_budget = max(
+                                    _step_budget - n_promoted, 0)
                             # Replay only if SOME rank upgraded a cold
                             # expert -> the result can actually change; if
                             # everything routed was already FP4 the replay
-                            # is wasted HBM bandwidth.
+                            # is wasted HBM bandwidth. A refused/exhausted
+                            # promotion pass (n=0 with budget left, or
+                            # budget 0) ends the loop the same way — extra
+                            # replays cannot change the result either.
                             if not (_or_tp(n_promoted > 0)
                                     and moe_w2_gate.reforward_enabled()):
                                 break
