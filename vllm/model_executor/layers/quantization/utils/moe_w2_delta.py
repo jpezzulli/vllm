@@ -944,7 +944,14 @@ class DeltaTier:
             ev = torch.cuda.Event()
             ev.record(self._stream)
         ev.synchronize()           # bytes resident BEFORE mapping
-        self.slot_table[li, ei] = slot
+        # The MANAGER thread runs this: its slot_table write must order
+        # against graph replays on the forward stream. Today that ordering
+        # comes from the thread's current stream being the LEGACY default
+        # stream (device-wide serializing) — make that explicit instead of
+        # accidental (review 2.5: a vLLM move to per-thread streams would
+        # silently break the mapping-after-bytes guarantee).
+        with torch.cuda.stream(torch.cuda.default_stream(self.dev)):
+            self.slot_table[li, ei] = slot
         self._mirror[li, ei] = slot
         self._own(slot, li, ei)
         self._n_promoted += 1
@@ -1886,32 +1893,70 @@ def check_pool_floor(top_k: int, n_spec: int, max_num_seqs: int) -> None:
         fire_floor = int(len(d._store) * top_k * (1 + n_spec)
                          * min(max(max_num_seqs, 1), 4) * fp_growth)
         if d.n_slots < fire_floor:
-            # Graceful degradation (same philosophy as the residency
-            # ladder VRAM->host->NVMe: degrade SPEED, never correctness,
-            # never refuse work that can be done slower): fires switch to
-            # the EAGER LAYER-WISE replay - each MoE layer's routed set is
-            # promoted just-in-time before its GEMMs (ensure_resident,
-            # layer-scoped pins), so the pool only ever needs ONE layer's
-            # union and the fire contract holds in full. Costs: the
-            # replay runs eagerly (no CUDA graph) + per-fire H2D traffic;
-            # second-order misses vanish structurally (each layer sees
-            # its ACTUAL routing), so the FP loop is unnecessary here.
+            # Sub-floor pools serve in DEGRADED mode: a fire can only
+            # PARTIALLY upgrade its step, and the measured-sound operating
+            # point is the INCREMENTAL cap (GATE_MAX_PROMOTE default 64) —
+            # uncapped sub-floor churns the pool wholesale (measured 94.5%
+            # / +110% tokens; GPQA 60.6% vs 70.2% capped, McNemar p=0.002).
+            # The flag below is READ BY NOTHING yet: the eager layer-wise
+            # fire (full contract at any pool size) is a SPEC, not a
+            # feature — see internal/EAGER_FIRE_NEXT_SESSION.md. The
+            # warning must not promise it (review finding 2.4).
             d._sub_floor = True
             logger.warning(
                 "moe_w2 FP4 need-pool is below the FIRE FLOOR: %d slots "
                 "< %d (%d MoE layers x top-%d x (1+%d spec) x %d seqs x "
                 "%.2f FP-growth = ~%.1f GiB). Serving continues in "
                 "DEGRADED mode: gate fires can only PARTIALLY upgrade "
-                "their step (consider an explicit GATE_MAX_PROMOTE cap, "
-                "e.g. 64 — measured best sub-floor operating point). The "
-                "EAGER LAYER-WISE fire path (full contract fidelity at a "
-                "decode cost, keyed off this _sub_floor flag) is speced "
-                "in internal/EAGER_FIRE_NEXT_SESSION.md. For graph-mode "
-                "fires raise VLLM_MOE_W2_DELTA_GB or reduce "
-                "num_speculative_tokens/max_num_seqs.",
+                "their step; promotions stay capped by GATE_MAX_PROMOTE "
+                "(default 64 = the measured-best sub-floor operating "
+                "point; do NOT set 0/unlimited here — measured churn "
+                "regression). tau->1 does NOT converge to native on a "
+                "sub-floor pool. For full graph-mode fires raise "
+                "VLLM_MOE_W2_DELTA_GB or reduce num_speculative_tokens/"
+                "max_num_seqs.",
                 d.n_slots, fire_floor, len(d._store), top_k, n_spec,
                 max_num_seqs, fp_growth,
                 fire_floor * d.slot_bytes / 2**30)
+
+    # ---- config-coherence guards (review finding 2.3): contradictory
+    # env combinations used to fail silently or pay dead per-step costs.
+    from vllm.model_executor.layers.quantization.utils import (
+        moe_w2_cubit, moe_w2_gate)
+    if moe_w2_gate.enabled() and _TIER is None:
+        # gate without a delta tier: the decision (topk + logsumexp +
+        # .item() sync) would run EVERY step and force_promote would
+        # no-op forever — pure hot-path waste. Disable loudly.
+        moe_w2_gate.disable(
+            "VLLM_MOE_W2_GATE=1 but no FP4 delta tier exists "
+            "(VLLM_MOE_W2_DELTA_GB unset/0) — the gate cannot promote "
+            "anything; disabling to avoid a dead per-step sync.")
+    decode_cap = max(max_num_seqs, 1) * (1 + n_spec)
+    if moe_w2_cubit._PREFILL_T < decode_cap:
+        raise ValueError(
+            f"VLLM_MOE_W2_PREFILL_T={moe_w2_cubit._PREFILL_T} is below "
+            f"the largest decode step of this config (max_num_seqs x "
+            f"(1 + num_speculative_tokens) = {decode_cap}): captured "
+            "decode graphs would bake the PREFILL code path (wrong tier "
+            "machinery inside full-graph replays). Raise PREFILL_T to "
+            f">= {decode_cap} (default 96) or shrink the config.")
+    try:
+        from vllm.config import get_current_vllm_config
+        pc = get_current_vllm_config().parallel_config
+        if _BASE_TIER is not None and (
+                getattr(pc, "use_ubatching", False)
+                or getattr(pc, "ubatch_size", 0)):
+            raise ValueError(
+                "BASE cache x micro-batching (ubatch/DBO) is unsupported: "
+                "the in-graph miss counter is zeroed at layer 0 of EVERY "
+                "forward, so the second ubatch erases the first ubatch's "
+                "misses -> the runner skips the restore replay and serves "
+                "ZEROED expert contributions. Disable ubatching or the "
+                "base cache.")
+    except ValueError:
+        raise
+    except Exception:  # noqa: BLE001 - config introspection best-effort
+        pass
 
 
 def gate_armed() -> bool:

@@ -86,7 +86,7 @@ _TAU = float(os.getenv("VLLM_MOE_W2_GATE_TAU", str(_DEFAULT_TAU.get(_SIGNAL, 0.6
 # one step's routed union are refused at boot (the FIRE FLOOR hardstop in
 # moe_w2_delta.check_pool_floor); FORCE_POOL=1 configs run degraded and
 # should set an explicit cap.
-_MAX_PROMOTE = int(os.getenv("VLLM_MOE_W2_GATE_MAX_PROMOTE", "0"))
+_MAX_PROMOTE = int(os.getenv("VLLM_MOE_W2_GATE_MAX_PROMOTE", "64"))
 _FIRE_FP_MAX = max(int(os.getenv("VLLM_MOE_W2_GATE_FP_MAX", "3")), 1)
 
 
@@ -118,6 +118,16 @@ _n_promoted = 0
 
 def enabled() -> bool:
     return _ENABLED
+
+
+def disable(reason: str) -> None:
+    """Turn the gate off at runtime (boot-time config-coherence guard):
+    a gate without a promotable tier pays its per-step decision sync for
+    nothing. Loud by design."""
+    global _ENABLED
+    if _ENABLED:
+        logger.warning("moe_w2 gate DISABLED: %s", reason)
+    _ENABLED = False
 
 
 def signal() -> str:

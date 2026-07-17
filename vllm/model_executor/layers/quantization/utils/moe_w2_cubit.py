@@ -234,7 +234,9 @@ def enabled() -> bool:
     return os.getenv("VLLM_MOE_W2", "0") == "1"
 
 
-@functools.cache
+_cutoff_cache: int | None = None
+
+
 def _layer_cutoff() -> int:
     """Main-stack layer count: layers >= this are the MTP drafter. Taken from
     the model config when available (43 for DS4-Flash, 78 for GLM-5.2, 61 for
@@ -243,19 +245,33 @@ def _layer_cutoff() -> int:
     get_text_config() unwraps composite VLM configs (KimiK25Config keeps
     num_hidden_layers on .text_config; a bare hf_config lookup would raise
     and silently fall back to 43, sending layers 43+ down the stock path);
-    for text-only configs it returns self."""
+    for text-only configs it returns self.
+
+    Manual memoization on SUCCESS ONLY (was @functools.cache): a transient
+    config-not-current exception must not freeze the guessed 43 forever —
+    on a 78-layer GLM that silently sent layers 43+ down the stock path
+    (mixed precision, no log — review finding 2.4). The fallback is now
+    loud and uncached."""
+    global _cutoff_cache
+    if _cutoff_cache is not None:
+        return _cutoff_cache
     v = os.getenv("VLLM_MOE_W2_NUM_LAYERS")
     if v is not None:
-        return int(v)
+        _cutoff_cache = int(v)
+        return _cutoff_cache
     try:
         from vllm.config import get_current_vllm_config
         cfg = get_current_vllm_config().model_config.hf_config
         cfg = cfg.get_text_config()
         n = cfg.num_hidden_layers
         if n:
-            return int(n)
-    except Exception:  # noqa: BLE001
-        pass
+            _cutoff_cache = int(n)
+            return _cutoff_cache
+    except Exception as e:  # noqa: BLE001
+        logger.error(
+            "moe_w2 _layer_cutoff: no current vllm config (%s) — TEMPORARY "
+            "uncached fallback 43 (DS4 layout); set VLLM_MOE_W2_NUM_LAYERS "
+            "explicitly if this repeats past load.", e)
     return 43
 
 
@@ -305,6 +321,16 @@ def _ensure_ready() -> bool:
     try:
         torch.cuda.init()
         torch.zeros(1, device="cuda")
+        # Hand-written SASS = sm_120 ONLY, and the cubins carry no PTX to
+        # JIT elsewhere. Refuse EARLY with a clear message instead of the
+        # late shape-assert at weight load (review finding 2.6): SM121
+        # (GB10/DGX Spark), SM100 and SM90 cannot run these kernels.
+        cap = torch.cuda.get_device_capability()
+        if cap != (12, 0):
+            raise RuntimeError(
+                f"moe_w2 cubins are sm_120-only (hand-written SASS, no "
+                f"PTX); this device reports sm_{cap[0]}{cap[1]}. Unset "
+                "VLLM_MOE_W2 on this hardware.")
         cu = _driver()
         # ONLY `_a32` cubins load (activation format rev: f32 A scales at
         # PER-32-GROUP granularity, folded per k32). The a128 lineage reads
@@ -314,6 +340,11 @@ def _ensure_ready() -> bool:
         # fails loudly in _require_kernels (no old/new mixing possible).
         # The a128-era mc2 prefill experiment is retired (superseded by
         # mc4/AFRAG; never launched by the serving path).
+        # K set: the shipped families cover DS4/GLM/Kimi at TP1-8;
+        # VLLM_MOE_W2_KS extends it WITHOUT a code edit when a new model
+        # brings a new contraction (comma-separated; cubins must exist).
+        ks = tuple(int(x) for x in os.getenv(
+            "VLLM_MOE_W2_KS", "7168,6144,4096,2048,1024,512").split(","))
         for tier, kern in (("w2", b"moe_w2_mm"), ("w4", b"moe_w4_mm"),
                            ("w4q", b"moe_w4q_mm"), ("w2mc4", b"moe_w2_mm")):
             # GEMM contraction K: gate-up needs K=hidden (4096 DS4-Flash,
@@ -321,7 +352,7 @@ def _ensure_ready() -> bool:
             # 1024 @ TP2, 512 @ TP4). Cubins are loaded opportunistically --
             # the plane builders assert the shapes the model actually needs
             # are present (_require_kernels fails loudly at weight load).
-            for k in (7168, 6144, 4096, 2048, 1024, 512):
+            for k in ks:
                 if tier == "w2mc4":
                     fname = f"moe_w2_mm_mc4_k{k}_a32.cubin"
                 else:
@@ -339,7 +370,7 @@ def _ensure_ready() -> bool:
         global _afrag_ok
         if _AFRAG:
             try:
-                for k in (7168, 6144, 4096, 2048, 1024, 512):
+                for k in ks:
                     path = os.path.join(
                         _DIR, f"moe_w2_mm_mc4afrag_k{k}_a32.cubin")
                     if not os.path.exists(path):
@@ -1188,6 +1219,26 @@ def _workspaces(slots: int, tokens: int, dev, inter: int = 2048,
     if (_WS.get("slots", 0) < slots or _WS.get("tokens", 0) < tokens
             or _WS.get("inter") != inter or _WS.get("hidden") != hidden
             or _WS.get("n_experts", 0) < n_experts):
+        # Captured graphs bake these buffer ADDRESSES; a realloc after any
+        # capture would leave every captured replay reading freed memory.
+        # The system invariant is "profile_run maxes the sizes before
+        # capture" — enforce it instead of assuming it (review 2.5): any
+        # growth after the first capture (or during one) is a hard error.
+        if _WS.get("frozen"):
+            raise RuntimeError(
+                f"moe_w2 workspace growth after graph capture: have "
+                f"slots={_WS.get('slots')}, tokens={_WS.get('tokens')}, "
+                f"need slots={slots}, tokens={tokens}. Captured graphs "
+                "hold the old buffers - the profile run must cover the "
+                "largest schedulable batch (check max_num_batched_tokens/"
+                "max_num_seqs vs the profile shapes).")
+        if torch.cuda.is_available() and torch.cuda.is_initialized() \
+                and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "moe_w2 workspace realloc DURING cudagraph capture "
+                f"(slots {_WS.get('slots', 0)}->{slots}, tokens "
+                f"{_WS.get('tokens', 0)}->{tokens}) - the profile run "
+                "must pre-size the workspaces.")
         slots = max(slots, _WS.get("slots", 0))
         tokens = max(tokens, _WS.get("tokens", 0))
         n_experts = max(n_experts, _WS.get("n_experts", 0))
@@ -1803,6 +1854,9 @@ def _moe_w2_forward_timed(
     cap = d.shape[1]
     miss_rows = None
     use_pf4 = False        # prefill-FP4 (resident mode only; see _PREFILL_FP4)
+    if torch.cuda.is_current_stream_capturing():
+        # first capture freezes the workspace sizes (see _workspaces)
+        _WS["frozen"] = True
     if base_mode:
         # BASE cache: 2-bit planes come from the base tier's GPU pool; a live
         # pair with a non-resident expert contributes zero and bumps the miss
