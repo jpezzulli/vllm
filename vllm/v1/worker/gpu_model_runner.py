@@ -4741,7 +4741,8 @@ class GPUModelRunner(
                         and moe_w2_gate.reforward_enabled()
                     )
                 else:
-                    fire = moe_w2_gate.should_reforward(logits)
+                    fire = moe_w2_gate.should_reforward(
+                        logits, spec=spec_decode_metadata)
                     _tp = get_tp_group()
 
                     def _or_tp(flag: bool) -> bool:

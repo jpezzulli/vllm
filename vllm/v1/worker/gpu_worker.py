@@ -383,6 +383,29 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
+            # bf12 (VLLM_MOE_W2_BF12=1): repack the BF16 dense remainder
+            # (attention / shared-expert / dense-MLP linears) into lossless
+            # 12-bit planes and free the BF16 params. Must run after weight
+            # load and before profiling/cudagraph capture — the decode
+            # scratch address is baked into every captured graph.
+            if not load_dummy_weights:
+                try:
+                    from vllm.model_executor.layers.quantization.utils import (
+                        moe_w2_bf12,
+                    )
+
+                    if moe_w2_bf12.enabled():
+                        moe_w2_bf12.convert_model(
+                            self.model_runner.model, self.vllm_config
+                        )
+                        drafter = getattr(self.model_runner, "drafter", None)
+                        if drafter is not None and hasattr(drafter, "model"):
+                            moe_w2_bf12.convert_model(
+                                drafter.model, self.vllm_config
+                            )
+                except Exception as e:  # noqa: BLE001 - never fatal
+                    logger.warning("bf12 conversion skipped: %s", e)
+
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                 self.vllm_config.weight_transfer_config,
