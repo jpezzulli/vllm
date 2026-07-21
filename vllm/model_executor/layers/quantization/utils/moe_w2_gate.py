@@ -264,11 +264,35 @@ def should_reforward(logits: torch.Tensor, spec=None) -> bool:
     return fire
 
 
+# Optional runtime-tunable budget: VLLM_MOE_W2_GATE_MAX_PROMOTE_FILE points
+# at a file whose integer contents override GATE_MAX_PROMOTE (mtime-cached,
+# the TAU_FILE idiom) — a budget sweep runs on ONE warm server.
+_MAX_PROMOTE_FILE = os.getenv("VLLM_MOE_W2_GATE_MAX_PROMOTE_FILE", "")
+_mp_dyn = _MAX_PROMOTE
+_mp_mtime = -1.0
+
+
+def _current_max_promote() -> int:
+    global _mp_dyn, _mp_mtime
+    if not _MAX_PROMOTE_FILE:
+        return _MAX_PROMOTE
+    try:
+        m = os.path.getmtime(_MAX_PROMOTE_FILE)
+        if m != _mp_mtime:
+            _mp_mtime = m
+            with open(_MAX_PROMOTE_FILE) as f:
+                _mp_dyn = int(f.read().strip())
+    except (OSError, ValueError):
+        pass
+    return _mp_dyn
+
+
 def step_promote_budget():
     """The per-STEP promotion budget for a fired step (None = unlimited).
     The runner threads it through the fixed-point loop so GATE_MAX_PROMOTE
     caps the STEP as documented, not each promote->replay pass."""
-    return _MAX_PROMOTE if _MAX_PROMOTE > 0 else None
+    mp = _current_max_promote()
+    return mp if mp > 0 else None
 
 
 def force_promote_step(layers=None, max_promote="default") -> int:
