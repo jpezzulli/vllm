@@ -26,26 +26,33 @@ possible follow-up).
 Sizes (Kimi-K2.7 @ TP4): 2-bit ~70 GiB/rank, FP4 ~126 GiB/rank.
 """
 
+import functools
 import hashlib
 import json
 import os
 import queue
 import re
 import threading
+import time
 
 import numpy as np
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
+    MOE_W2_QUANTIZER_ABI,
+    zero_mode,
+)
 
 logger = init_logger(__name__)
 
-_VERSION = "tsym4-fragmajor-v1"
+_VERSION = 2
 _PARTS_2BIT = ("planes13", "sc13", "planes2", "sc2")
 _PARTS_FP4 = ("fp13", "fp2")
 
 _meta_written = False
 _writer: "queue.Queue[tuple[str, torch.Tensor] | None] | None" = None
+_writer_thread: threading.Thread | None = None
 _broken = False
 
 
@@ -67,16 +74,85 @@ def _tp_ids() -> tuple[int, int]:
         get_tensor_model_parallel_rank()
 
 
+@functools.cache
 def _ckpt_id() -> str:
-    """Identity of the checkpoint the planes derive from: model path +
-    sha1 of the safetensors index (covers shard layout and tensor set)."""
+    """Cheap but content-sensitive checkpoint identity.
+
+    Reading every byte of a 400-600 GiB checkpoint on each boot would erase
+    most of the persistent-cache win.  Instead hash the immutable HF revision
+    when available plus the index and a stable manifest of every referenced
+    shard (resolved blob id, size and nanosecond timestamps).  Normal shard
+    replacement is therefore detected without bulk I/O.  Operators that
+    manage an immutable external snapshot can provide its digest explicitly
+    through VLLM_MOE_W2_CKPT_ID.
+    """
+    override = os.getenv("VLLM_MOE_W2_CKPT_ID", "").strip()
+    if override:
+        return override
     from vllm.config import get_current_vllm_config
-    model = get_current_vllm_config().model_config.model
-    h = hashlib.sha1(model.encode())
-    idx = os.path.join(model, "model.safetensors.index.json")
-    if os.path.exists(idx):
+    model_config = get_current_vllm_config().model_config
+    model = str(model_config.model)
+    resolved_revision = getattr(
+        getattr(model_config, "hf_config", None), "_commit_hash", None)
+    revision = resolved_revision or getattr(model_config, "revision", None)
+    h = hashlib.sha256()
+    h.update(b"moe-w2-checkpoint-stat-v2\0")
+    h.update(model.encode())
+    h.update(b"\0")
+    h.update(str(revision or "").encode())
+    if not os.path.isdir(model):
+        immutable_revision = (
+            isinstance(revision, str)
+            and len(revision) == 40
+            and all(c in "0123456789abcdef" for c in revision.lower())
+        )
+        if not immutable_revision:
+            raise RuntimeError(
+                "moe_w2 persistent cache needs a local checkpoint path, an "
+                "immutable resolved 40-hex model revision, or "
+                "VLLM_MOE_W2_CKPT_ID")
+        return h.hexdigest()
+
+    config_path = os.path.join(model, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path, "rb") as f:
+            h.update(b"config.json\0")
+            h.update(hashlib.sha256(f.read()).digest())
+
+    shards: set[str] = set()
+    for name in ("model.safetensors.index.json",
+                 "pytorch_model.bin.index.json"):
+        idx = os.path.join(model, name)
+        if not os.path.exists(idx):
+            continue
         with open(idx, "rb") as f:
-            h.update(f.read())
+            raw = f.read()
+        h.update(name.encode())
+        h.update(hashlib.sha256(raw).digest())
+        try:
+            weight_map = json.loads(raw).get("weight_map", {})
+            shards.update(str(v) for v in weight_map.values())
+        except (TypeError, ValueError, json.JSONDecodeError) as e:
+            raise RuntimeError(f"invalid checkpoint index {idx}: {e}") from e
+    if not shards:
+        shards.update(
+            name for name in os.listdir(model)
+            if name.endswith((".safetensors", ".bin")))
+    if not shards:
+        raise RuntimeError(
+            f"no checkpoint weight shards found under {model!r}")
+    for rel in sorted(shards):
+        path = os.path.join(model, rel)
+        st = os.stat(path)
+        record = {
+            "name": rel,
+            "resolved_blob": os.path.basename(os.path.realpath(path)),
+            "size": st.st_size,
+            "mtime_ns": st.st_mtime_ns,
+            "ctime_ns": st.st_ctime_ns,
+        }
+        h.update(json.dumps(record, sort_keys=True, separators=(",", ":"))
+                 .encode())
     return h.hexdigest()
 
 
@@ -85,10 +161,11 @@ def _meta() -> dict:
     world, rank = _tp_ids()
     return dict(
         version=_VERSION,
+        quantizer_abi=MOE_W2_QUANTIZER_ABI,
         ckpt_id=_ckpt_id(),
         world=world,
         rank=rank,
-        zero_mode=os.getenv("VLLM_MOE_W2_ZERO_MODE", "auto"),
+        zero_mode=zero_mode(),
         # split-FP4 stores radix-5 quintal planes in fp13/fp2 (5/8 of the
         # nibble bytes) — a cache built in another mode must MISS
         # wholesale. "w4q" also invalidates caches of the superseded
@@ -99,8 +176,11 @@ def _meta() -> dict:
 
 def _rank_dir() -> str:
     world, rank = _tp_ids()
-    return os.path.join(os.environ["VLLM_MOE_W2_PLANES_CACHE"],
-                        f"tp{world}-rank{rank}")
+    meta_key = hashlib.sha256(
+        json.dumps(_meta(), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:20]
+    return os.path.join(os.environ["VLLM_MOE_W2_PLANES_CACHE"], "v2",
+                        meta_key, f"tp{world}-rank{rank}")
 
 
 def expected_sizes(E: int, N13: int, K13: int, N2: int, K2: int,
@@ -154,7 +234,9 @@ def try_load(layer_idx: int,
         if not os.path.exists(mp):
             return None
         if json.load(open(mp)) != _meta():
-            _mark_broken(f"meta mismatch in {d} (stale cache?) — rebuilding")
+            logger.warning(
+                "moe_w2 planes cache: metadata mismatch in %s — treating "
+                "as a normal cache miss", d)
             return None
         out = {}
         for part, nbytes in sizes.items():
@@ -190,8 +272,12 @@ def _writer_loop() -> None:
             return
         path, cpu = item
         try:
-            tmp = path + ".tmp"
-            cpu.numpy().tofile(tmp)
+            tmp = (f"{path}.tmp.{os.getpid()}."
+                   f"{threading.get_ident()}")
+            with open(tmp, "wb") as f:
+                cpu.numpy().tofile(f)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, path)
         except Exception as e:  # noqa: BLE001
             _mark_broken(f"write failed for {path}: {e}")
@@ -200,7 +286,7 @@ def _writer_loop() -> None:
 def store(layer_idx: int, tensors: dict[str, torch.Tensor]) -> None:
     """Queue a built layer's planes for background writing. Never raises;
     tensors may live on GPU (copied to CPU here, synchronously)."""
-    global _meta_written, _writer
+    global _meta_written, _writer, _writer_thread
     if not enabled() or _broken:
         return
     try:
@@ -208,20 +294,21 @@ def store(layer_idx: int, tensors: dict[str, torch.Tensor]) -> None:
         os.makedirs(d, exist_ok=True)
         if not _meta_written:
             mp = os.path.join(d, "meta.json")
-            if os.path.exists(mp) and json.load(open(mp)) != _meta():
-                # stale cache from another checkpoint/config: start over
-                for f in os.listdir(d):
-                    os.unlink(os.path.join(d, f))
-            with open(mp + ".tmp", "w") as f:
+            tmp = f"{mp}.tmp.{os.getpid()}"
+            with open(tmp, "w") as f:
                 json.dump(_meta(), f)
-            os.replace(mp + ".tmp", mp)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, mp)
             _meta_written = True
         if _writer is None:
             # maxsize bounds the transient host copies (~3 GiB at Kimi TP4
             # layer sizes) and back-pressures the build if the disk lags.
             _writer = queue.Queue(maxsize=2)
-            threading.Thread(target=_writer_loop, daemon=True,
-                             name="moe-w2-planes-cache").start()
+            _writer_thread = threading.Thread(
+                target=_writer_loop, daemon=True,
+                name="moe-w2-planes-cache")
+            _writer_thread.start()
         for part, t in tensors.items():
             if t is None:
                 continue
@@ -229,3 +316,33 @@ def store(layer_idx: int, tensors: dict[str, torch.Tensor]) -> None:
             _writer.put((path, t.detach().reshape(-1).cpu()))
     except Exception as e:  # noqa: BLE001
         _mark_broken(f"store failed: {e}")
+
+
+def shutdown() -> None:
+    """Drain the background writer and reset process-global cache state."""
+    global _meta_written, _writer, _writer_thread, _broken
+    writer, thread = _writer, _writer_thread
+    if writer is not None:
+        deadline = time.monotonic() + 60.0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "moe_w2 planes-cache writer queue did not drain "
+                    "within 60 s")
+            try:
+                writer.put(None, timeout=min(1.0, remaining))
+                break
+            except queue.Full:
+                continue
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=max(deadline - time.monotonic(), 0.0)
+                    if writer is not None else 60.0)
+        if thread.is_alive():
+            raise RuntimeError(
+                "moe_w2 planes-cache writer did not stop within 60 s")
+    _writer = None
+    _writer_thread = None
+    _meta_written = False
+    _broken = False
+    _ckpt_id.cache_clear()

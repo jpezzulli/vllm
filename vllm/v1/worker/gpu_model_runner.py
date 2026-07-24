@@ -23,12 +23,16 @@ from tqdm import tqdm
 
 import vllm.envs as envs
 
+from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+
 # VLLM_MOE_W2 confidence gate (opt-in FP4 re-forward for low-confidence decode
 # tokens). Guarded so serving still boots if only part of the moe_w2 stack is
 # deployed; None => no gate, prod path unchanged.
 try:
     from vllm.model_executor.layers.quantization.utils import moe_w2_gate
 except Exception:  # noqa: BLE001
+    if os.getenv("VLLM_MOE_W2_GATE", "0") == "1":
+        raise
     moe_w2_gate = None
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
@@ -241,6 +245,45 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+
+def _moe_w2_promote_consensus(
+    tier,
+    tp_group,
+    local_miss: int,
+    *,
+    pin: bool,
+    where: str,
+) -> None:
+    """Complete local base-cache I/O on every TP rank before replay."""
+    error = None
+    if local_miss > 0:
+        try:
+            tier.force_promote(max_promote=None, pin=pin)
+        except BaseException as e:  # preserve consensus after local I/O fault
+            error = e
+    if tp_group.world_size > 1:
+        ok = torch.tensor(
+            [0 if error is not None else 1],
+            dtype=torch.int32,
+            device=tier.dev,
+        )
+        torch.distributed.all_reduce(
+            ok,
+            op=torch.distributed.ReduceOp.MIN,
+            group=tp_group.device_group,
+        )
+        all_ok = bool(ok.item())
+    else:
+        all_ok = error is None
+    if not all_ok:
+        message = (
+            f"moe_w2 mandatory base-cache promotion failed before {where}; "
+            "refusing to replay or return zero-contribution logits")
+        if error is not None:
+            raise RuntimeError(message) from error
+        raise RuntimeError(message + " (failure occurred on a peer TP rank)")
+
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -4349,6 +4392,13 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        # Manager residency commits are scheduled after the previous step.
+        # Drain them before this forward so slot-table/pool mutation cannot
+        # overlap graph readers.
+        for _w2_tier in (moe_w2_delta._BASE_TIER, moe_w2_delta._TIER):
+            if _w2_tier is not None:
+                _w2_tier.wait_manager_idle()
+
         # moe_w2 draft-affinity PREFETCH (VLLM_MOE_W2_PREFETCH=1): before the
         # forward, fold the PREVIOUS step's in-graph routing log into the
         # token->experts table and prefetch this step's predicted experts on
@@ -4356,10 +4406,9 @@ class GPUModelRunner(
         # step's sampled+draft tokens — the draft signal. Decode-shaped
         # steps only (a prefill chunk would poison the table; prefill
         # prefetches via ensure_resident anyway).
-        if moe_w2_gate is not None and not self.is_pooling_model:
+        if moe_w2_delta._BASE_TIER is not None and not self.is_pooling_model:
             try:
-                from vllm.model_executor.layers.quantization.utils import (
-                    moe_w2_delta as _w2d)
+                _w2d = moe_w2_delta
                 _btier = _w2d._BASE_TIER
                 if (
                     _btier is not None
@@ -4420,13 +4469,12 @@ class GPUModelRunner(
         # MTP verify steps too, same as the inline TP path. PP==1 keeps the
         # post-logits path below (unchanged).
         if (
-            moe_w2_gate is not None
+            moe_w2_delta._BASE_TIER is not None
             and get_pp_group().world_size > 1
             and not self.is_pooling_model
         ):
             try:
-                from vllm.model_executor.layers.quantization.utils import (
-                    moe_w2_delta as _w2d)
+                _w2d = moe_w2_delta
                 _btier = _w2d._BASE_TIER
                 if _btier is not None:
                     # open this step's pin scope: slots touched by any pass
@@ -4442,10 +4490,13 @@ class GPUModelRunner(
                         _max_miss = int(_t.item())
                     else:
                         _max_miss = _miss
-                    if _miss > 0:
-                        _btier.force_promote(
-                            max_promote=None,
-                            pin=_w2d.fp_continue(0, _max_miss))
+                    _moe_w2_promote_consensus(
+                        _btier,
+                        _tp,
+                        _miss,
+                        pin=_w2d.fp_continue(0, _max_miss),
+                        where="PP base segment replay",
+                    )
                     _btier.kpi_step(
                         _max_miss, _max_miss > _w2d.base_miss_tol())
                     # Replay to a FIXED POINT (bounded): the corrected early
@@ -4486,25 +4537,24 @@ class GPUModelRunner(
                             _max_miss = int(_t.item())
                         else:
                             _max_miss = _miss
-                        if _miss > 0:
-                            _btier.force_promote(
-                                max_promote=None,
-                                pin=_w2d.fp_continue(_replays, _max_miss))
+                        _moe_w2_promote_consensus(
+                            _btier,
+                            _tp,
+                            _miss,
+                            pin=_w2d.fp_continue(_replays, _max_miss),
+                            where="PP base fixed-point replay",
+                        )
+                    _w2d.fp_validate_complete(_max_miss)
                     if _replays:
                         _btier.kpi_fp(_replays, _max_miss)
-                    # close the base seen window HERE for PP: non-last
-                    # ranks early-return before the shared end-of-step
-                    # hook (see the step_end call after the gate block).
-                    # The FP4 window is only closed on prefill-shaped
-                    # steps — a decode fire decision arrives later via the
-                    # worker (gate_reforward) and consumes it there.
-                    _btier.step_end()
-                    if (_w2d._TIER is not None
-                            and max_num_scheduled_tokens > 4):
-                        _w2d._TIER.step_end()
-            except Exception as e:  # noqa: BLE001 - never crash serving
-                logger.warning(
-                    "moe_w2 base-cache PP stage replay skipped: %s", e)
+                    # PP lifecycle closes both tiers once in the worker
+                    # barrier after first-pass send and optional gate replay.
+            except Exception as e:
+                logger.exception(
+                    "moe_w2 mandatory PP base-cache replay failed")
+                raise RuntimeError(
+                    "mandatory moe_w2 PP base-cache replay failed; "
+                    "refusing zero-contribution activations") from e
 
         # moe_w2 confidence gate under PP: cache this step's forward context so
         # the worker can drive a FULL second pipeline pass (gate_reforward) when
@@ -4604,18 +4654,17 @@ class GPUModelRunner(
         # counter. Fetch the missing experts synchronously and replay the
         # step's graph ONCE (mandatory for correctness, unlike the optional
         # gate re-forward below). TP-only: all ranks decide via OR-reduce and
-        # replay together (the re-forward is a collective). Fail-safe: on any
-        # error the zero-contribution logits are kept (quality blip, not a
-        # crash).
+        # replay together (the re-forward is a collective). Any restoration
+        # failure is fatal: returning zero-contribution logits is silent model
+        # corruption.
         if (
-            moe_w2_gate is not None    # module family deployed
+            moe_w2_delta._BASE_TIER is not None
             and logits is not None
             and not self.is_pooling_model
             and get_pp_group().world_size == 1
         ):
             try:
-                from vllm.model_executor.layers.quantization.utils import (
-                    moe_w2_delta as _w2d)
+                _w2d = moe_w2_delta
                 _btier = _w2d._BASE_TIER
                 if _btier is not None:
                     # open this step's pin scope: slots touched by any pass
@@ -4638,14 +4687,17 @@ class GPUModelRunner(
                     # lockstep. Tolerated steps keep their logits: <= TOL of
                     # the step's ~top_k*n_layers weighted contributions were
                     # zeroed (bounded approximation, delta/gate class).
-                    if _miss > 0:
-                        # pin only when a replay will actually re-read the
-                        # step (otherwise the fetch serves FUTURE steps and
-                        # pinning it just starves the eviction — see
-                        # force_promote's pin doc)
-                        _btier.force_promote(
-                            max_promote=None,
-                            pin=_w2d.fp_continue(0, _max_miss))
+                    # Pin only when a replay will actually re-read the step
+                    # (otherwise the fetch serves FUTURE steps).  Every TP
+                    # rank participates in the status consensus even when its
+                    # local miss count is zero.
+                    _moe_w2_promote_consensus(
+                        _btier,
+                        _tp,
+                        _miss,
+                        pin=_w2d.fp_continue(0, _max_miss),
+                        where="TP base replay",
+                    )
                     # KPI: per-step replay rate + missing pairs (windowed
                     # INFO line) — the pool-sizing signal.
                     _btier.kpi_step(
@@ -4694,14 +4746,21 @@ class GPUModelRunner(
                             _max_miss = int(_t.item())
                         else:
                             _max_miss = _miss
-                        if _miss > 0:
-                            _btier.force_promote(
-                                max_promote=None,
-                                pin=_w2d.fp_continue(_replays, _max_miss))
+                        _moe_w2_promote_consensus(
+                            _btier,
+                            _tp,
+                            _miss,
+                            pin=_w2d.fp_continue(_replays, _max_miss),
+                            where="TP base fixed-point replay",
+                        )
+                    _w2d.fp_validate_complete(_max_miss)
                     if _replays:
                         _btier.kpi_fp(_replays, _max_miss)
-            except Exception as e:  # noqa: BLE001 - never crash serving
-                logger.warning("moe_w2 base-cache miss replay skipped: %s", e)
+            except Exception as e:
+                logger.exception("moe_w2 mandatory base-cache replay failed")
+                raise RuntimeError(
+                    "mandatory moe_w2 base-cache replay failed; refusing "
+                    "zero-contribution logits") from e
 
         # Confidence-gated FP4 re-forward (VLLM_MOE_W2_GATE=1; default OFF, so
         # the serving path is byte-for-byte unchanged). When this step's 2-bit
@@ -4722,6 +4781,7 @@ class GPUModelRunner(
             and get_pp_group().is_last_rank
             and (spec_decode_metadata is not None or max_num_scheduled_tokens <= 1)
         ):
+            gate_collective_active = False
             try:
                 # The re-forward is a COLLECTIVE (TP: all-reduce per layer; PP:
                 # a full pipeline pass), so all participating ranks must replay
@@ -4735,14 +4795,39 @@ class GPUModelRunner(
                 #     across TP so every rank agrees (logits are replicated
                 #     post lm_head all-gather).
                 if get_pp_group().world_size > 1:
-                    self._gate_fire = (
-                        spec_decode_metadata is None
-                        and moe_w2_gate.should_reforward(logits)
-                        and moe_w2_gate.reforward_enabled()
-                    )
+                    decision_error = None
+                    try:
+                        local_fire = (
+                            spec_decode_metadata is None
+                            and moe_w2_gate.should_reforward(logits)
+                            and moe_w2_gate.reforward_enabled()
+                        )
+                    except BaseException as e:
+                        decision_error = e
+                        local_fire = False
+                    _tp = get_tp_group()
+                    ok = torch.tensor(
+                        [0 if decision_error is not None else 1],
+                        dtype=torch.int32, device=logits.device)
+                    fire_t = torch.tensor(
+                        [1 if local_fire else 0],
+                        dtype=torch.int32, device=logits.device)
+                    if _tp.world_size > 1:
+                        torch.distributed.all_reduce(
+                            ok, op=torch.distributed.ReduceOp.MIN,
+                            group=_tp.device_group)
+                        torch.distributed.all_reduce(
+                            fire_t, op=torch.distributed.ReduceOp.MAX,
+                            group=_tp.device_group)
+                    if not bool(ok.item()):
+                        logger.error(
+                            "moe_w2 PP gate decision failed on at least one "
+                            "TP rank; skipping optional re-forward%s",
+                            f": {decision_error}" if decision_error else "")
+                        self._gate_fire = False
+                    else:
+                        self._gate_fire = bool(fire_t.item())
                 else:
-                    fire = moe_w2_gate.should_reforward(
-                        logits, spec=spec_decode_metadata)
                     _tp = get_tp_group()
 
                     def _or_tp(flag: bool) -> bool:
@@ -4754,6 +4839,29 @@ class GPUModelRunner(
                             group=_tp.device_group)
                         return bool(t.item())
 
+                    def _and_tp(flag: bool) -> bool:
+                        if _tp.world_size <= 1:
+                            return flag
+                        t = torch.tensor(
+                            [1 if flag else 0], device=logits.device)
+                        torch.distributed.all_reduce(
+                            t, op=torch.distributed.ReduceOp.MIN,
+                            group=_tp.device_group)
+                        return bool(t.item())
+
+                    decision_error = None
+                    try:
+                        fire = moe_w2_gate.should_reforward(
+                            logits, spec=spec_decode_metadata)
+                    except BaseException as e:
+                        decision_error = e
+                        fire = False
+                    if not _and_tp(decision_error is None):
+                        logger.error(
+                            "moe_w2 TP gate decision failed on at least one "
+                            "rank; skipping optional re-forward%s",
+                            f": {decision_error}" if decision_error else "")
+                        fire = False
                     fire = _or_tp(fire)
                     if fire:
                         # FIXED-POINT fire (2026-07-13): a single replay is
@@ -4780,8 +4888,21 @@ class GPUModelRunner(
                             # 64+64+48 promotions in ONE step = the whole
                             # pool cycled per fire, [pinned 204, free 0]
                             # refusals, 12% pool hit-rate = pure churn).
-                            n_promoted = moe_w2_gate.force_promote_step(
-                                max_promote=_step_budget)
+                            promote_error = None
+                            try:
+                                n_promoted = moe_w2_gate.force_promote_step(
+                                    max_promote=_step_budget)
+                            except BaseException as e:
+                                promote_error = e
+                                n_promoted = 0
+                            if not _and_tp(promote_error is None):
+                                logger.error(
+                                    "moe_w2 TP gate promotion failed on at "
+                                    "least one rank; skipping optional "
+                                    "re-forward%s",
+                                    f": {promote_error}"
+                                    if promote_error else "")
+                                break
                             if _step_budget is not None:
                                 _step_budget = max(
                                     _step_budget - n_promoted, 0)
@@ -4796,6 +4917,7 @@ class GPUModelRunner(
                                     and moe_w2_gate.reforward_enabled()):
                                 break
                             _gate_iters += 1
+                            gate_collective_active = True
                             with set_forward_context(
                                 attn_metadata,
                                 self.vllm_config,
@@ -4820,8 +4942,16 @@ class GPUModelRunner(
                                 hidden_states = regated_output
                             sample_hidden_states = hidden_states[logits_indices]
                             logits = self.model.compute_logits(sample_hidden_states)
-            except Exception as e:  # noqa: BLE001 - gate must never crash serving
-                logger.warning("moe_w2 confidence gate re-forward skipped: %s", e)
+                            gate_collective_active = False
+            except Exception as e:
+                if gate_collective_active:
+                    logger.exception(
+                        "moe_w2 confidence gate failed during TP replay")
+                    raise RuntimeError(
+                        "moe_w2 TP gate replay failed after collective "
+                        "entry; worker must terminate") from e
+                logger.warning(
+                    "moe_w2 confidence gate preflight skipped: %s", e)
 
         # moe_w2: the step is fully executed (base replays + gate replay
         # done) — close both tiers' SEEN windows so the eviction exclusion
@@ -4830,10 +4960,12 @@ class GPUModelRunner(
         # pinned the whole pool at the next decode step (measured: [pool
         # 2123, pinned 2123], hundreds of unpromotable experts, corrupted
         # first decode tokens).
-        if moe_w2_gate is not None and not self.is_pooling_model:
+        if ((moe_w2_delta._BASE_TIER is not None
+             or moe_w2_delta._TIER is not None)
+                and not self.is_pooling_model
+                and get_pp_group().world_size == 1):
             try:
-                from vllm.model_executor.layers.quantization.utils import (
-                    moe_w2_delta as _w2d_end)
+                _w2d_end = moe_w2_delta
                 if _w2d_end._BASE_TIER is not None:
                     _w2d_end._BASE_TIER.step_end()
                 # under PP a pending gate fire consumes the FP4 window in
@@ -4896,9 +5028,8 @@ class GPUModelRunner(
             return
         _trace = os.getenv("VLLM_MOE_W2_GATE_TRACE", "0") == "1"
         try:
-            # Promote THIS stage's routed cold experts to FP4 (rank-local, no
-            # collective) so this stage's replay runs at FP4.
-            moe_w2_gate.force_promote_step()
+            # The worker completed a TP+PP promotion preflight before any
+            # stage enters this second pipeline pass.
             intermediate = ctx["intermediate_tensors"]
             if not pp.is_first_rank:
                 recv = pp.recv_tensor_dict(all_gather_group=tp)
@@ -4952,8 +5083,11 @@ class GPUModelRunner(
                 if _trace:
                     logger.info("[gate-pp] rank=%d (last) replayed -> FP4 logits",
                                 pp.rank_in_group)
-        except Exception as e:  # noqa: BLE001 - gate must never crash serving
-            logger.warning("moe_w2 PP gate re-forward skipped: %s", e)
+        except Exception as e:
+            logger.exception("moe_w2 PP gate re-forward failed mid-pipeline")
+            raise RuntimeError(
+                "moe_w2 PP gate replay failed after collective pipeline "
+                "entry; worker must terminate to avoid rank divergence") from e
 
     def _input_fits_in_drafter(
         self, common_attn_metadata: CommonAttentionMetadata | None
@@ -5473,10 +5607,9 @@ class GPUModelRunner(
         # (colibri's measured cold-cache MTP regression). The drafter still
         # ran (cheap); only scheduling is suppressed, and it resumes
         # automatically via the tier's hysteresis latch.
-        if moe_w2_gate is not None:
+        if moe_w2_delta._BASE_TIER is not None:
             try:
-                from vllm.model_executor.layers.quantization.utils import (
-                    moe_w2_delta as _w2d)
+                _w2d = moe_w2_delta
                 if _w2d.spec_suppressed():
                     return None
             except Exception:  # noqa: BLE001 - guard must never crash
@@ -5968,12 +6101,11 @@ class GPUModelRunner(
                 # the in-graph prediction buffers. Must run after weight
                 # load (gates materialized, _LAYERS populated) and before
                 # any cudagraph capture. No-op unless armed via env.
-                if moe_w2_gate is not None:
+                if moe_w2_delta._BASE_TIER is not None:
                     try:
                         from vllm.model_executor.layers.quantization.utils \
-                            import moe_w2_delta as _w2d
-                        from vllm.model_executor.layers.quantization.utils \
                             import moe_w2_looka as _w2l
+                        _w2d = moe_w2_delta
                         if _w2d._BASE_TIER is not None:
                             _w2l.arm(self.model,
                                      _w2d._BASE_TIER.n_layers,
@@ -6035,10 +6167,10 @@ class GPUModelRunner(
         # plane builder has registered every MoE layer by end-of-load and
         # the spec/scheduler configs are final. VLLM_MOE_W2_FORCE_POOL=1
         # downgrades the failure to a warning.
-        if moe_w2_gate is not None and not load_dummy_weights:
+        if (moe_w2_delta._BASE_TIER is not None
+                or moe_w2_delta._TIER is not None) and not load_dummy_weights:
             try:
-                from vllm.model_executor.layers.quantization.utils import (
-                    moe_w2_delta as _w2d_floor)
+                _w2d_floor = moe_w2_delta
                 if _w2d_floor._BASE_TIER is not None or _w2d_floor._TIER is not None:
                     _n_spec = 0
                     if self.speculative_config is not None:

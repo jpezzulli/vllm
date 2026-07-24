@@ -54,7 +54,19 @@ def has_flashinfer() -> bool:
         return False
     # When not using flashinfer cubin,
     # Also check if nvcc is available since it's required to JIT compile flashinfer
-    if not has_flashinfer_cubin() and shutil.which("nvcc") is None:
+    cuda_home = os.getenv("CUDA_HOME") or os.getenv("CUDA_PATH")
+    if not cuda_home:
+        try:
+            from torch.utils.cpp_extension import CUDA_HOME as torch_cuda_home
+            cuda_home = torch_cuda_home
+        except Exception:
+            cuda_home = None
+    nvcc = shutil.which("nvcc")
+    if nvcc is None and cuda_home:
+        candidate = os.path.join(cuda_home, "bin", "nvcc")
+        nvcc = (candidate if os.path.isfile(candidate)
+                and os.access(candidate, os.X_OK) else None)
+    if not has_flashinfer_cubin() and nvcc is None:
         logger.debug_once(
             "FlashInfer unavailable since nvcc was not found "
             "and not using pre-downloaded cubins"

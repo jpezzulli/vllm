@@ -828,7 +828,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     @property
     def supports_eplb(self) -> bool:
-        return True
+        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
+        return not moe_w2_cubit.enabled()
 
     def apply_monolithic(
         self,
@@ -871,8 +872,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if w2_key is not None:
             from vllm.model_executor.layers.quantization.utils import (
                 moe_w2_cubit)
-            assert layer.expert_map is None and \
-                not layer.apply_router_weight_on_input
+            if (layer.expert_map is not None
+                    or layer.apply_router_weight_on_input):
+                raise RuntimeError(
+                    "VLLM_MOE_W2 does not support expert maps/EPLB or "
+                    "router-weight-on-input")
             return moe_w2_cubit.moe_w2_forward(x, topk_weights, topk_ids,
                                                w2_key)
 

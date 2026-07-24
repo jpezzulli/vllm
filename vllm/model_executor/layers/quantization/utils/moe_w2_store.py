@@ -41,6 +41,9 @@ so the shared pinned stage buffer / arena bookkeeping need no lock of
 their own.
 """
 
+import contextlib
+import fcntl
+import hashlib
 import json
 import os
 import time
@@ -54,7 +57,18 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _ALIGN = 4096
-_PACK_VERSION = 1
+_PACK_VERSION = 2
+_PACK_CHECK_FIELDS = (
+    "version",
+    "tag",
+    "E",
+    "n_layers",
+    "slot_bytes",
+    "stride",
+    "ckpt_id",
+    "zero_mode",
+    "quantizer_abi",
+)
 
 
 def _ckpt_id():
@@ -77,6 +91,18 @@ def _ckpt_id():
         return None
 
 
+def _identity_fields() -> dict:
+    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
+        MOE_W2_QUANTIZER_ABI,
+        zero_mode,
+    )
+    return {
+        "ckpt_id": _ckpt_id(),
+        "zero_mode": zero_mode(),
+        "quantizer_abi": MOE_W2_QUANTIZER_ABI,
+    }
+
+
 def _rank_suffix() -> str:
     """Pack-file name suffix identifying this rank's shard. TP rank always;
     PP rank appended only under pipeline parallelism (PP ranks host disjoint
@@ -97,6 +123,100 @@ def _rank_suffix() -> str:
     if pp_world > 1:
         s += f".pp{pp_rank}of{pp_world}"
     return s
+
+
+def _pack_paths(dir_: str, tag: str, n_layers: int, n_experts: int,
+                slot_bytes: int, stride: int) -> tuple[str, str, str, dict]:
+    """Identity-keyed v2 paths.
+
+    Different checkpoints or quantizer ABIs must never replace a pack that a
+    running process may still have open.  An unresolved checkpoint identity
+    gets a process-local namespace and is therefore never reused across boots.
+    """
+    identity = _identity_fields()
+    key_identity = {
+        **identity,
+        "tag": tag,
+        "n_layers": n_layers,
+        "E": n_experts,
+        "slot_bytes": slot_bytes,
+        "stride": stride,
+    }
+    if key_identity["ckpt_id"] is None:
+        key_identity["ckpt_id"] = f"unverified-process-{os.getpid()}"
+    key = hashlib.sha256(
+        json.dumps(key_identity, sort_keys=True, separators=(",", ":"))
+        .encode()).hexdigest()[:20]
+    base = f"{tag}.v2.{key}.{_rank_suffix()}"
+    return (
+        os.path.join(dir_, base + ".pack"),
+        os.path.join(dir_, base + ".json"),
+        os.path.join(dir_, base + ".lock"),
+        identity,
+    )
+
+
+def _pack_meta(tag: str, n_layers: int, n_experts: int, slot_bytes: int,
+               stride: int, identity: dict) -> dict:
+    return {
+        "version": _PACK_VERSION,
+        "tag": tag,
+        "E": n_experts,
+        "n_layers": n_layers,
+        "slot_bytes": slot_bytes,
+        "stride": stride,
+        **identity,
+        "layers": [],
+    }
+
+
+def _valid_layers(meta: dict, n_layers: int) -> list[int] | None:
+    try:
+        layers = [int(li) for li in meta.get("layers", [])]
+    except (TypeError, ValueError):
+        return None
+    if len(layers) != len(set(layers)):
+        return None
+    if any(li < 0 or li >= n_layers for li in layers):
+        return None
+    return sorted(layers)
+
+
+def _meta_matches(meta: dict, expected: dict) -> bool:
+    return all(meta.get(k) == expected.get(k) for k in _PACK_CHECK_FIELDS)
+
+
+def _fsync_dir(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_json(path: str, value: dict) -> None:
+    tmp = f"{path}.tmp.{os.getpid()}.{time.time_ns()}"
+    try:
+        with open(tmp, "x") as f:
+            json.dump(value, f, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(os.path.dirname(path))
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+@contextlib.contextmanager
+def _exclusive_lock(fd: int):
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 class PinnedHostStore:
@@ -148,56 +268,76 @@ class MmapPackStore:
 
     def __init__(self, dir_: str, tag: str, n_layers: int, n_experts: int,
                  slot_bytes: int):
+        self.tag = tag
         self.slot_bytes = slot_bytes
         self.E = n_experts
         self.n_layers = n_layers
         self.stride = (slot_bytes + _ALIGN - 1) // _ALIGN * _ALIGN
         os.makedirs(dir_, exist_ok=True)
-        base = f"{tag}.{_rank_suffix()}"
-        self.path = os.path.join(dir_, base + ".pack")
-        self._sidecar_path = os.path.join(dir_, base + ".json")
-        self._meta = dict(version=_PACK_VERSION, tag=tag, E=n_experts,
-                          n_layers=n_layers, slot_bytes=slot_bytes,
-                          stride=self.stride, ckpt_id=_ckpt_id(), layers=[])
-        # Identity + geometry gate for the persistent-quant-cache property.
-        # ckpt_id (checkpoint path + safetensors-index sha1, the planes
-        # cache's convention) is what actually ties the raw rows to A MODEL
-        # — geometry alone cannot (two checkpoints with equal expert dims
-        # sharing a STORE_DIR would silently swap weights). n_layers guards
-        # the row addressing ((layer*E + e)*stride: a different layer count
-        # re-maps every offset). A sidecar WITHOUT ckpt_id (pre-fix packs)
-        # is treated as stale — one rebuild re-stamps it; operators can
-        # instead pre-stamp known-good packs (tools/stamp_pack_identity.py).
-        _CHECK = ("version", "E", "n_layers", "slot_bytes", "stride",
-                  "ckpt_id")
-        if os.path.exists(self._sidecar_path):
+        (self.path, self._sidecar_path, self._lock_path,
+         identity) = _pack_paths(
+             dir_, tag, n_layers, n_experts, slot_bytes, self.stride)
+        self._meta = _pack_meta(
+            tag, n_layers, n_experts, slot_bytes, self.stride, identity)
+        self._size = self.n_layers * self.E * self.stride
+        self._lock_fd = os.open(
+            self._lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        with _exclusive_lock(self._lock_fd):
+            old = None
             try:
                 with open(self._sidecar_path) as f:
                     old = json.load(f)
-                match = all(old.get(k) == self._meta[k] for k in _CHECK)
-                if match:
-                    self._meta["layers"] = sorted(
-                        int(li) for li in old.get("layers", []))
-                else:
-                    logger.warning(
-                        "moe_w2 store: pack %s identity/shape mismatch "
-                        "(have %s, want %s) — rebuilding", self.path,
-                        {k: old.get(k) for k in _CHECK},
-                        {k: self._meta[k] for k in _CHECK})
+            except FileNotFoundError:
+                pass
             except (OSError, ValueError, json.JSONDecodeError) as e:
-                logger.warning("moe_w2 store: unreadable sidecar %s (%s) — "
-                               "rebuilding", self._sidecar_path, e)
+                logger.warning(
+                    "moe_w2 store: unreadable sidecar %s (%s) — rebuilding",
+                    self._sidecar_path, e)
+            layers = _valid_layers(old, n_layers) if isinstance(old, dict) \
+                else None
+            valid_file = (
+                os.path.isfile(self.path)
+                and os.path.getsize(self.path) == self._size
+            )
+            valid = (
+                self._meta["ckpt_id"] is not None
+                and isinstance(old, dict)
+                and _meta_matches(old, self._meta)
+                and layers is not None
+                and valid_file
+            )
+            if valid:
+                self._meta["layers"] = layers
+            else:
+                if old is not None or os.path.exists(self.path):
+                    logger.warning(
+                        "moe_w2 store: incomplete/stale pack generation %s "
+                        "— rebuilding without trusting cached layers",
+                        self.path)
+                tmp = (f"{self.path}.tmp.{os.getpid()}."
+                       f"{time.time_ns()}")
+                tfd = os.open(
+                    tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+                try:
+                    os.ftruncate(tfd, self._size)
+                    os.fsync(tfd)
+                finally:
+                    os.close(tfd)
+                os.replace(tmp, self.path)
+                _fsync_dir(dir_)
+                self._meta["layers"] = []
+                _atomic_write_json(self._sidecar_path, self._meta)
+            self._fd = os.open(self.path, os.O_RDWR)
+            if os.fstat(self._fd).st_size != self._size:
+                os.close(self._fd)
+                raise RuntimeError(
+                    f"moe_w2 pack changed size while opening {self.path}")
         self._present = set(self._meta["layers"])
-        size = self.n_layers * self.E * self.stride
-        flags = os.O_RDWR | os.O_CREAT
-        self._fd = os.open(self.path, flags, 0o644)
-        if os.fstat(self._fd).st_size < size:
-            os.ftruncate(self._fd, size)   # sparse until layers are written
         # reusable pinned stage for reads (grown on demand; callers hold the
         # tier lock, and the tier syncs its H2D copies before the next call,
         # so reuse is safe).
         self._stage = torch.empty(0, slot_bytes, dtype=torch.uint8,
-                                  pin_memory=True)
+                                  pin_memory=torch.cuda.is_available())
         # write-side staging reused across layers (pageable [E, stride])
         self._wbuf: torch.Tensor | None = None
         self._pool = ThreadPoolExecutor(
@@ -221,30 +361,69 @@ class MmapPackStore:
         return len(self._present)
 
     def add_layer(self, layer_key: int, parts) -> None:
+        if not 0 <= int(layer_key) < self.n_layers:
+            raise ValueError(
+                f"moe_w2 store layer {layer_key} outside "
+                f"[0,{self.n_layers})")
         if layer_key in self._present:
             return          # already packed on a previous boot
         E = parts[0].shape[0]
-        assert E == self.E, (E, self.E)
+        if E != self.E:
+            raise ValueError(
+                f"moe_w2 store expected {self.E} experts, got {E}")
         if self._wbuf is None:
             self._wbuf = torch.zeros(self.E, self.stride, dtype=torch.uint8)
         off = 0
         for t in parts:
             self._wbuf[:, off:off + t.shape[1]].copy_(t, non_blocking=False)
             off += t.shape[1]
-        assert off == self.slot_bytes, (off, self.slot_bytes)
+        if off != self.slot_bytes:
+            raise ValueError(
+                f"moe_w2 store parts total {off} bytes, expected "
+                f"{self.slot_bytes}")
         mv = memoryview(self._wbuf.numpy()).cast("B")
         base_off = layer_key * self.E * self.stride
-        written = 0
-        while written < len(mv):        # pwrite may be partial (>2 GiB rows)
-            written += os.pwrite(self._fd, mv[written:written + (1 << 30)],
-                                 base_off + written)
-        os.fdatasync(self._fd)
-        self._present.add(layer_key)
-        self._meta["layers"] = sorted(self._present)
-        tmp = self._sidecar_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(self._meta, f)
-        os.replace(tmp, self._sidecar_path)
+        with _exclusive_lock(self._lock_fd):
+            try:
+                with open(self._sidecar_path) as f:
+                    disk_meta = json.load(f)
+            except (OSError, ValueError, json.JSONDecodeError) as e:
+                raise RuntimeError(
+                    f"moe_w2 pack manifest unavailable during write: {e}"
+                ) from e
+            disk_layers = _valid_layers(disk_meta, self.n_layers)
+            if (not _meta_matches(disk_meta, self._meta)
+                    or disk_layers is None
+                    or not os.path.isfile(self.path)
+                    or os.path.getsize(self.path) != self._size):
+                raise RuntimeError(
+                    "moe_w2 pack generation changed or became invalid "
+                    f"while writing {self.path}")
+            if layer_key in disk_layers:
+                self._present = set(disk_layers)
+                return
+            # A concurrently starting writer may have atomically replaced a
+            # generation before this process opened it.  Never write through
+            # a stale inode.
+            if os.fstat(self._fd).st_ino != os.stat(self.path).st_ino:
+                os.close(self._fd)
+                self._fd = os.open(self.path, os.O_RDWR)
+            written = 0
+            while written < len(mv):    # pwrite may be partial (>2 GiB rows)
+                n = os.pwrite(
+                    self._fd, mv[written:written + (1 << 30)],
+                    base_off + written)
+                if n <= 0:
+                    raise IOError(
+                        f"moe_w2 pack write made no progress @ "
+                        f"{base_off + written} ({self.path})")
+                written += n
+            os.fdatasync(self._fd)
+            disk_layers.append(layer_key)
+            disk_meta["layers"] = sorted(set(disk_layers))
+            _atomic_write_json(self._sidecar_path, disk_meta)
+            self._meta = disk_meta
+            self._present = set(disk_meta["layers"])
         if len(self._present) == self.n_layers:
             self._wbuf = None       # all layers packed; drop write staging
 
@@ -267,7 +446,7 @@ class MmapPackStore:
         if self._stage.shape[0] < n:
             self._stage = torch.empty(max(n, 2 * self._stage.shape[0]),
                                       self.slot_bytes, dtype=torch.uint8,
-                                      pin_memory=True)
+                                      pin_memory=torch.cuda.is_available())
         t0 = time.perf_counter()
         offs = [(li * self.E + ei) * self.stride for li, ei in pairs]
         for off in offs:
@@ -293,7 +472,19 @@ class MmapPackStore:
         # cold NVMe reads into parallel work (single-threaded memcpy at
         # ~6 GB/s made a 400 MB replay fetch cost ~70 ms — measured).
         if n > 2:
-            list(self._pool.map(_read_one, enumerate(offs)))
+            futures = [
+                self._pool.submit(_read_one, pair)
+                for pair in enumerate(offs)
+            ]
+            first_error = None
+            for future in futures:
+                try:
+                    future.result()
+                except BaseException as e:
+                    if first_error is None:
+                        first_error = e
+            if first_error is not None:
+                raise first_error
         else:
             for pair in enumerate(offs):
                 _read_one(pair)
@@ -303,9 +494,13 @@ class MmapPackStore:
         return [self._stage[i] for i in range(n)]
 
     def release(self) -> None:
-        self._pool.shutdown(wait=False)
+        self._pool.shutdown(wait=True, cancel_futures=True)
         try:
             os.close(self._fd)
+        except OSError:
+            pass
+        try:
+            os.close(self._lock_fd)
         except OSError:
             pass
         self._present = set()
@@ -418,6 +613,26 @@ class TieredPackStore(MmapPackStore):
                               f"({self.path})")
             done += got
 
+    def _read_many(self, fills: list[tuple[int, int]]) -> None:
+        """Read all rows and never return while a failed sibling still writes."""
+        if len(fills) <= 2:
+            for slot, off in fills:
+                self._read_row(slot, off)
+            return
+        futures = [
+            self._pool.submit(self._read_row, slot, off)
+            for slot, off in fills
+        ]
+        first_error = None
+        for future in futures:
+            try:
+                future.result()
+            except BaseException as e:
+                if first_error is None:
+                    first_error = e
+        if first_error is not None:
+            raise first_error
+
     def _evict_order(self, busy: set) -> list:
         """Slot ids coldest-first, skipping the current batch's slots."""
         order = sorted(range(self.n_arena), key=self._last.__getitem__)
@@ -453,7 +668,7 @@ class TieredPackStore(MmapPackStore):
         try:
             fills = [(i, (li * self.E + ei) * self.stride)
                      for i, (li, ei) in enumerate(keys)]
-            list(self._pool.map(lambda p: self._read_row(p[0], p[1]), fills))
+            self._read_many(fills)
             for i, k in enumerate(keys):
                 self._pos[k] = i
                 self._owner_pair[i] = k
@@ -501,11 +716,21 @@ class TieredPackStore(MmapPackStore):
         evict_order = None
         ev_i = 0
         overflow: list[int] = []
-        placed: list[tuple[int, int, int]] = []   # (idx, slot, offset)
+        # New keys stay call-local until every read succeeds.  Publishing
+        # _pos before I/O made a failed read look like a later arena hit on
+        # stale/partially overwritten bytes.
+        placed: list[tuple[int, int, int, tuple[int, int]]] = []
+        pending: dict[tuple[int, int], int] = {}
         for i in miss_idx:
             li, ei = pairs[i]
-            s = self._pos.get((li, ei))
+            pair = (li, ei)
+            s = self._pos.get(pair)
             if s is not None:          # duplicate earlier in this batch
+                out[i] = s
+                busy.add(s)
+                continue
+            s = pending.get(pair)
+            if s is not None:
                 out[i] = s
                 busy.add(s)
                 continue
@@ -528,42 +753,55 @@ class TieredPackStore(MmapPackStore):
                 old = self._owner_pair[slot]
                 if old is not None:
                     del self._pos[old]
-            self._pos[(li, ei)] = slot
-            self._owner_pair[slot] = (li, ei)
+            # The old key is invalid once its bytes may be overwritten.  The
+            # new key remains unpublished until the read transaction commits.
+            self._owner_pair[slot] = None
             self._last[slot] = self._clock
             busy.add(slot)
             out[i] = slot
-            placed.append((i, slot, (li * self.E + ei) * self.stride))
+            pending[pair] = slot
+            placed.append(
+                (i, slot, (li * self.E + ei) * self.stride, pair))
         # pass 3: parallel fills (the link saturates at low QD for
         # multi-MiB rows; the pool mainly overlaps syscall latency and,
         # in buffered mode, parallelizes page-cache memcpys)
-        if placed:
-            if not self.direct:
-                for _, _, off in placed:
-                    try:
-                        os.posix_fadvise(self._fd, off, self.slot_bytes,
-                                         os.POSIX_FADV_WILLNEED)
-                    except OSError:
-                        break       # advisory only
-            if len(placed) > 2:
-                list(self._pool.map(
-                    lambda p: self._read_row(p[1], p[2]), placed))
-            else:
-                for p in placed:
-                    self._read_row(p[1], p[2])
-        # overflow rows (scan discipline, or arena smaller than one batch):
-        # parent's buffered stage
         stage_rows: dict[int, torch.Tensor] = {}
-        if overflow:
-            if not scan:
-                logger.warning(
-                    "moe_w2 tiered store: batch of %d rows exceeds the "
-                    "arena (%d slots) — %d rows served via buffered stage; "
-                    "raise VLLM_MOE_W2_BASE_RAM_GB", n, self.n_arena,
-                    len(overflow))
-            srows = MmapPackStore.rows_for(
-                self, [pairs[i] for i in overflow])
-            stage_rows = dict(zip(overflow, srows))
+        try:
+            if placed:
+                if not self.direct:
+                    for _, _, off, _ in placed:
+                        try:
+                            os.posix_fadvise(
+                                self._fd, off, self.slot_bytes,
+                                os.POSIX_FADV_WILLNEED)
+                        except OSError:
+                            break       # advisory only
+                self._read_many([(p[1], p[2]) for p in placed])
+            # overflow rows (scan discipline, or arena smaller than one
+            # batch): parent's buffered stage.  Keep placed rows unpublished
+            # until this part of the call succeeds as well.
+            if overflow:
+                if not scan:
+                    logger.warning(
+                        "moe_w2 tiered store: batch of %d rows exceeds the "
+                        "arena (%d slots) — %d rows served via buffered "
+                        "stage; raise VLLM_MOE_W2_BASE_RAM_GB",
+                        n, self.n_arena, len(overflow))
+                srows = MmapPackStore.rows_for(
+                    self, [pairs[i] for i in overflow])
+                stage_rows = dict(zip(overflow, srows))
+        except BaseException:
+            # Bytes in a failed slot are untrusted.  Leave evicted owners
+            # absent and return the slot to the free list; a retry must read
+            # it again rather than observe a false hit.
+            for _, slot, _, _ in placed:
+                self._owner_pair[slot] = None
+                self._last[slot] = 0
+                self._free.append(slot)
+            raise
+        for _, slot, _, pair in placed:
+            self._pos[pair] = slot
+            self._owner_pair[slot] = pair
         # metrics + result assembly
         n_miss = len(placed) + len(overflow)
         self._hit_rows += n - n_miss
@@ -580,6 +818,8 @@ class TieredPackStore(MmapPackStore):
                 for i in range(n)]
 
     def release(self) -> None:
+        # Arena read tasks may still reference both _dfd and _arena_mv.
+        self._pool.shutdown(wait=True, cancel_futures=True)
         if self._dfd >= 0:
             try:
                 os.close(self._dfd)
@@ -615,27 +855,46 @@ class TieredPackStore(MmapPackStore):
 
 def pack_has_layer(tag: str, layer_key: int, n_layers: int, n_experts: int,
                    slot_bytes: int) -> bool:
-    """Sidecar-only presence probe: does the pack this config would serve
-    from already hold `layer_key`? Used at WEIGHT-CREATE time (before any
-    store exists) to decide the loader-level skip — a pack-resident layer's
-    checkpoint experts never need to be read into host staging at all.
-    Deliberately touches only the sidecar JSON (no fd, no arena, no pinned
-    allocs) and never raises."""
+    """Fail-closed loader-skip probe for one durable pack generation.
+
+    A sidecar is not proof that its bytes still exist.  Validate the complete
+    identity/geometry contract and the exact pack extent before checkpoint
+    parameters may be replaced by stubs.
+    """
     dir_ = os.getenv("VLLM_MOE_W2_STORE_DIR", "").strip()
     if not dir_:
         return False
     try:
         stride = (slot_bytes + _ALIGN - 1) // _ALIGN * _ALIGN
-        sidecar = os.path.join(dir_, f"{tag}.{_rank_suffix()}.json")
-        if not os.path.exists(sidecar):
+        pack, sidecar, _lock_path, identity = _pack_paths(
+            dir_, tag, n_layers, n_experts, slot_bytes, stride)
+        # An unresolved model id is intentionally process-local and may serve
+        # the current boot, but can never authorize checkpoint loader skip.
+        if identity["ckpt_id"] is None:
             return False
-        with open(sidecar) as f:
-            meta = json.load(f)
-        want = dict(version=_PACK_VERSION, E=n_experts,
-                    slot_bytes=slot_bytes, stride=stride)
-        if any(meta.get(k) != v for k, v in want.items()):
+        expected = _pack_meta(
+            tag, n_layers, n_experts, slot_bytes, stride, identity)
+        lock_fd = os.open(
+            _lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            with _exclusive_lock(lock_fd):
+                with open(sidecar) as f:
+                    meta = json.load(f)
+                layers = _valid_layers(meta, n_layers)
+                if not _meta_matches(meta, expected) or layers is None:
+                    return False
+                fd = os.open(pack, os.O_RDONLY)
+                try:
+                    expected_size = n_layers * n_experts * stride
+                    if os.fstat(fd).st_size != expected_size:
+                        return False
+                finally:
+                    os.close(fd)
+        finally:
+            os.close(lock_fd)
+        if int(layer_key) not in set(layers):
             return False
-        return int(layer_key) in {int(li) for li in meta.get("layers", [])}
+        return True
     except Exception:  # noqa: BLE001 - probe only, staging path still works
         return False
 
