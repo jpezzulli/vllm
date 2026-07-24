@@ -80,6 +80,15 @@ _afrag_ok = False
 # Keep a runtime A/B escape hatch until every native-grade cell is remeasured.
 _FUSED_UNPERMUTE = os.getenv(
     "VLLM_MOE_W2_FUSED_UNPERMUTE", "0") == "1"
+# Diagnostic A/B only: DS4 declares swiglu_limit=10, which remains mandatory
+# by default. Setting this to 0 reproduces the historical W2 activation path
+# without changing the native/shared-expert path.
+_SWIGLU_CLAMP = os.getenv("VLLM_MOE_W2_SWIGLU_CLAMP", "1") == "1"
+# DeepGEMM's native DS4 path evaluates the clamped gated activation in FP32,
+# then rounds the product through BF16 before activation quantization. Keep
+# the old BF16-intermediate custom op as an A/B escape hatch.
+_SWIGLU_CLAMP_FP32 = os.getenv(
+    "VLLM_MOE_W2_SWIGLU_CLAMP_FP32", "1") == "1"
 # PREFILL QUALITY LEVER (default ON): prefill-sized calls consume the FP4
 # delta tier exactly like decode — pairs whose expert is FP4-resident divert
 # to moe_w4(q)_mm, the rest stay on the 2-bit planes. Before this, prefill
@@ -552,6 +561,11 @@ def _layer_contract(layer) -> dict:
         if not limit > 0:
             raise ValueError(
                 f"VLLM_MOE_W2 swiglu_limit must be positive, got {limit}")
+        if not _SWIGLU_CLAMP:
+            logger.warning_once(
+                "moe_w2_cubit: routed-expert SwiGLU clamp disabled by "
+                "VLLM_MOE_W2_SWIGLU_CLAMP=0 (diagnostic A/B only)")
+            limit = None
     return {
         "activation": activation,
         "swiglu_limit": limit,
@@ -1503,6 +1517,55 @@ def _deterministic_unpermute_kernel(
         product = _fp32_mul_rn(value, weight)
         acc = _fp32_add_rn(acc, product)
     tl.store(out_ptr + token * out_stride + h, acc, mask=h_mask)
+
+
+@triton.jit
+def _silu_and_mul_clamp_fp32_kernel(
+    input_ptr,
+    output_ptr,
+    hidden,
+    input_stride,
+    output_stride,
+    limit,
+    BLOCK_H: tl.constexpr,
+):
+    row = tl.program_id(0)
+    h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = h < hidden
+    gate = tl.load(
+        input_ptr + row * input_stride + h, mask=mask, other=0.0
+    ).to(tl.float32)
+    up = tl.load(
+        input_ptr + row * input_stride + hidden + h,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    gate = tl.minimum(gate, limit)
+    up = tl.clamp(up, -limit, limit)
+    glu = gate / (1.0 + tl.exp(-gate))
+    tl.store(output_ptr + row * output_stride + h, glu * up, mask=mask)
+
+
+def _silu_and_mul_clamp_fp32(
+    output: torch.Tensor, input_: torch.Tensor, limit: float
+) -> None:
+    """Match DeepGEMM's native clamp/activation precision before A2 quant."""
+    rows, twice_hidden = input_.shape
+    hidden = twice_hidden // 2
+    assert twice_hidden == hidden * 2
+    assert output.shape == (rows, hidden)
+    _silu_and_mul_clamp_fp32_kernel[
+        (rows, triton.cdiv(hidden, 256))
+    ](
+        input_,
+        output,
+        hidden,
+        input_.stride(0),
+        output.stride(0),
+        limit,
+        BLOCK_H=256,
+        num_warps=4,
+    )
 
 
 @triton.jit
@@ -2512,6 +2575,9 @@ def _moe_w2_forward_timed(
     act = ws["act"][:slots]
     if st.get("swiglu_limit") is None:
         torch.ops._C.silu_and_mul(act, ws["c13"][:slots])
+    elif _SWIGLU_CLAMP_FP32:
+        _silu_and_mul_clamp_fp32(
+            act, ws["c13"][:slots], st["swiglu_limit"])
     else:
         torch.ops._C.silu_and_mul_with_clamp(
             act,

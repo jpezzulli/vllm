@@ -215,6 +215,27 @@ def test_w2_layer_contract_preserves_ds4_clamp():
     assert contract["swiglu_beta"] == 0.0
 
 
+def test_w2_layer_contract_allows_diagnostic_unclamped_ab(monkeypatch):
+    monkeypatch.setattr(moe_w2_cubit, "_SWIGLU_CLAMP", False)
+    contract = moe_w2_cubit._layer_contract(_contract_layer())
+    assert contract["swiglu_limit"] is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_w2_clamp_matches_native_deepgemm_precision():
+    torch.manual_seed(0)
+    x = (
+        torch.randn(17, 512, device="cuda", dtype=torch.bfloat16) * 12
+    ).contiguous()
+    out = torch.empty(17, 256, device="cuda", dtype=torch.bfloat16)
+    moe_w2_cubit._silu_and_mul_clamp_fp32(out, x, 10.0)
+
+    gate = torch.minimum(x[:, :256].float(), torch.tensor(10.0, device="cuda"))
+    up = torch.clamp(x[:, 256:].float(), -10.0, 10.0)
+    ref = (gate * torch.sigmoid(gate) * up).to(torch.bfloat16)
+    torch.testing.assert_close(out, ref, rtol=0, atol=4e-3)
+
+
 @pytest.mark.parametrize(
     "dtype,use_v2,use_ubatching,expert_parallel,match",
     [
