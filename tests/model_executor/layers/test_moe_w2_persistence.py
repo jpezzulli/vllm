@@ -273,6 +273,14 @@ def test_strict_replay_converges_or_fails_closed():
     moe_w2_delta.fp_validate_complete(0)
 
 
+def test_strict_replay_allows_deep_fixed_point(monkeypatch):
+    monkeypatch.setattr(moe_w2_delta, "_REPLAY_MODE", "strict")
+    monkeypatch.setattr(moe_w2_delta, "_FP_MAX", 32)
+    assert moe_w2_delta.fp_continue(8, 1)
+    assert moe_w2_delta.fp_continue(31, 1)
+    assert not moe_w2_delta.fp_continue(32, 1)
+
+
 def test_mandatory_promotion_failure_is_fail_closed():
     from vllm.v1.worker.gpu_model_runner import _moe_w2_promote_consensus
 

@@ -1808,8 +1808,14 @@ def base_miss_tol() -> int:
 # faster on GLM TP2 (threshold 0: 28.3 tok/s; threshold 16: 19.2), but silently
 # accepted residue. Select it only through VLLM_MOE_W2_REPLAY_MODE=approximate
 # and report that fact in the recipe/result. THRESH remains file-tunable for
-# that mode; FP_MAX bounds pathological ping-pong in both modes.
-_FP_MAX = int(os.getenv("VLLM_MOE_W2_FP_MAX", "8"))
+# that mode; FP_MAX bounds pathological ping-pong in both modes. Eight passes
+# were insufficient on DS4 base52+delta17: MTP0/1/2 each eventually retained
+# 1-2 pairs and failed closed, while 32 converged and restored paired GPQA
+# parity. The extra passes run only on second-order miss steps.
+_FP_MAX = int(os.getenv("VLLM_MOE_W2_FP_MAX", "32"))
+if _FP_MAX < 1:
+    raise ValueError(
+        f"VLLM_MOE_W2_FP_MAX must be positive, got {_FP_MAX}")
 _FP_THRESH = int(os.getenv("VLLM_MOE_W2_FP_THRESH", "0"))
 _FP_THRESH_FILE = os.getenv("VLLM_MOE_W2_FP_THRESH_FILE", "")
 _REPLAY_MODE = os.getenv(
