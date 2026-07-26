@@ -417,6 +417,10 @@ class Worker(WorkerBase):
         self.model_runner.update_config(overrides)
 
     def reload_weights(self, *args, **kwargs) -> None:
+        if os.getenv("VLLM_MOE_W2", "0") == "1":
+            raise RuntimeError(
+                "reload_weights is unsupported with VLLM_MOE_W2: expert "
+                "planes and persistent stores are outside model parameters")
         self.model_runner.reload_weights(*args, **kwargs)
 
     @torch.inference_mode()
@@ -1013,29 +1017,74 @@ class Worker(WorkerBase):
         execute_model: gate+PP+pure-decode) — on MTP/prefill steps every rank
         skips together, so the base pipeline keeps its exact send/recv order.
         """
-        if not forward_pass or os.getenv("VLLM_MOE_W2_GATE", "0") != "1":
+        if not forward_pass:
             return
         pp = get_pp_group()
         if pp.world_size <= 1:
             return
-        if getattr(self.model_runner, "_gate_ctx", None) is None:
-            return
-        dev = self.model_runner.device
-        if pp.is_last_rank:
-            f = 1 if getattr(self.model_runner, "_gate_fire", False) else 0
-            data: dict = {"gate_fire": torch.tensor([f], device=dev)}
-        else:
-            data = {}
-        bcast = pp.broadcast_tensor_dict(data, src=pp.world_size - 1)
-        if bcast is None or not bool(bcast["gate_fire"].item()):
-            return
-        # Make sure the first-pass async send has landed before the 2nd pass
-        # reuses buffers / sends again.
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
-        self.model_runner.gate_reforward()
+        try:
+            if os.getenv("VLLM_MOE_W2_GATE", "0") != "1":
+                return
+            if getattr(self.model_runner, "_gate_ctx", None) is None:
+                return
+            dev = self.model_runner.device
+            if pp.is_last_rank:
+                f = 1 if getattr(self.model_runner, "_gate_fire", False) else 0
+                data: dict = {"gate_fire": torch.tensor([f], device=dev)}
+            else:
+                data = {}
+            bcast = pp.broadcast_tensor_dict(data, src=pp.world_size - 1)
+            if bcast is None or not bool(bcast["gate_fire"].item()):
+                return
+            # Promotion is local I/O/H2D and can fail before the collective
+            # model replay. Reach TP then PP consensus first so every rank
+            # either skips this optional quality replay or enters together.
+            from vllm.model_executor.layers.quantization.utils import (
+                moe_w2_gate)
+            promote_error = None
+            try:
+                moe_w2_gate.force_promote_step()
+            except BaseException as e:
+                promote_error = e
+            ok = torch.tensor(
+                [0 if promote_error is not None else 1],
+                dtype=torch.int32,
+                device=dev,
+            )
+            tp = get_tp_group()
+            if tp.world_size > 1:
+                torch.distributed.all_reduce(
+                    ok, op=torch.distributed.ReduceOp.MIN,
+                    group=tp.device_group)
+            if pp.world_size > 1:
+                torch.distributed.all_reduce(
+                    ok, op=torch.distributed.ReduceOp.MIN,
+                    group=pp.device_group)
+            if not bool(ok.item()):
+                logger.error(
+                    "moe_w2 PP gate promotion failed on at least one rank; "
+                    "skipping optional re-forward%s",
+                    f": {promote_error}" if promote_error else "")
+                return
+            # Make sure the first-pass async send has landed before the 2nd
+            # pass reuses buffers / sends again.
+            if self._pp_send_work:
+                for handle in self._pp_send_work:
+                    handle.wait()
+                self._pp_send_work = []
+            self.model_runner.gate_reforward()
+        finally:
+            # execute_model returns early on every non-last PP rank, so its
+            # runner-level cleanup hook is unreachable.  Close both tier
+            # windows exactly at the worker barrier for every PP outcome:
+            # gate off, no-fire, fire, prefill and exceptions.
+            from vllm.model_executor.layers.quantization.utils import (
+                moe_w2_delta)
+            for tier in (moe_w2_delta._BASE_TIER, moe_w2_delta._TIER):
+                if tier is not None:
+                    tier.step_end()
+            self.model_runner._gate_ctx = None
+            self.model_runner._gate_fire = False
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
@@ -1165,6 +1214,11 @@ class Worker(WorkerBase):
                 format (need layerwise processing) or kernel format (direct
                 copy / sparse patch application).
         """
+        if os.getenv("VLLM_MOE_W2", "0") == "1":
+            raise RuntimeError(
+                "weight updates are unsupported with VLLM_MOE_W2: hidden "
+                "expert planes/stores cannot be updated by the stock "
+                "parameter transfer lifecycle")
         self._check_weight_transfer_engine()
 
         if self._weight_update_active:
@@ -1283,6 +1337,23 @@ class Worker(WorkerBase):
     def shutdown(self) -> None:
         gc.unfreeze()
 
+        # Stop residency managers before model/CUDA graph teardown. They own
+        # side streams, pack executors and pinned buffers that must not outlive
+        # the worker.
+        try:
+            from vllm.model_executor.layers.quantization.utils import (
+                moe_w2_delta)
+            moe_w2_delta.shutdown()
+        except Exception as e:
+            logger.exception("moe_w2 residency shutdown failed")
+            # A live manager still owns CUDA/store state. Destroying the model
+            # underneath it is unsafe; retain globals and stop teardown.
+            raise RuntimeError(
+                "cannot continue worker teardown while a moe_w2 residency "
+                "manager is still active") from e
+
+        moe_w2_errors = []
+
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
@@ -1298,6 +1369,22 @@ class Worker(WorkerBase):
         # can be reclaimed when running in-process
         if model_runner := getattr(self, "model_runner", None):
             model_runner.shutdown()
+        try:
+            from vllm.model_executor.layers.quantization.utils import (
+                moe_w2_bf12, moe_w2_cubit, moe_w2_gate, moe_w2_looka,
+                moe_w2_planes_cache)
+            moe_w2_planes_cache.shutdown()
+            moe_w2_bf12.shutdown()
+            moe_w2_gate.shutdown()
+            moe_w2_looka.shutdown()
+            moe_w2_cubit.shutdown()
+        except Exception as e:
+            logger.exception("moe_w2 registry/cache shutdown failed")
+            moe_w2_errors.append(e)
+        if moe_w2_errors:
+            raise RuntimeError(
+                "moe_w2 worker teardown was incomplete: "
+                + "; ".join(str(e) for e in moe_w2_errors))
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)

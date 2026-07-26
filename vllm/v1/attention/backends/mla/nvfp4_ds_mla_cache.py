@@ -22,13 +22,17 @@ import torch  # noqa: F401  (loads libc10/libtorch before the .so)
 def _ext():
     ext_dir = os.environ.get("VLLM_NVFP4_DS_MLA_EXT_DIR", "")
     if ext_dir:
-        so = glob.glob(os.path.join(ext_dir, "**/*.so"), recursive=True)
-        if so:
+        so = sorted(glob.glob(os.path.join(ext_dir, "**/*.so"), recursive=True))
+        if len(so) == 1:
             spec = importlib.util.spec_from_file_location(
                 "nvfp4_ds_mla_cache_ext", so[0])
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             return mod
+        if len(so) > 1:
+            raise RuntimeError(
+                f"ambiguous nvfp4_ds_mla extension directory {ext_dir}: "
+                f"found {len(so)} shared objects")
 
     from torch.utils.cpp_extension import load
 
@@ -49,5 +53,12 @@ def concat_and_cache_nvfp4_ds_mla(
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
 ) -> None:
+    if not kv_c_normed.is_cuda:
+        raise RuntimeError("nvfp4_ds_mla cache input must be CUDA")
+    cap = torch.cuda.get_device_capability(kv_c_normed.device)
+    if cap != (12, 0):
+        raise RuntimeError(
+            "nvfp4_ds_mla cache extension requires exactly SM120 on the "
+            f"input tensor device; got {cap} on {kv_c_normed.device}")
     _ext().concat_and_cache_nvfp4_ds_mla(kv_c_normed, k_pe, kv_cache,
                                          slot_mapping)

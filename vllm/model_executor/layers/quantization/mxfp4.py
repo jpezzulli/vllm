@@ -491,7 +491,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     @property
     def supports_eplb(self) -> bool:
-        return True
+        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
+        return not moe_w2_cubit.enabled()
 
     @property
     def skip_forward_padding(self) -> bool:
@@ -622,6 +623,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # in process_weights_after_loading.
         from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
         if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
+            if moe_w2_cubit.plan_pack_skip(layer):
+                return
             for pname in ("w13_weight", "w13_weight_scale", "w2_weight",
                           "w2_weight_scale"):
                 p_ = getattr(layer, pname)
@@ -740,7 +743,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # VLLM_MOE_W2: build 2-bit tensor-sym planes; skip Marlin/other backends.
         from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
         if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
-            key = len(moe_w2_cubit._LAYERS)
+            key = getattr(
+                layer, "_moe_w2_create_key", len(moe_w2_cubit._LAYERS))
             moe_w2_cubit.build_layer_planes(layer, key)
             layer._moe_w2_key = key
             return
@@ -810,8 +814,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if w2_key is not None:
             from vllm.model_executor.layers.quantization.utils import (
                 moe_w2_cubit)
-            assert layer.expert_map is None and \
-                not layer.apply_router_weight_on_input
+            if (layer.expert_map is not None
+                    or layer.apply_router_weight_on_input):
+                raise RuntimeError(
+                    "VLLM_MOE_W2 does not support expert maps/EPLB or "
+                    "router-weight-on-input")
             return moe_w2_cubit.moe_w2_forward(x, topk_weights, topk_ids,
                                                w2_key)
 

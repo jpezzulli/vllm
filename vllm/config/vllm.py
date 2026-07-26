@@ -2198,16 +2198,24 @@ class VllmConfig:
         # keep the guard for every other platform/backend combination.
         from vllm.platforms import current_platform
 
-        if (
-            self.cache_config.cache_dtype == "nvfp4"
-            and self.model_config.use_mla
-            and not current_platform.is_device_capability_family(120)
-        ):
-            raise ValueError(
-                "nvfp4 KV cache is not supported with MLA (Multi-head Latent "
-                "Attention) backends. Please use a different --kv-cache-dtype "
-                "(e.g., 'fp8' or 'auto') for MLA models such as DeepSeek."
+        if (self.cache_config.cache_dtype == "nvfp4"
+                and self.model_config.use_mla):
+            cap = current_platform.get_device_capability()
+            text_config = self.model_config.hf_text_config
+            geometry_ok = (
+                getattr(text_config, "kv_lora_rank", None) == 512
+                and getattr(text_config, "qk_rope_head_dim", None) == 64
             )
+            if (cap is None or (cap.major, cap.minor) != (12, 0)
+                    or not geometry_ok):
+                raise ValueError(
+                    "packed nvfp4 MLA KV cache requires exactly SM120 and "
+                    "the validated latent/rope geometry 512/64; got "
+                    f"capability={cap}, kv_lora_rank="
+                    f"{getattr(text_config, 'kv_lora_rank', None)}, "
+                    f"qk_rope_head_dim="
+                    f"{getattr(text_config, 'qk_rope_head_dim', None)}. "
+                    "Use --kv-cache-dtype fp8 or auto.")
         return self
 
     @model_validator(mode="after")

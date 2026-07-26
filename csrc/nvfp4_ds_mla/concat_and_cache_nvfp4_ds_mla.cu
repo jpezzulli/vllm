@@ -20,6 +20,7 @@
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -60,10 +61,16 @@ __global__ void concat_and_cache_nvfp4_kernel(
     uint8_t* __restrict__ kv_cache,            // [num_blocks, page, 352]
     const int64_t* __restrict__ slot_mapping,  // [T]
     const int64_t kv_c_stride, const int64_t k_pe_stride,
-    const int64_t block_stride_bytes, const int page_size) {
+    const int64_t block_stride_bytes, const int page_size,
+    const int64_t num_slots) {
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
   if (slot_idx < 0) return;  // padded token
+  if (slot_idx >= num_slots) {
+    // An invalid positive slot is an internal scheduler/cache bug. Silently
+    // skipping it leaves stale KV bytes that look valid to later attention.
+    asm volatile("trap;");
+  }
   const int64_t block_idx = slot_idx / page_size;
   const int64_t block_off = slot_idx % page_size;
   uint8_t* dst =
@@ -115,14 +122,34 @@ void concat_and_cache_nvfp4_ds_mla(torch::Tensor& kv_c, torch::Tensor& k_pe,
   TORCH_CHECK(k_pe.dtype() == torch::kBFloat16, "k_pe must be bf16");
   TORCH_CHECK(kv_cache.dtype() == torch::kUInt8, "kv_cache must be uint8");
   TORCH_CHECK(slot_mapping.dtype() == torch::kInt64);
+  TORCH_CHECK(kv_c.is_cuda() && k_pe.is_cuda() && kv_cache.is_cuda() &&
+                  slot_mapping.is_cuda(),
+              "all nvfp4 MLA cache tensors must be CUDA tensors");
+  TORCH_CHECK(kv_c.device() == k_pe.device() &&
+                  kv_c.device() == kv_cache.device() &&
+                  kv_c.device() == slot_mapping.device(),
+              "all nvfp4 MLA cache tensors must be on the same CUDA device");
   TORCH_CHECK(kv_c.dim() == 2 && kv_c.size(-1) == kLatentDim, "kv_c [T,512]");
   TORCH_CHECK(k_pe.dim() == 2 && k_pe.size(-1) == kRopeDim, "k_pe [T,64]");
+  TORCH_CHECK(kv_c.size(0) == k_pe.size(0),
+              "kv_c and k_pe token counts must match");
+  TORCH_CHECK(slot_mapping.dim() == 1 &&
+                  slot_mapping.size(0) == kv_c.size(0),
+              "slot_mapping must be contiguous [T]");
+  TORCH_CHECK(slot_mapping.is_contiguous(),
+              "slot_mapping must be contiguous");
+  TORCH_CHECK(kv_cache.dim() == 3,
+              "kv_cache must have shape [num_blocks,page,352]");
   TORCH_CHECK(kv_cache.size(-1) == kStride, "kv_cache last dim must be 352");
   TORCH_CHECK(kv_c.stride(-1) == 1 && k_pe.stride(-1) == 1);
+  TORCH_CHECK(kv_cache.is_contiguous(),
+              "kv_cache must be contiguous [num_blocks,page,352]");
+  TORCH_CHECK(kv_cache.size(1) > 0, "kv_cache page size must be positive");
 
-  const int num_tokens = slot_mapping.size(0);
+  const int num_tokens = kv_c.size(0);
   if (num_tokens == 0) return;
   const int page_size = kv_cache.size(1);
+  const int64_t num_slots = kv_cache.size(0) * int64_t(page_size);
 
   const c10::cuda::OptionalCUDAGuard guard(kv_c.device());
   const cudaStream_t stream =
@@ -131,7 +158,9 @@ void concat_and_cache_nvfp4_ds_mla(torch::Tensor& kv_c, torch::Tensor& k_pe,
       reinterpret_cast<const __nv_bfloat16*>(kv_c.data_ptr()),
       reinterpret_cast<const __nv_bfloat16*>(k_pe.data_ptr()),
       kv_cache.data_ptr<uint8_t>(), slot_mapping.data_ptr<int64_t>(),
-      kv_c.stride(0), k_pe.stride(0), kv_cache.stride(0), page_size);
+      kv_c.stride(0), k_pe.stride(0), kv_cache.stride(0), page_size,
+      num_slots);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 }  // namespace

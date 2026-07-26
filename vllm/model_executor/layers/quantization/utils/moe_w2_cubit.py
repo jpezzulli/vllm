@@ -76,6 +76,19 @@ _state = "uninit"
 # (loader degrades to mc4 when missing). Opt out: VLLM_MOE_W2_AFRAG=0.
 _AFRAG = os.getenv("VLLM_MOE_W2_AFRAG", "1") == "1"
 _afrag_ok = False
+# Fused gather-reduce removes the enormous deterministic scatter buffer.
+# Keep a runtime A/B escape hatch until every native-grade cell is remeasured.
+_FUSED_UNPERMUTE = os.getenv(
+    "VLLM_MOE_W2_FUSED_UNPERMUTE", "0") == "1"
+# Diagnostic A/B only: DS4 declares swiglu_limit=10, which remains mandatory
+# by default. Setting this to 0 reproduces the historical W2 activation path
+# without changing the native/shared-expert path.
+_SWIGLU_CLAMP = os.getenv("VLLM_MOE_W2_SWIGLU_CLAMP", "1") == "1"
+# DeepGEMM's native DS4 path evaluates the clamped gated activation in FP32,
+# then rounds the product through BF16 before activation quantization. Keep
+# the old BF16-intermediate custom op as an A/B escape hatch.
+_SWIGLU_CLAMP_FP32 = os.getenv(
+    "VLLM_MOE_W2_SWIGLU_CLAMP_FP32", "1") == "1"
 # PREFILL QUALITY LEVER (default ON): prefill-sized calls consume the FP4
 # delta tier exactly like decode — pairs whose expert is FP4-resident divert
 # to moe_w4(q)_mm, the rest stay on the 2-bit planes. Before this, prefill
@@ -382,8 +395,16 @@ def _ensure_ready() -> bool:
                     _ck(cu.cuModuleGetFunction(ctypes.byref(fn), mod, b"moe_w2_mm"),
                         "cuModuleGetFunction afrag")
                     _fns[("w2mc4afrag", k)] = fn
-                _afrag_ok = True
-                logger.info("moe_w2_cubit: AFRAG prefill cubins loaded")
+                loaded = sorted(
+                    k for tier, k in _fns if tier == "w2mc4afrag")
+                _afrag_ok = bool(loaded)
+                if loaded:
+                    logger.info(
+                        "moe_w2_cubit: AFRAG prefill cubins loaded for K=%s",
+                        loaded)
+                else:
+                    logger.warning(
+                        "moe_w2_cubit: no AFRAG cubins found; using mc4")
             except Exception as e:  # noqa: BLE001
                 logger.warning("moe_w2_cubit: AFRAG unavailable (%s); using mc4", e)
                 _afrag_ok = False
@@ -409,9 +430,10 @@ def _require_kernels(K13: int, K2: int, need_w4: bool) -> None:
         w4tier = "w4q" if moe_w2_delta.split_enabled() else "w4"
         need += [(w4tier, K13), (w4tier, K2)]
     missing = [f"{t}_k{k}" for t, k in need if (t, k) not in _fns]
-    assert not missing, (
-        f"moe_w2_cubit: missing cubins for K13={K13}/K2={K2}: {missing} "
-        f"(dir {_DIR}; set VLLM_MOE_W2_CUBIT_DIR)")
+    if missing:
+        raise RuntimeError(
+            f"moe_w2_cubit: missing cubins for K13={K13}/K2={K2}: "
+            f"{missing} (dir {_DIR}; set VLLM_MOE_W2_CUBIT_DIR)")
 
 
 def _fp4_tier_for_build(E: int, dev, n13k13: int, n2k2: int):
@@ -481,6 +503,77 @@ _n_created = 0
 _skip_logged = False
 
 
+def _layer_contract(layer) -> dict:
+    """Validate semantics the hand-written W2 path actually implements."""
+    try:
+        from vllm.config import get_current_vllm_config
+        cfg = get_current_vllm_config()
+        if cfg.model_config.dtype != torch.bfloat16:
+            raise ValueError(
+                "VLLM_MOE_W2 kernels use BF16 intermediates and currently "
+                f"require model dtype bfloat16, got {cfg.model_config.dtype}")
+        if cfg.use_v2_model_runner:
+            raise ValueError(
+                "VLLM_MOE_W2 is not integrated with Model Runner V2 "
+                "(mandatory base replay and gate hooks are absent)")
+        pc = cfg.parallel_config
+        if (getattr(pc, "use_ubatching", False)
+                or getattr(pc, "ubatch_size", 0)):
+            raise ValueError(
+                "VLLM_MOE_W2 does not support ubatching/DBO: its CUDA "
+                "workspaces are shared across forwards")
+        if (getattr(pc, "enable_expert_parallel", False)
+                or getattr(pc, "enable_eplb", False)):
+            raise ValueError(
+                "VLLM_MOE_W2 does not support expert parallelism or EPLB")
+    except ValueError:
+        raise
+    except Exception:
+        # Layer-level checks below remain authoritative in offline tools that
+        # intentionally construct layers without a current VllmConfig.
+        pass
+    activation = getattr(layer, "activation", "silu")
+    activation = getattr(activation, "value", activation)
+    if activation != "silu":
+        raise ValueError(
+            "VLLM_MOE_W2 supports only packed SILU-gated routed experts; "
+            f"layer {getattr(layer, 'layer_name', '')!r} uses "
+            f"{activation!r}")
+    alpha = getattr(layer, "swiglu_alpha", None)
+    beta = getattr(layer, "swiglu_beta", None)
+    if alpha not in (None, 1.0) or beta not in (None, 0.0):
+        raise ValueError(
+            "VLLM_MOE_W2 does not implement non-default SwiGLU alpha/beta "
+            f"(got alpha={alpha}, beta={beta})")
+    moe_config = getattr(layer, "moe_config", None)
+    if bool(getattr(moe_config, "has_bias", False)):
+        raise ValueError(
+            "VLLM_MOE_W2 does not implement routed-expert w13/w2 bias")
+    if getattr(layer, "expert_map", None) is not None:
+        raise ValueError(
+            "VLLM_MOE_W2 does not support expert parallel/EPLB mappings")
+    if bool(getattr(layer, "apply_router_weight_on_input", False)):
+        raise ValueError(
+            "VLLM_MOE_W2 does not support router weight on input")
+    limit = getattr(layer, "swiglu_limit", None)
+    if limit is not None:
+        limit = float(limit)
+        if not limit > 0:
+            raise ValueError(
+                f"VLLM_MOE_W2 swiglu_limit must be positive, got {limit}")
+        if not _SWIGLU_CLAMP:
+            logger.warning_once(
+                "moe_w2_cubit: routed-expert SwiGLU clamp disabled by "
+                "VLLM_MOE_W2_SWIGLU_CLAMP=0 (diagnostic A/B only)")
+            limit = None
+    return {
+        "activation": activation,
+        "swiglu_limit": limit,
+        "swiglu_alpha": 1.0,
+        "swiglu_beta": 0.0,
+    }
+
+
 def _noop_loader(*args, **kwargs):
     """Weight-loader stand-in for pack-skipped params: the expert loading
     loop calls with return_success=True and must see truthy, or it treats
@@ -507,6 +600,7 @@ def plan_pack_skip(layer) -> bool:
     layer._moe_w2_create_key = key
     if not enabled():
         return False
+    _layer_contract(layer)
     try:
         E, N13, K13h = layer.w13_weight.shape
         _, N2, K2h = layer.w2_weight.shape
@@ -649,6 +743,7 @@ def arm_stream_build(layer) -> bool:
     global _stream_logged
     if not (_STREAM and enabled()):
         return False
+    _layer_contract(layer)
     try:
         E = layer.w13_weight.shape[0]
     except Exception:  # noqa: BLE001 - unexpected layout: staged path
@@ -706,6 +801,7 @@ def _try_skip_requant(layer, layer_key: int, E: int, N13: int, K13: int,
     but ITS pack misses the layer, we also requant (the fp4 sections can
     only be rebuilt from the checkpoint bytes)."""
     from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+    contract = _layer_contract(layer)
     if not moe_w2_delta.base_enabled():
         return False
     dev = torch.device("cuda")
@@ -728,6 +824,7 @@ def _try_skip_requant(layer, layer_key: int, E: int, N13: int, K13: int,
         off_s2=c13len + s13len + c2len,
         off4_s13=2 * c13len, off4_c2=2 * c13len + s13len,
         off4_s2=2 * c13len + s13len + 2 * c2len,
+        **contract,
     )
     stub = torch.empty(0, dtype=torch.uint8, device=dev)
     for name in param_names:
@@ -747,8 +844,28 @@ def build_layer_planes(layer, layer_key: int) -> None:
     builds fragment-major code planes + scale planes on the GPU, then
     replaces the originals with empty stubs.
     """
-    assert _ensure_ready(), "moe_w2 cubins missing"
+    _layer_contract(layer)
+    if not _ensure_ready():
+        raise RuntimeError("moe_w2 cubins missing or failed to load")
     dev = torch.device("cuda")
+    if getattr(layer, "_moe_w2_pack_skip", False):
+        E, N13, K13, N2, K2 = layer._moe_w2_shapes
+        from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+        _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
+        if moe_w2_delta.base_enabled():
+            if not _try_skip_requant(
+                    layer, layer_key, E, N13, K13, N2, K2,
+                    ("w13_weight", "w13_weight_scale", "w2_weight",
+                     "w2_weight_scale")):
+                raise RuntimeError(
+                    f"moe_w2 mxfp4 layer {layer_key} pack generation "
+                    "changed during loader skip")
+        elif not _consume_planes_cache(
+                layer, layer_key, dev, E, N13, K13, N2, K2):
+            raise RuntimeError(
+                f"moe_w2 mxfp4 layer {layer_key} planes cache changed "
+                "during loader skip")
+        return
     w13 = layer.w13_weight.data          # [E, 2I, H/2] u8 (cpu)
     s13 = layer.w13_weight_scale.data    # [E, 2I, H/32] u8
     w2 = layer.w2_weight.data            # [E, H, I/2] u8
@@ -761,6 +878,9 @@ def build_layer_planes(layer, layer_key: int) -> None:
     if _try_skip_requant(layer, layer_key, E, N13, K13, N2, K2,
                          ("w13_weight", "w13_weight_scale", "w2_weight",
                           "w2_weight_scale")):
+        return
+    if _consume_planes_cache(
+            layer, layer_key, dev, E, N13, K13, N2, K2):
         return
 
     planes13 = torch.empty(E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
@@ -802,6 +922,16 @@ def build_layer_planes(layer, layer_key: int) -> None:
             if fp2 is not None:
                 fp2[e0 + i] = _pack_fp4_plane(nib)
 
+    from vllm.model_executor.layers.quantization.utils import (
+        moe_w2_planes_cache as planes_cache)
+    lidx = planes_cache.layer_idx_from_name(
+        getattr(layer, "layer_name", ""))
+    if planes_cache.enabled() and lidx is not None:
+        planes_cache.store(
+            lidx,
+            dict(planes13=planes13, sc13=sc13, planes2=planes2, sc2=sc2,
+                 fp13=fp13, fp2=fp2))
+
     if tier is not None:
         _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
         del fp13, fp2
@@ -831,12 +961,15 @@ def build_layer_planes_fp8(layer, layer_key: int,
     from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
         fp8_block_to_codes_scales, pack_fp4_fragment_major)
 
-    assert _ensure_ready(), "moe_w2 cubins missing"
+    _layer_contract(layer)
+    if not _ensure_ready():
+        raise RuntimeError("moe_w2 cubins missing or failed to load")
     dev = torch.device("cuda")
     w13 = layer.w13_weight.data                       # [E, 2I, H] e4m3 (cpu)
     s13 = getattr(layer, f"w13_{scale_suffix}").data  # [E, 2I/128, H/128] f32
     w2 = layer.w2_weight.data                         # [E, H, I] e4m3
     s2 = getattr(layer, f"w2_{scale_suffix}").data    # [E, H/128, I/128] f32
+    block_shape = getattr(layer, "weight_block_size", None) or (128, 128)
     assert w13.dtype == torch.float8_e4m3fn, w13.dtype
     E, N13, K13 = w13.shape
     _, N2, K2 = w2.shape
@@ -869,7 +1002,8 @@ def build_layer_planes_fp8(layer, layer_key: int,
         sg = s13[e0:e1].to(dev, non_blocking=True)
         for i in range(e1 - e0):
             codes, sbytes, nib = fp8_block_to_codes_scales(
-                wg[i], sg[i], want_nibbles=fp13 is not None)
+                wg[i], sg[i], block_shape=block_shape,
+                want_nibbles=fp13 is not None)
             planes13[e0 + i] = pack_fragment_major(codes)
             sc13[e0 + i] = pack_scales(sbytes)
             if fp13 is not None:
@@ -878,7 +1012,8 @@ def build_layer_planes_fp8(layer, layer_key: int,
         sg = s2[e0:e1].to(dev, non_blocking=True)
         for i in range(e1 - e0):
             codes, sbytes, nib = fp8_block_to_codes_scales(
-                wg[i], sg[i], want_nibbles=fp2 is not None)
+                wg[i], sg[i], block_shape=block_shape,
+                want_nibbles=fp2 is not None)
             planes2[e0 + i] = pack_fragment_major(codes)
             sc2[e0 + i] = pack_scales(sbytes)
             if fp2 is not None:
@@ -944,7 +1079,9 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
     from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
         nvfp4_to_codes_scales, pack_fp4_fragment_major)
 
-    assert _ensure_ready(), "moe_w2 cubins missing"
+    _layer_contract(layer)
+    if not _ensure_ready():
+        raise RuntimeError("moe_w2 cubins missing or failed to load")
     dev = torch.device("cuda")
     if getattr(layer, "_moe_w2_pack_skip", False):
         # loader-level skip: the params are 0-byte stubs (plan_pack_skip),
@@ -954,23 +1091,26 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
         E, N13, K13, N2, K2 = layer._moe_w2_shapes
         _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
         if moe_w2_delta.base_enabled():
-            assert _try_skip_requant(
-                layer, layer_key, E, N13, K13, N2, K2,
-                ("w13_weight", "w13_weight_scale", "w2_weight",
-                 "w2_weight_scale")), (
-                f"moe_w2: layer {layer_key} was loader-skipped on a pack "
-                f"sidecar hit but the pack no longer serves it "
-                f"(dir/sidecar changed mid-load?) — restart without the "
-                f"stale VLLM_MOE_W2_STORE_DIR state")
+            if not _try_skip_requant(
+                    layer, layer_key, E, N13, K13, N2, K2,
+                    ("w13_weight", "w13_weight_scale", "w2_weight",
+                     "w2_weight_scale")):
+                raise RuntimeError(
+                    f"moe_w2: layer {layer_key} was loader-skipped on a "
+                    "validated pack hit but the pack no longer serves it "
+                    "(generation changed mid-load); restart after checking "
+                    "VLLM_MOE_W2_STORE_DIR")
             return
         # GPU-resident: materialize the planes from the planes cache
         # (probed at create time; a miss here means the cache dir changed
         # under a live load).
-        assert _consume_planes_cache(layer, layer_key, dev,
-                                     E, N13, K13, N2, K2), (
-            f"moe_w2: layer {layer_key} was loader-skipped on a planes-"
-            f"cache hit but the cache no longer serves it — restart "
-            f"without the stale VLLM_MOE_W2_PLANES_CACHE state")
+        if not _consume_planes_cache(
+                layer, layer_key, dev, E, N13, K13, N2, K2):
+            raise RuntimeError(
+                f"moe_w2: layer {layer_key} was loader-skipped on a "
+                "planes-cache hit but the cache generation changed "
+                "mid-load; restart after checking "
+                "VLLM_MOE_W2_PLANES_CACHE")
         return
     w13 = layer.w13_weight.data                 # [E, 2I, H/2] u8 (cpu)
     s13 = layer.w13_weight_scale.data           # [E, 2I, H/16] e4m3
@@ -1066,6 +1206,7 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
 def _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
                   N13, K13, N2, K2, E, param_names) -> None:
     from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+    contract = _layer_contract(layer)
     # transformer layer index of this layer_key (dense-offset models: GLM's
     # first sparse layer 3 -> key 0). LOOKA uses it to pair each key with
     # its transformer layer's router (mlp.gate) weights.
@@ -1083,10 +1224,10 @@ def _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
         btier = moe_w2_delta.get_base_tier(
             _layer_cutoff() + 1, E, dev,
             w13_bytes=c13len + s13len, w2_bytes=c2len + s2len)
-        btier.add_layer_host_planes(
-            layer_key,
-            torch.cat((planes13, sc13), dim=1),
-            torch.cat((planes2, sc2), dim=1))
+        # Stage sections directly. Concatenating these multi-GiB tensors on
+        # GPU created a full duplicate layer transient during first boot.
+        btier.add_layer_host_sections(
+            layer_key, (planes13, sc13), (planes2, sc2))
         _LAYERS[layer_key] = dict(
             N13=N13, K13=K13, N2=N2, K2=K2, E=E, base=True, tl_idx=_tl,
             off_s13=c13len, off_c2=c13len + s13len,
@@ -1096,6 +1237,7 @@ def _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
             # base+delta desc kernel when the FP4 tier coexists.
             off4_s13=2 * c13len, off4_c2=2 * c13len + s13len,
             off4_s2=2 * c13len + s13len + 2 * c2len,
+            **contract,
         )
         del planes13, sc13, planes2, sc2
         stub = torch.empty(0, dtype=torch.uint8, device=dev)
@@ -1113,6 +1255,7 @@ def _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
     _LAYERS[layer_key] = dict(
         planes13=planes13, sc13=sc13, planes2=planes2, sc2=sc2,
         N13=N13, K13=K13, N2=N2, K2=K2, E=E, tl_idx=_tl,
+        **contract,
     )
     # Release checkpoint copies; keep CUDA stubs so device probes stay happy.
     stub = torch.empty(0, dtype=torch.uint8, device=dev)
@@ -1281,6 +1424,9 @@ def _workspaces(slots: int, tokens: int, dev, inter: int = 2048,
             # fixed 256-row table).
             no_slots=torch.full((max(n_experts, 256),), -1,
                                 dtype=torch.int32, device=dev),
+            # inverse permutation for the fused deterministic unpermute.
+            # `slots` >= tokens*top_k, so one buffer covers every valid route.
+            inv_sorted=torch.empty(slots + 4, dtype=torch.int32, device=dev),
         )
         if _afrag_ok:
             # AFRAG destination buffers: the triton repack streams row-major
@@ -1297,6 +1443,129 @@ def _workspaces(slots: int, tokens: int, dev, inter: int = 2048,
 
 import triton
 import triton.language as tl
+
+
+@triton.jit
+def _invert_sorted_ids_kernel(sorted_ids_ptr, inverse_ptr, n_slots,
+                              n_routes, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    ids = tl.load(sorted_ids_ptr + offsets, mask=offsets < n_slots, other=-1)
+    valid = (offsets < n_slots) & (ids >= 0) & (ids < n_routes)
+    # Valid sorted ids are a permutation of token*top_k+j, so stores never
+    # collide. Padding ids are ignored rather than redirected to a dump row.
+    tl.store(inverse_ptr + ids, offsets, mask=valid)
+
+
+@triton.jit
+def _fp32_mul_rn(a, b):
+    return tl.inline_asm_elementwise(
+        "mul.rn.f32 $0, $1, $2;",
+        constraints="=f,f,f",
+        args=[a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _fp32_add_rn(a, b):
+    return tl.inline_asm_elementwise(
+        "add.rn.f32 $0, $1, $2;",
+        constraints="=f,f,f",
+        args=[a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _deterministic_unpermute_kernel(
+    c2_ptr,
+    weights_ptr,
+    inverse_ptr,
+    row_mask_ptr,
+    out_ptr,
+    hidden,
+    c2_stride,
+    weight_stride_t,
+    weight_stride_k,
+    out_stride,
+    TOP_K: tl.constexpr,
+    HAS_ROW_MASK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    token = tl.program_id(0)
+    h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    h_mask = h < hidden
+    acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    # Fixed j-order preserves deterministic accumulation without the
+    # [T*top_k,H] FP32 scatter buffer used by index_copy_ + sum.
+    for j in tl.static_range(0, TOP_K):
+        route = token * TOP_K + j
+        slot = tl.load(inverse_ptr + route)
+        value = tl.load(
+            c2_ptr + slot * c2_stride + h, mask=h_mask, other=0.0
+        ).to(tl.float32)
+        weight = tl.load(
+            weights_ptr + token * weight_stride_t + j * weight_stride_k
+        ).to(tl.float32)
+        if HAS_ROW_MASK:
+            weight = _fp32_mul_rn(
+                weight, tl.load(row_mask_ptr + slot).to(tl.float32))
+        product = _fp32_mul_rn(value, weight)
+        acc = _fp32_add_rn(acc, product)
+    tl.store(out_ptr + token * out_stride + h, acc, mask=h_mask)
+
+
+@triton.jit
+def _silu_and_mul_clamp_fp32_kernel(
+    input_ptr,
+    output_ptr,
+    hidden,
+    input_stride,
+    output_stride,
+    limit,
+    BLOCK_H: tl.constexpr,
+):
+    row = tl.program_id(0)
+    h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = h < hidden
+    gate = tl.load(
+        input_ptr + row * input_stride + h, mask=mask, other=0.0
+    ).to(tl.float32)
+    up = tl.load(
+        input_ptr + row * input_stride + hidden + h,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    gate = tl.minimum(gate, limit)
+    up = tl.clamp(up, -limit, limit)
+    glu = gate / (1.0 + tl.exp(-gate))
+    tl.store(output_ptr + row * output_stride + h, glu * up, mask=mask)
+
+
+def _silu_and_mul_clamp_fp32(
+    output: torch.Tensor, input_: torch.Tensor, limit: float
+) -> None:
+    """Match DeepGEMM's native clamp/activation precision before A2 quant."""
+    rows, twice_hidden = input_.shape
+    hidden = twice_hidden // 2
+    assert twice_hidden == hidden * 2
+    assert output.shape == (rows, hidden)
+    _silu_and_mul_clamp_fp32_kernel[
+        (rows, triton.cdiv(hidden, 256))
+    ](
+        input_,
+        output,
+        hidden,
+        input_.stride(0),
+        output.stride(0),
+        limit,
+        BLOCK_H=256,
+        num_warps=4,
+    )
 
 
 @triton.jit
@@ -1997,7 +2266,12 @@ def _moe_w2_forward_timed(
     # AFRAG: decode is row-major anyway and the prefill-FP4 sub-entries
     # take the row-major bases explicitly (the repack copies OUT of a1/a2,
     # leaving them valid).
-    use_afrag = prefill and _afrag_ok
+    use_afrag = (
+        prefill
+        and _afrag_ok
+        and ("w2mc4afrag", st["K13"]) in _fns
+        and ("w2mc4afrag", st["K2"]) in _fns
+    )
     a1_base = ws["a1f"] if use_afrag else ws["a1"]
     a2_base = ws["a2f"] if use_afrag else ws["a2"]
     d = ws["desc"]
@@ -2299,7 +2573,19 @@ def _moe_w2_forward_timed(
         else:
             _launch("w4", st["K13"], d[2], st["N13"], pairs * 4, stream)
     act = ws["act"][:slots]
-    torch.ops._C.silu_and_mul(act, ws["c13"][:slots])
+    if st.get("swiglu_limit") is None:
+        torch.ops._C.silu_and_mul(act, ws["c13"][:slots])
+    elif _SWIGLU_CLAMP_FP32:
+        _silu_and_mul_clamp_fp32(
+            act, ws["c13"][:slots], st["swiglu_limit"])
+    else:
+        torch.ops._C.silu_and_mul_with_clamp(
+            act,
+            ws["c13"][:slots],
+            st["swiglu_limit"],
+            st.get("swiglu_alpha", 1.0),
+            st.get("swiglu_beta", 0.0),
+        )
     # mid-pipeline requant (group _G2, default 32 — the a128-era group-128
     # requant here was one of the two activation-precision gaps vs native)
     _quant_a32(act, ws["a2"][:slots], ws["as2"][:slots], _G2)
@@ -2324,25 +2610,54 @@ def _moe_w2_forward_timed(
     # up to ~1.6e-2 abs on prefill, and single-token probes produced a small
     # set of bit-distinct logit variants — the root cause of the "greedy
     # decode is not reproducible" investigation (PP_DETERMINISM.md; it was
-    # never PP-specific). Deterministic scheme: every VALID slot owns a
-    # unique (token, j) coordinate (valid sorted_ids are a permutation of
-    # token*top_k + j), so index_copy_ into [T*top_k (+1 dump row), H] has no
-    # write collisions except filler slots, which all target the discarded
-    # dump row. The final sum(dim=1) reduces top_k in a fixed order.
-    # Static shapes + no host branches -> cudagraph-capture-safe.
-    w = topk_weights.reshape(-1)[sorted_ids.clamp(max=T * top_k - 1)]
-    w = torch.where(valid, w, torch.zeros_like(w)).to(torch.float32)
-    if miss_rows is not None:
-        # base cache: rows of non-resident pairs hold stale workspace values
-        # (their GEMMs early-EXITed) — zero their scatter weight so a miss
-        # contributes exactly nothing (the replay recomputes them properly).
-        w = w * miss_rows.to(torch.float32)
-    dump = T * top_k                       # collision row for filler slots
-    dst = torch.where(valid, sorted_ids,
-                      torch.full_like(sorted_ids, dump)).long()
-    gath = torch.zeros(dump + 1, H, dtype=torch.float32, device=dev)
-    gath.index_copy_(0, dst, ws["c2"][:slots].float() * w.unsqueeze(1))
-    return gath[:dump].view(T, top_k, H).sum(dim=1).to(x.dtype)
+    # never PP-specific). Invert the permutation, then one Triton program
+    # gathers and reduces top_k in fixed order for each token/H tile. This
+    # removes the previous [T*top_k,H] FP32 gath tensor (1.83 GiB at
+    # T=9984, top_k=8, H=6144) and its equally large weighted temporary.
+    if not _FUSED_UNPERMUTE:
+        w = topk_weights.reshape(-1)[sorted_ids.clamp(max=T * top_k - 1)]
+        w = torch.where(valid, w, torch.zeros_like(w)).to(torch.float32)
+        if miss_rows is not None:
+            w = w * miss_rows.to(torch.float32)
+        dump = T * top_k
+        dst = torch.where(
+            valid, sorted_ids, torch.full_like(sorted_ids, dump)).long()
+        gath = torch.zeros(
+            dump + 1, H, dtype=torch.float32, device=dev)
+        gath.index_copy_(
+            0, dst, ws["c2"][:slots].float() * w.unsqueeze(1))
+        return gath[:dump].view(T, top_k, H).sum(dim=1).to(x.dtype)
+
+    n_routes = T * top_k
+    inverse = ws["inv_sorted"][:n_routes]
+    _invert_sorted_ids_kernel[(triton.cdiv(slots, 256),)](
+        sorted_ids,
+        inverse,
+        slots,
+        n_routes,
+        BLOCK=256,
+    )
+    out = torch.empty((T, H), dtype=x.dtype, device=dev)
+    row_mask_ptr = miss_rows if miss_rows is not None else inverse
+    _deterministic_unpermute_kernel[
+        (T, triton.cdiv(H, 256))
+    ](
+        ws["c2"],
+        topk_weights,
+        inverse,
+        row_mask_ptr,
+        out,
+        H,
+        ws["c2"].stride(0),
+        topk_weights.stride(0),
+        topk_weights.stride(1),
+        out.stride(0),
+        TOP_K=top_k,
+        HAS_ROW_MASK=miss_rows is not None,
+        BLOCK_H=256,
+        num_warps=4,
+    )
+    return out
 
 
 def _moe_w2_forward_fake(
@@ -2368,3 +2683,17 @@ def moe_w2_forward(x, topk_weights, topk_ids, layer_key):
 @functools.cache
 def ready() -> bool:
     return enabled() and _ensure_ready()
+
+
+def shutdown() -> None:
+    """Release model-owned registries/workspaces while retaining cubin modules."""
+    global _n_created, _skip_logged, _stream_logged
+    global _cutoff_cache, _resident_fit_checked
+    _LAYERS.clear()
+    _WS.clear()
+    _n_created = 0
+    _skip_logged = False
+    _stream_logged = False
+    _cutoff_cache = None
+    _resident_fit_checked = False
+    ready.cache_clear()

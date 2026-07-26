@@ -62,8 +62,7 @@ _POOL_HEAT_EVERY_S = max(
     float(os.getenv("VLLM_MOE_W2_POOL_HEAT_EVERY_S", "10")), 1.0)
 # Minimum spacing between manager passes. The manager is event-driven (one
 # pass per step-boundary wake, see _loop/wake_all); this knob only rate
-# limits pathological wake storms and paces the LEGACY polling mode used
-# until the first wake arrives. It is no longer a fixed period: the old
+# limits pathological wake storms. It is no longer a fixed period: the old
 # 5 ms free-running poll cost ~200 passes/s of GIL + CUDA-event syncs +
 # slot churn against the forward thread (measured on GLM-5.2 TP2 base
 # cache: removing it bought +40% decode), while slowing the period starved
@@ -71,11 +70,6 @@ _POOL_HEAT_EVERY_S = max(
 # long-context retrieval. Step-driven passes give fresh recency at step
 # granularity with zero standing overhead.
 _TICK_S = float(os.getenv("VLLM_MOE_W2_DELTA_TICK_MS", "5")) / 1e3
-# Liveness fallback for wake-driven mode: an idle server still gets a pass
-# this often (pending heat dumps, decay, trace), and a tier that never
-# receives wakes keeps the legacy _TICK_S poll instead.
-_FALLBACK_S = max(
-    float(os.getenv("VLLM_MOE_W2_TICK_FALLBACK_MS", "250")) / 1e3, 0.05)
 
 # Observability of the precision tiering (default OFF; behaviour-neutral — only
 # adds logging). Useful for studying the delta in practice: which experts are
@@ -291,12 +285,15 @@ class DeltaTier:
         self._tick = 0
         self._stop = False
         self._thread = None
-        # Step-boundary wakeup (wake()/wake_all()): coalescing event; the
-        # _wake_driven latch flips the loop from legacy polling to pure
-        # event cadence the moment the first signal arrives.
+        # Step-boundary wakeup: coalescing event. Start
+        # event-driven immediately—delta-only recipes previously polled at
+        # 200 Hz until a gate/base signal happened to arrive.
         self._wake = threading.Event()
-        self._wake_driven = False
-        self._last_capture = 0.0    # graph-capture grace (see notify_capture)
+        self._wake_driven = True
+        self._manager_idle = threading.Event()
+        self._manager_idle.set()
+        self._snapshot_event: torch.cuda.Event | None = None
+        self._snapshot_pending = False
         # observability counters: cumulative + per-summary window
         self._n_promoted = 0
         self._n_evicted = 0
@@ -509,59 +506,84 @@ class DeltaTier:
                                         name="moe-w2-delta")
         self._thread.start()
 
+    def close(self) -> None:
+        """Stop background activity before releasing stores/CUDA references."""
+        self._stop = True
+        self._wake.set()
+        thread = self._thread
+        if (thread is not None and thread is not threading.current_thread()
+                and thread.is_alive()):
+            thread.join(timeout=30)
+            if thread.is_alive():
+                raise RuntimeError(
+                    f"moe_w2 {self._tag} manager did not stop within 30 s")
+        self._thread = None
+        try:
+            self._stream.synchronize()
+        finally:
+            store = getattr(self, "_store", None)
+            if store is not None:
+                store.release()
+
     # ---- manager loop ----------------------------------------------------
 
     def _loop(self):
-        # Event-driven cadence: block until a step-boundary wake (or the
-        # liveness fallback), enforce the _TICK_S rate limit, run ONE pass.
+        # Event-driven cadence: block until a completed-step wake, enforce
+        # the _TICK_S rate limit, run ONE pass.  There is deliberately no
+        # idle timeout: spontaneous GPU/store mutation could overlap the
+        # next forward before its safe-point barrier.
         # Tick counts advance per pass, so tick-denominated ages ("cold
         # >= 2 ticks", the seen window, decay/heat cadences) now track
         # steps — matching their original intent of "in-flight graph
         # protection" — instead of wall-clock poll iterations.
         last = 0.0
         while not self._stop:
-            if self._wake_driven:
-                self._wake.wait(timeout=_FALLBACK_S)
-            else:
-                # No wake ever received (no base tier / gate armed in the
-                # runner): keep the legacy fixed-period poll.
-                self._wake.wait(timeout=_TICK_S)
+            self._wake.wait()
             self._wake.clear()
+            if self._stop:
+                break
             gap = _TICK_S - (time.monotonic() - last)
             if gap > 0:
                 time.sleep(gap)
             last = time.monotonic()
+            self._manager_idle.clear()
             try:
                 torch.cuda.set_device(self.dev)
                 self._tick_once()
             except Exception as e:  # noqa: BLE001 - never kill serving
                 logger.warning("delta tick failed: %s", e)
                 time.sleep(1.0)
+            finally:
+                self._manager_idle.set()
+        self._manager_idle.set()
 
     def wake(self):
         """Step-boundary signal (runner thread): run one manager pass as
         soon as the rate limiter allows. Lock-free and coalescing — a burst
         of calls between two passes collapses into one."""
+        if self._thread is None:
+            return
         self._wake_driven = True
+        self._manager_idle.clear()
         self._wake.set()
 
+    def wait_manager_idle(self, timeout: float = 60.0) -> None:
+        """Wait until no manager store/CUDA mutation can overlap a forward."""
+        if not self._manager_idle.wait(timeout=timeout):
+            raise RuntimeError(
+                f"moe_w2 {self._tag} manager did not reach a safe point "
+                f"within {timeout:.0f} s")
+
     def notify_capture(self):
-        """Forward calls this while stream capture is active: the manager
-        idles through the whole capture phase plus a grace window (captures
-        run with thread_local error mode as the primary guard; this avoids
-        even benign allocator interleaving)."""
-        self._last_capture = time.monotonic()
+        """Compatibility hook; manager commits occur only after step_end."""
 
     def _tick_once(self):
-        if time.monotonic() - self._last_capture < 5.0:
-            return
         self._tick += 1
         with self._snap_lock:
-            with torch.cuda.stream(self._stream):
-                self._seen_host.copy_(self.seen, non_blocking=True)
-                ev = torch.cuda.Event()
-                ev.record(self._stream)
-            ev.synchronize()
+            if not self._snapshot_pending or self._snapshot_event is None:
+                return
+            self._snapshot_event.synchronize()
+            self._snapshot_pending = False
             seen = self._seen_host.nonzero()
             # token counts for the hit-rate below — read under the snap lock
             # so a concurrent snapshot can't swap the values underneath.
@@ -619,15 +641,7 @@ class DeltaTier:
                         bar = floor * _PROMO_HYST + 4.0
                         cand = [(li, ei) for li, ei in cand
                                 if float(self._freq[li, ei]) > bar]
-                promoted = 0
-                for li, ei in cand:
-                    if promoted >= _PROMOTE_PER_TICK:
-                        break
-                    slot = self._take_slot()
-                    if slot is None:
-                        break
-                    self._promote(li, ei, slot)
-                    promoted += 1
+                self._promote_batch(cand[:_PROMOTE_PER_TICK])
             now = time.monotonic()
             if now - self._last_decay_t >= _DECAY_EVERY_S:
                 # exponent scales with real elapsed time, so the half-life is
@@ -636,10 +650,6 @@ class DeltaTier:
                 self._freq *= f  # keep the frequency signal recent + bounded
                 self._need *= f  # need decays too -> tracks RECENT 2-bit misses
                 self._last_decay_t = now
-        # reset flags for the next window (racy with the forward's scatter
-        # of ones — a lost flag only delays promotion by one tick)
-        if self._tick % 4 == 0:
-            self.seen.zero_()
         # PILOT (router-lookahead) consumption: prefetch the experts the
         # in-graph predictor flagged for upcoming layers. 5 ms ticks against
         # a 30-60 ms step: fetched bytes typically land before the step's
@@ -938,20 +948,33 @@ class DeltaTier:
         return slots[0] if slots else None
 
     def _promote(self, li, ei, slot):
-        row = self._store.rows_for([(li, ei)])[0]
-        with torch.cuda.stream(self._stream):
-            self.pool[slot].copy_(row, non_blocking=True)
-            ev = torch.cuda.Event()
-            ev.record(self._stream)
-        ev.synchronize()           # bytes resident BEFORE mapping
-        # The MANAGER thread runs this: its slot_table write must order
-        # against graph replays on the forward stream. Today that ordering
-        # comes from the thread's current stream being the LEGACY default
-        # stream (device-wide serializing) — make that explicit instead of
-        # accidental (review 2.5: a vLLM move to per-thread streams would
-        # silently break the mapping-after-bytes guarantee).
-        with torch.cuda.stream(torch.cuda.default_stream(self.dev)):
-            self.slot_table[li, ei] = slot
+        try:
+            row = self._store.rows_for([(li, ei)])[0]
+            # Bytes and mapping publish are one ordered side-stream
+            # transaction. The runner waits for manager_idle before the next
+            # forward, so no graph can observe a half-committed slot.
+            with torch.cuda.stream(self._stream):
+                self.pool[slot].copy_(row, non_blocking=True)
+                self.slot_table[li, ei] = slot
+                ev = torch.cuda.Event()
+                ev.record(self._stream)
+            ev.synchronize()
+        except BaseException:
+            # _take_slots_batch already unpublished any victim. Quarantine
+            # the failed contents as a free/unmapped slot rather than leaving
+            # stale ownership that permanently leaks capacity.
+            with torch.cuda.stream(self._stream):
+                self.slot_table[li, ei] = -1
+                ev = torch.cuda.Event()
+                ev.record(self._stream)
+            ev.synchronize()
+            self._mirror[li, ei] = -1
+            self._owner_li[slot] = -1
+            self._owner_ei[slot] = -1
+            self._owner_tick[slot] = 0
+            if slot not in self._free:
+                self._free.append(slot)
+            raise
         self._mirror[li, ei] = slot
         self._own(slot, li, ei)
         self._n_promoted += 1
@@ -959,6 +982,49 @@ class DeltaTier:
         if _TRACE >= 2:
             logger.info("[%s] promote L%-2d E%-3d  slot %-4d (tick %d)",
                         self._tag, li, ei, slot, self._tick)
+
+    def _promote_batch(self, candidates) -> int:
+        """Manager safe-point promotion with one store batch and one sync."""
+        if not candidates:
+            return 0
+        slots = self._take_slots_batch(len(candidates))
+        plan = list(zip(candidates, slots))
+        if not plan:
+            return 0
+        try:
+            rows = self._store.rows_for([pair for pair, _ in plan])
+            with torch.cuda.stream(self._stream):
+                for ((li, ei), slot), row in zip(plan, rows):
+                    self.pool[slot].copy_(row, non_blocking=True)
+                    self.slot_table[li, ei] = slot
+                event = torch.cuda.Event()
+                event.record(self._stream)
+            event.synchronize()
+        except BaseException:
+            with torch.cuda.stream(self._stream):
+                for (li, ei), _slot in plan:
+                    self.slot_table[li, ei] = -1
+                event = torch.cuda.Event()
+                event.record(self._stream)
+            event.synchronize()
+            for (li, ei), slot in plan:
+                self._mirror[li, ei] = -1
+                self._owner_li[slot] = -1
+                self._owner_ei[slot] = -1
+                self._owner_tick[slot] = 0
+                if slot not in self._free:
+                    self._free.append(slot)
+            raise
+        for (li, ei), slot in plan:
+            self._mirror[li, ei] = slot
+            self._own(slot, li, ei)
+            self._n_promoted += 1
+            self._win_promoted += 1
+            if _TRACE >= 2:
+                logger.info(
+                    "[%s] promote L%-2d E%-3d  slot %-4d (tick %d)",
+                    self._tag, li, ei, slot, self._tick)
+        return len(plan)
 
     # ---- confidence-gated re-forward (directive 2 / Step B) --------------
 
@@ -968,13 +1034,11 @@ class DeltaTier:
         pinned against eviction until the next step_begin — the fixed-point
         replay's passes must never cannibalize each other's fetches.
 
-        Doubles as the manager's step-boundary signal: every live tier
-        (base AND fp4) gets one pass per step instead of a free-running
-        poll."""
+        Manager work is scheduled by step_end and must finish before the next
+        model forward."""
         with self._lock:
             self._step_pins.clear()
             self._layer_pins.clear()
-        wake_all()
 
     def step_end(self) -> None:
         """Close this step's SEEN window (runner: after the replay loop /
@@ -1006,10 +1070,20 @@ class DeltaTier:
         here restores the one-step scope on every config. Ported as
         knowledge from fin-03 commit 6e4af0052 (its gate line diverged
         pre-fire-floor; the fix concept carries verbatim)."""
-        self.seen.zero_()
+        main = torch.cuda.current_stream(self.dev)
+        with self._snap_lock:
+            with torch.cuda.stream(self._stream):
+                self._stream.wait_stream(main)
+                self._seen_host.copy_(self.seen, non_blocking=True)
+                self.seen.zero_()
+                event = torch.cuda.Event()
+                event.record(self._stream)
+            self._snapshot_event = event
+            self._snapshot_pending = True
         with self._lock:
             self._step_pins.clear()
             self._layer_pins.clear()
+        self.wake()
 
     # ---- draft-affinity prefetch (VLLM_MOE_W2_PREFETCH=1) ------------------
 
@@ -1725,28 +1799,31 @@ def base_miss_tol() -> int:
     return _base_tol_dyn
 
 
-# Adaptive fixed-point replay policy. Pass 1 is MANDATORY above the
-# tolerance band (it restores every first-order miss — the bulk of the
-# quality). Further passes chase SECOND-ORDER misses (corrected layers
-# re-routing onto unfetched experts) and only run while the step is within
-# FP_THRESH of miss-free: that yields strict, bit-deterministic fixed
-# points for extra passes, while on shifting content (fresh prose: 100+
-# missing pairs, residue stays large) the loop stops at 2 forwards/step —
-# the old single-replay cost — instead of burning 3x+ chasing a moving
-# target. The accepted residue is second-order only, small, and
-# KPI-visible ("fp-residue"). DEFAULT 0 = mandatory pass only: measured
-# A/B (GLM TP2 46 GiB pool, runtime thresh flip, same server, fox 384
-# med 5): thresh=16 -> 19.2 tok/s, thresh=0 -> 28.3 at unchanged quality
-# probes (needle 36K PASS, arithmetic ok) — the second-order chase cost
-# ~35% decode for residue the pre-fixed-point stack silently kept
-# anyway, plus first-order restoration on top. DS4 1x5090 14 GiB:
-# thresh-insensitive (31.2 vs 31.4 — residue >16 either way). Raise for
-# bit-determinism studies on converged working sets. THRESH is
-# file-tunable at runtime (sweep idiom of TAU/TOL); FP_MAX bounds
-# pathological ping-pong.
-_FP_MAX = int(os.getenv("VLLM_MOE_W2_FP_MAX", "8"))
+# Fixed-point replay policy. STRICT is the correctness default: replay until
+# no miss above tolerance remains, or fail the request after FP_MAX rather
+# than return logits with zeroed expert contributions. APPROXIMATE is an
+# explicit degraded-quality mode preserving the historical adaptive policy:
+# pass 1 is mandatory, then SECOND-ORDER misses are chased only while the
+# residue is within FP_THRESH of miss-free. The old policy was materially
+# faster on GLM TP2 (threshold 0: 28.3 tok/s; threshold 16: 19.2), but silently
+# accepted residue. Select it only through VLLM_MOE_W2_REPLAY_MODE=approximate
+# and report that fact in the recipe/result. THRESH remains file-tunable for
+# that mode; FP_MAX bounds pathological ping-pong in both modes. Eight passes
+# were insufficient on DS4 base52+delta17: MTP0/1/2 each eventually retained
+# 1-2 pairs and failed closed, while 32 converged and restored paired GPQA
+# parity. The extra passes run only on second-order miss steps.
+_FP_MAX = int(os.getenv("VLLM_MOE_W2_FP_MAX", "32"))
+if _FP_MAX < 1:
+    raise ValueError(
+        f"VLLM_MOE_W2_FP_MAX must be positive, got {_FP_MAX}")
 _FP_THRESH = int(os.getenv("VLLM_MOE_W2_FP_THRESH", "0"))
 _FP_THRESH_FILE = os.getenv("VLLM_MOE_W2_FP_THRESH_FILE", "")
+_REPLAY_MODE = os.getenv(
+    "VLLM_MOE_W2_REPLAY_MODE", "strict").strip().lower()
+if _REPLAY_MODE not in ("strict", "approximate"):
+    raise ValueError(
+        "VLLM_MOE_W2_REPLAY_MODE must be strict|approximate, got "
+        f"{_REPLAY_MODE!r}")
 _fp_thresh_dyn = _FP_THRESH
 _fp_thresh_mtime = -1.0
 
@@ -1772,11 +1849,41 @@ def fp_continue(passes: int, max_miss: int) -> bool:
     """Should the runner run another replay pass? (adaptive policy above)"""
     if max_miss <= base_miss_tol():
         return False            # inside the tolerance band (or miss-free)
-    if passes == 0:
-        return True             # first-order restore is mandatory
     if passes >= _FP_MAX:
         return False            # hard bound on ping-pong
+    if _REPLAY_MODE == "strict":
+        return True             # correctness mode: converge or fail closed
+    if passes == 0:
+        return True             # first-order restore is mandatory
     return max_miss <= fp_thresh()
+
+
+def fp_validate_complete(max_miss: int) -> None:
+    """Fail closed when strict replay exhausted its bound with residue."""
+    if (_REPLAY_MODE == "strict"
+            and max_miss > base_miss_tol()):
+        raise RuntimeError(
+            "moe_w2 strict base-cache replay did not converge: "
+            f"{max_miss} missing pairs remain after {_FP_MAX} passes "
+            f"(tolerance {base_miss_tol()}); grow the base pool or set "
+            "VLLM_MOE_W2_REPLAY_MODE=approximate with explicit degraded-"
+            "quality consent")
+
+
+def gate_validate_base_clean(max_miss: int) -> None:
+    """A gate re-forward runs after the base fixed-point loop.
+
+    It may re-route onto a base expert that was not resident in the accepted
+    base pass. Strict mode cannot return those zero-contribution logits; the
+    base and gate loops are not yet unified, so fail closed. Approximate mode
+    retains its explicit degraded-quality contract.
+    """
+    if (_REPLAY_MODE == "strict"
+            and max_miss > base_miss_tol()):
+        raise RuntimeError(
+            "moe_w2 strict FP4 gate replay introduced "
+            f"{max_miss} base-cache missing pairs after the base replay "
+            "already converged; refusing zero-contribution logits")
 
 
 # Base-cache KPI cadence: every N runner steps log the per-STEP replay rate,
@@ -1842,18 +1949,17 @@ def check_pool_floor(top_k: int, n_spec: int, max_num_seqs: int) -> None:
     hold a step's experts even with perfect eviction — the emergency path
     then leaves routed experts ZEROED (silent quality corruption; measured
     on DS4+MTP2: 11 GiB pool -> corrupted math, 14 GiB -> clean). Floor:
-        pairs = moe_layers x top_k x (1 + n_spec) x sqrt(min(seqs, 4))
-    (sqrt: concurrent decodes overlap heavily on hot experts). HARD floor
+        pairs = moe_layers x top_k x (1 + n_spec) x min(seqs, 4)
+    (worst case: concurrent requests have disjoint routed sets). HARD floor
     1.15x pairs (below the measured-bad anchor stays below it), comfort
     1.40x (the measured-good anchor stays above it).
 
     FP4 need-pool (gate): pool < one step's routed set means a fire can
-    NEVER cover its own step (partial upgrades regardless of
-    GATE_MAX_PROMOTE) — degraded recovery, not corruption: WARN only.
+    NEVER cover its own step. Refuse unless FORCE_POOL explicitly consents
+    to measured-degraded partial recovery.
     """
-    import math
     force = os.getenv("VLLM_MOE_W2_FORCE_POOL", "0") == "1"
-    seq_f = math.sqrt(float(min(max(max_num_seqs, 1), 4)))
+    seq_f = float(min(max(max_num_seqs, 1), 4))
     t = _BASE_TIER
     if t is not None and len(t._store) > 0:
         pairs = int(len(t._store) * top_k * (1 + n_spec) * seq_f)
@@ -1921,34 +2027,32 @@ def check_pool_floor(top_k: int, n_spec: int, max_num_seqs: int) -> None:
             # feature — see internal/EAGER_FIRE_NEXT_SESSION.md. The
             # warning must not promise it (review finding 2.4).
             d._sub_floor = True
+            msg = (
+                f"moe_w2 FP4 need-pool is below the FIRE FLOOR: "
+                f"{d.n_slots} slots < {fire_floor} ({len(d._store)} MoE "
+                f"layers x top-{top_k} x (1+{n_spec} spec) x "
+                f"{max_num_seqs} seqs x {fp_growth:.2f} FP-growth = "
+                f"~{fire_floor * d.slot_bytes / 2**30:.1f} GiB). Gate "
+                "fires can only PARTIALLY upgrade their step and tau->1 "
+                "does not converge to native. Raise DELTA_GB, reduce "
+                "spec/sequences, disable the gate, or set "
+                "VLLM_MOE_W2_FORCE_POOL=1 as explicit degraded-quality "
+                "consent.")
+            if not force:
+                raise ValueError(msg)
             logger.warning(
-                "moe_w2 FP4 need-pool is below the FIRE FLOOR: %d slots "
-                "< %d (%d MoE layers x top-%d x (1+%d spec) x %d seqs x "
-                "%.2f FP-growth = ~%.1f GiB). Serving continues in "
-                "DEGRADED mode: gate fires can only PARTIALLY upgrade "
-                "their step; promotions stay capped by GATE_MAX_PROMOTE "
-                "(default 64 = the measured-best sub-floor operating "
-                "point; do NOT set 0/unlimited here — measured churn "
-                "regression). tau->1 does NOT converge to native on a "
-                "sub-floor pool. For full graph-mode fires raise "
-                "VLLM_MOE_W2_DELTA_GB or reduce num_speculative_tokens/"
-                "max_num_seqs.",
-                d.n_slots, fire_floor, len(d._store), top_k, n_spec,
-                max_num_seqs, fp_growth,
-                fire_floor * d.slot_bytes / 2**30)
+                "%s Serving continues in FORCED DEGRADED mode; promotions "
+                "must remain capped (GATE_MAX_PROMOTE default 64).", msg)
 
     # ---- config-coherence guards (review finding 2.3): contradictory
     # env combinations used to fail silently or pay dead per-step costs.
     from vllm.model_executor.layers.quantization.utils import (
         moe_w2_cubit, moe_w2_gate)
     if moe_w2_gate.enabled() and _TIER is None:
-        # gate without a delta tier: the decision (topk + logsumexp +
-        # .item() sync) would run EVERY step and force_promote would
-        # no-op forever — pure hot-path waste. Disable loudly.
-        moe_w2_gate.disable(
+        raise ValueError(
             "VLLM_MOE_W2_GATE=1 but no FP4 delta tier exists "
-            "(VLLM_MOE_W2_DELTA_GB unset/0) — the gate cannot promote "
-            "anything; disabling to avoid a dead per-step sync.")
+            "(VLLM_MOE_W2_DELTA_GB unset/0) — the gate cannot recover "
+            "precision. Disable the gate or allocate a valid delta pool.")
     decode_cap = max(max_num_seqs, 1) * (1 + n_spec)
     if moe_w2_cubit._PREFILL_T < decode_cap:
         raise ValueError(
@@ -1961,16 +2065,15 @@ def check_pool_floor(top_k: int, n_spec: int, max_num_seqs: int) -> None:
     try:
         from vllm.config import get_current_vllm_config
         pc = get_current_vllm_config().parallel_config
-        if _BASE_TIER is not None and (
+        if moe_w2_cubit.enabled() and (
                 getattr(pc, "use_ubatching", False)
                 or getattr(pc, "ubatch_size", 0)):
             raise ValueError(
-                "BASE cache x micro-batching (ubatch/DBO) is unsupported: "
-                "the in-graph miss counter is zeroed at layer 0 of EVERY "
-                "forward, so the second ubatch erases the first ubatch's "
-                "misses -> the runner skips the restore replay and serves "
-                "ZEROED expert contributions. Disable ubatching or the "
-                "base cache.")
+                "VLLM_MOE_W2 x micro-batching (ubatch/DBO) is unsupported: "
+                "all W2 modes share process-global CUDA workspaces, and the "
+                "base cache additionally shares one in-graph miss counter. "
+                "Concurrent ubatches can overwrite descriptors/outputs or "
+                "erase misses. Disable ubatching or VLLM_MOE_W2.")
     except ValueError:
         raise
     except Exception:  # noqa: BLE001 - config introspection best-effort
@@ -1991,10 +2094,11 @@ def spec_suppressed() -> bool:
 
 
 def wake_all() -> None:
-    """Step-boundary broadcast: nudge every live tier's manager (base +
-    fp4/delta) to run one pass. Called once per decode step from
-    step_begin (base-cache configs) and the gate decision (delta-only
-    configs); lock-free, coalescing, safe before tiers exist."""
+    """Explicitly schedule one safe-point manager pass for every live tier.
+
+    Normal runner lifecycle calls each tier's step_end(), which wakes only
+    that tier exactly once. This broadcast remains for offline tools.
+    """
     t = _BASE_TIER
     if t is not None:
         t.wake()
@@ -2104,3 +2208,26 @@ def get_tier(n_layers=None, n_experts=256, dev=None,
         # inactive (pool allocated but no promotions).
         _TIER.start()
     return _TIER
+
+
+def shutdown() -> None:
+    """Idempotently stop and release both process-global residency tiers."""
+    global _BASE_TIER, _TIER
+    errors = []
+    base, delta = _BASE_TIER, _TIER
+    if base is not None:
+        try:
+            base.close()
+            _BASE_TIER = None
+        except Exception as e:
+            errors.append(e)
+    if delta is not None:
+        try:
+            delta.close()
+            _TIER = None
+        except Exception as e:
+            errors.append(e)
+    if errors:
+        raise RuntimeError(
+            "moe_w2 residency shutdown failed: "
+            + "; ".join(str(e) for e in errors))

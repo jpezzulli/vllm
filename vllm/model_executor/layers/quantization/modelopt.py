@@ -149,28 +149,13 @@ def _maybe_dense_fp8_method(prefix: str, layer):
     and kv_b_proj — the MLA impl unpacks its weight into the w_kc/w_vc
     einsum operands at load, and it is only ~4 MB/layer/rank anyway.
     """
-    mode = os.getenv("VLLM_MOE_W2_DENSE_FP8", "0")
-    if mode not in ("1", "attn", "l0"):
+    mode = os.getenv("VLLM_MOE_W2_DENSE_FP8", "0").strip().lower()
+    if mode in ("", "0"):
         return None
-    if not isinstance(layer, LinearBase):
-        return None
-    p = prefix or ""
-    if ".kv_b_proj" in p:
-        return None
-    # "l0": ONLY the first dense MLP — bisection mode (no shared experts,
-    # no attention; the plain-Linear proof case). "1": + shared experts.
-    # "attn": + attention projections. Bring-up so far: both "1" and "attn"
-    # produced NaN logits — suspects are the MoE runner touching shared
-    # expert weights outside LinearMethod.apply, and the MLA absorption
-    # reading module weights raw; "l0" isolates the base mechanism.
-    targets = ".layers.0." in p and ".mlp." in p
-    if mode in ("1", "attn"):
-        targets = targets or ".shared_experts." in p
-    if mode == "attn":
-        targets = targets or ".self_attn." in p
-    if targets:
-        return _OnlineFp8LinearMethod.build()
-    return None
+    raise ValueError(
+        "VLLM_MOE_W2_DENSE_FP8 is an unsafe bring-up experiment: the "
+        "'1' and 'attn' modes produced NaN logits and the path has no "
+        "release-quality finite-output coverage. Unset it for serving.")
 
 
 class _OnlineFp8LinearMethod:
@@ -1762,7 +1747,8 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
 
     @property
     def supports_eplb(self) -> bool:
-        return True
+        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
+        return not moe_w2_cubit.enabled()
 
     def apply_monolithic(
         self,
@@ -1805,8 +1791,11 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         if w2_key is not None:
             from vllm.model_executor.layers.quantization.utils import (
                 moe_w2_cubit)
-            assert layer.expert_map is None and \
-                not layer.apply_router_weight_on_input
+            if (layer.expert_map is not None
+                    or layer.apply_router_weight_on_input):
+                raise RuntimeError(
+                    "VLLM_MOE_W2 does not support expert maps/EPLB or "
+                    "router-weight-on-input")
             return moe_w2_cubit.moe_w2_forward(x, topk_weights, topk_ids,
                                                w2_key)
 

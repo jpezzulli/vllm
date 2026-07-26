@@ -27,7 +27,26 @@ Plane layout (fragment-major, per expert weight matrix [N, K]):
   => plane bytes = N/16 * K/64 * 32 lanes * 8 = N*K/4.
 """
 
+import os
+
 import torch
+
+# Persistent planes/packs must be invalidated whenever the quantization,
+# section ordering, scale encoding or fragment-major layout changes.  Keep
+# this value data-oriented (rather than tying it to a git SHA) so harmless
+# code changes do not force multi-hundred-GiB rebuilds.
+MOE_W2_QUANTIZER_ABI = "tsym4-e8m0-fragmajor-a32-v2"
+_ZERO_MODES = frozenset(("auto", "sign", "alt"))
+
+
+def zero_mode() -> str:
+    """Return the validated exact-zero sign policy used by the quantizer."""
+    mode = os.getenv("VLLM_MOE_W2_ZERO_MODE", "auto").strip().lower()
+    if mode not in _ZERO_MODES:
+        raise ValueError(
+            "VLLM_MOE_W2_ZERO_MODE must be one of auto|sign|alt, "
+            f"got {mode!r}")
+    return mode
 
 # e2m1 nibble -> 2-bit code (tensor-sym {-4,-1,1,4}), validated against
 # tools/repack_expert_bits.py in tools/test_moe_w2_planes.py.
@@ -264,15 +283,14 @@ def _f64_to_codes_scales(
                           _E2M1_MID.to(w.device)).to(torch.uint8)
     neg = torch.signbit(u).reshape(N, K)
 
-    import os
-    zero_mode = os.getenv("VLLM_MOE_W2_ZERO_MODE", "auto")
-    if zero_mode != "sign":
+    mode = zero_mode()
+    if mode != "sign":
         zero = (u == 0.0).reshape(N, K)
         nz = int(zero.sum())
         if nz:
             nneg = int(neg[zero].sum())
             one_signed = min(nneg, nz - nneg) < 0.05 * nz
-            if zero_mode == "alt" or (zero_mode == "auto" and one_signed):
+            if mode == "alt" or (mode == "auto" and one_signed):
                 # k-position parity: deterministic, block-local ~balance
                 parity = (torch.arange(K, device=w.device, dtype=torch.uint8)
                           & 1).view(1, K).expand(N, K)
@@ -286,7 +304,7 @@ def _f64_to_codes_scales(
 def fp8_block_to_codes_scales(
     w_fp8: torch.Tensor,
     s_block: torch.Tensor,
-    block: int = 128,
+    block_shape: tuple[int, int] | list[int] | int = (128, 128),
     want_nibbles: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """FP8 block-quant checkpoint expert -> (2-bit codes, UE8M0 scale bytes).
@@ -301,9 +319,26 @@ def fp8_block_to_codes_scales(
     sweep) feeds the optional delta tier's FP4 planes.
     """
     N, K = w_fp8.shape
+    if isinstance(block_shape, int):
+        block_n = block_k = block_shape
+    else:
+        if len(block_shape) != 2:
+            raise ValueError(
+                f"FP8 block shape must have two dimensions, got "
+                f"{block_shape!r}")
+        block_n, block_k = (int(block_shape[0]), int(block_shape[1]))
+    if block_n <= 0 or block_k <= 0:
+        raise ValueError(f"invalid FP8 block shape {(block_n, block_k)}")
+    expected = ((N + block_n - 1) // block_n,
+                (K + block_k - 1) // block_k)
+    if tuple(s_block.shape) != expected:
+        raise ValueError(
+            f"FP8 block scale shape {tuple(s_block.shape)} does not match "
+            f"weight {(N, K)} / block {(block_n, block_k)} -> {expected}")
     w = w_fp8.double()
     sb = s_block.double()
-    s = sb.repeat_interleave(block, 0)[:N].repeat_interleave(block, 1)[:, :K]
+    s = (sb.repeat_interleave(block_n, 0)[:N]
+         .repeat_interleave(block_k, 1)[:, :K])
     return _f64_to_codes_scales(w * s, want_nibbles)
 
 

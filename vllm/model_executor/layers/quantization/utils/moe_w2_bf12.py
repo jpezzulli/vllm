@@ -116,6 +116,17 @@ _SCRATCH: dict[tuple, torch.Tensor] = {}
 _AUX_STREAM_ID: int | None = None
 
 
+def shutdown() -> None:
+    """Release process-global BF12 references between in-process engines."""
+    global _AUX_STREAM_ID
+    _LAYER_NAMES.clear()
+    _LAYER_REFS.clear()
+    _LAYER_PRIVATE.clear()
+    _MISMATCH_LOGGED.clear()
+    _SCRATCH.clear()
+    _AUX_STREAM_ID = None
+
+
 def _aux_stream_id() -> int | None:
     global _AUX_STREAM_ID
     if _AUX_STREAM_ID is None:

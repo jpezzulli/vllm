@@ -127,6 +127,21 @@ _n_reforwarded = 0
 _n_promoted = 0
 
 
+def shutdown() -> None:
+    """Reset mutable gate state between in-process engines."""
+    global _ENABLED, _tau_dyn, _tau_mtime, _mp_dyn, _mp_mtime
+    global _n_steps, _n_fired, _n_reforwarded, _n_promoted
+    _ENABLED = os.getenv("VLLM_MOE_W2_GATE", "0") == "1"
+    _tau_dyn = _TAU
+    _tau_mtime = -1.0
+    _mp_dyn = _MAX_PROMOTE
+    _mp_mtime = -1.0
+    _n_steps = 0
+    _n_fired = 0
+    _n_reforwarded = 0
+    _n_promoted = 0
+
+
 def enabled() -> bool:
     return _ENABLED
 
@@ -229,12 +244,6 @@ def should_reforward(logits: torch.Tensor, spec=None) -> bool:
     """
     global _n_steps, _n_fired
     _n_steps += 1
-    # Step-boundary signal for the tier managers: this is the one gate call
-    # guaranteed once per decode step, so delta-only configs (no base tier,
-    # hence no runner step_begin) still get event-driven manager passes
-    # instead of the legacy free-running poll.
-    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
-    moe_w2_delta.wake_all()
     if logits is None or logits.numel() == 0:
         return False
     if logits.dim() == 1:

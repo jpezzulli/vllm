@@ -148,15 +148,31 @@ def allocate_widths(
     calibrated survivals. Survival is a cumprod, so thresholding yields
     valid prefixes.
     """
-    a = survival_view * cal_t
+    a = (survival_view * cal_t)[:, :length]
+    # Calibration is position-wise and can make raw scores non-monotonic.
+    # Project back onto a valid survival curve so every selected width is a
+    # prefix. cummin preserves the conservative interpretation.
+    a = torch.cummin(a, dim=1).values
     if tau > 0.0:
-        return (a >= tau).sum(dim=1, dtype=torch.int32)
-    a = a[:, :length]
-    budget = min(int(num_reqs * length * budget_frac) + 1, num_reqs * length)
+        return (a >= tau).sum(dim=1, dtype=torch.int32).clamp_max_(length)
+    budget = min(
+        max(int(num_reqs * length * budget_frac), 0),
+        num_reqs * length,
+    )
+    if budget == 0:
+        return torch.zeros(
+            num_reqs, dtype=torch.int32, device=a.device)
     flat = a.reshape(-1)
     if budget < flat.numel():
-        th = torch.topk(flat, budget, sorted=False).values.min()
-        return (a >= th).sum(dim=1, dtype=torch.int32)
+        # Stable descending order makes equal-score positions deterministic.
+        # The projected rows are non-increasing and flattened prefix-first,
+        # therefore the first `budget` positions are prefix-closed while
+        # using the budget exactly.
+        selected = torch.zeros_like(flat, dtype=torch.bool)
+        order = torch.argsort(flat, descending=True, stable=True)
+        selected.scatter_(0, order[:budget], True)
+        return selected.view(num_reqs, length).sum(
+            dim=1, dtype=torch.int32)
     return torch.full((num_reqs,), length, dtype=torch.int32, device=a.device)
 
 

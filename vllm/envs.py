@@ -2008,9 +2008,23 @@ def is_set(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+_MOET_EXTENSION_ENV_PREFIXES = (
+    "VLLM_MOE_W2",
+    "VLLM_DCP_SPARSE_",
+    "VLLM_NVFP4_DS_MLA_",
+    "VLLM_SPARSE_MLA_",
+)
+
+
+def _is_moet_extension_env(name: str) -> bool:
+    return name.startswith(_MOET_EXTENSION_ENV_PREFIXES)
+
+
 def validate_environ(hard_fail: bool) -> None:
     for env in os.environ:
-        if env.startswith("VLLM_") and env not in environment_variables:
+        if (env.startswith("VLLM_")
+                and env not in environment_variables
+                and not _is_moet_extension_env(env)):
             if hard_fail:
                 raise ValueError(f"Unknown vLLM environment variable detected: {env}")
             else:
@@ -2111,6 +2125,14 @@ def compile_factors() -> dict[str, object]:
             continue
 
         factors[factor] = normalize_value(raw)
+
+    # The MoET overlay keeps backwards-compatible env aliases outside the
+    # upstream typed registry. They still affect graph shapes, residency and
+    # numerics, so include every explicitly set extension value in compile
+    # cache identity instead of warning and silently omitting it.
+    for factor, raw in os.environ.items():
+        if _is_moet_extension_env(factor):
+            factors[factor] = normalize_value(raw)
 
     ray_noset_env_vars = [
         # Refer to

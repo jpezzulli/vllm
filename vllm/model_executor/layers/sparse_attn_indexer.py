@@ -416,6 +416,10 @@ def sparse_attn_indexer(
         # match under interleave=1 striping). The buffer tail beyond the
         # quota stays -1 and is skipped by the sparse kernel.
         dcp_local_quota = dcp_world_size > 1 and dcp_local_topk
+        if dcp_local_quota and topk_tokens % dcp_world_size != 0:
+            raise ValueError(
+                "DCP local top-k requires topk_tokens divisible by "
+                f"dcp_world_size; got {topk_tokens} and {dcp_world_size}")
         k_select = topk_tokens // dcp_world_size if dcp_local_quota else topk_tokens
         topk_indices = topk_indices_buffer[:num_padded_tokens, :k_select]
 
@@ -627,6 +631,11 @@ class SparseAttnIndexer(CustomOp):
                 "indexer cache."
             )
             if self.dcp_local_topk:
+                if topk_tokens % self.dcp_world_size != 0:
+                    raise ValueError(
+                        "VLLM_DCP_SPARSE_LOCAL_TOPK requires topk_tokens "
+                        "divisible by dcp_world_size; got "
+                        f"{topk_tokens} and {self.dcp_world_size}")
                 logger.info_once(
                     "DCP DSA indexer decode top-k: LOCAL quota "
                     "(top-%d per rank, no per-layer collective). "

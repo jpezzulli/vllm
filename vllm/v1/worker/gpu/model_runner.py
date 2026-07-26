@@ -618,7 +618,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                if pre_hc_hidden_states is not None:
+                    spec_hidden_states = pre_hc_hidden_states[
+                        : hidden_states.shape[0]]
             self.speculator.propose(
                 input_batch=input_batch,
                 attn_metadata=attn_metadata,
@@ -1223,16 +1225,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
-            # Dynamic SD: hand the speculator the engine-scheduled next-step
-            # width (K=0 skips the draft forward). Gated on the LIVE config --
-            # the table may be auto-injected after worker init via the shared
-            # config object -- and never written on the static path, where it
-            # would pin the worker-side scheduler to full gamma.
+            # Hand DSpark the engine-owned next-step width on every worker.
+            # Without a dynamic table this is the configured full gamma; with
+            # one it is the selected K. Rank-local timing/EMA must never choose
+            # a different collective shape under TP/DCP.
             spec_cfg = self.vllm_config.speculative_config
             if (
                 hasattr(self.speculator, "next_k_hint")
                 and spec_cfg is not None
-                and spec_cfg.uses_dynamic_speculative_decoding()
+                and spec_cfg.method == "dspark"
             ):
                 self.speculator.next_k_hint = (
                     scheduler_output.num_spec_tokens_to_schedule
@@ -1611,7 +1612,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                if pre_hc_hidden_states is not None:
+                    spec_hidden_states = pre_hc_hidden_states[
+                        : hidden_states.shape[0]]
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,

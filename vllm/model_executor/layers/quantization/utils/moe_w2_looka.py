@@ -79,6 +79,19 @@ _hit: torch.Tensor | None = None          # i64 [2]
 _tot: torch.Tensor | None = None          # i64 [2]
 
 
+def shutdown() -> None:
+    """Release model/router references between in-process engines."""
+    global _armed, _pred_buf, _pilot_log, _pilot_host, _hit, _tot
+    _armed = False
+    _gate_w.clear()
+    _gate_b.clear()
+    _pred_buf = None
+    _pilot_log = None
+    _pilot_host = None
+    _hit = None
+    _tot = None
+
+
 def enabled() -> bool:
     return _armed and (_LOOKA or _PILOT)
 
