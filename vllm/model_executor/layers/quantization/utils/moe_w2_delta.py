@@ -1870,6 +1870,22 @@ def fp_validate_complete(max_miss: int) -> None:
             "quality consent")
 
 
+def gate_validate_base_clean(max_miss: int) -> None:
+    """A gate re-forward runs after the base fixed-point loop.
+
+    It may re-route onto a base expert that was not resident in the accepted
+    base pass. Strict mode cannot return those zero-contribution logits; the
+    base and gate loops are not yet unified, so fail closed. Approximate mode
+    retains its explicit degraded-quality contract.
+    """
+    if (_REPLAY_MODE == "strict"
+            and max_miss > base_miss_tol()):
+        raise RuntimeError(
+            "moe_w2 strict FP4 gate replay introduced "
+            f"{max_miss} base-cache missing pairs after the base replay "
+            "already converged; refusing zero-contribution logits")
+
+
 # Base-cache KPI cadence: every N runner steps log the per-STEP replay rate,
 # avg missing pairs/step and pool coverage. Always on (INFO, one line per
 # window) because pool sizing is the dominant base-cache perf knob and the

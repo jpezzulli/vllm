@@ -4942,6 +4942,25 @@ class GPUModelRunner(
                                 hidden_states = regated_output
                             sample_hidden_states = hidden_states[logits_indices]
                             logits = self.model.compute_logits(sample_hidden_states)
+                            # The gate loop runs AFTER mandatory base replay.
+                            # Its changed early-layer numerics can route a later
+                            # layer onto a new, non-resident base expert. The
+                            # descriptor then zeroes that contribution; strict
+                            # mode must not return those fail-open logits.
+                            _gate_btier = moe_w2_delta._BASE_TIER
+                            if _gate_btier is not None:
+                                _gate_miss = int(
+                                    _gate_btier.miss_count.item())
+                                if _tp.world_size > 1:
+                                    _gate_miss_t = torch.tensor(
+                                        [_gate_miss], device=logits.device)
+                                    torch.distributed.all_reduce(
+                                        _gate_miss_t,
+                                        op=torch.distributed.ReduceOp.MAX,
+                                        group=_tp.device_group)
+                                    _gate_miss = int(_gate_miss_t.item())
+                                moe_w2_delta.gate_validate_base_clean(
+                                    _gate_miss)
                             gate_collective_active = False
             except Exception as e:
                 if gate_collective_active:
@@ -5083,6 +5102,28 @@ class GPUModelRunner(
                 if _trace:
                     logger.info("[gate-pp] rank=%d (last) replayed -> FP4 logits",
                                 pp.rank_in_group)
+            # Every stage has now forwarded (and non-last stages have sent),
+            # so a TP+PP consensus cannot deadlock the pipeline. A gate replay
+            # happens after stage-local base repair and may introduce new base
+            # misses; strict mode must fail on every rank together.
+            gate_btier = moe_w2_delta._BASE_TIER
+            gate_miss = (
+                int(gate_btier.miss_count.item())
+                if gate_btier is not None else 0)
+            gate_miss_t = torch.tensor(
+                [gate_miss], dtype=torch.int32, device=self.device)
+            if tp.world_size > 1:
+                torch.distributed.all_reduce(
+                    gate_miss_t,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=tp.device_group)
+            if pp.world_size > 1:
+                torch.distributed.all_reduce(
+                    gate_miss_t,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=pp.device_group)
+            moe_w2_delta.gate_validate_base_clean(
+                int(gate_miss_t.item()))
         except Exception as e:
             logger.exception("moe_w2 PP gate re-forward failed mid-pipeline")
             raise RuntimeError(

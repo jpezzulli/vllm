@@ -281,6 +281,18 @@ def test_strict_replay_allows_deep_fixed_point(monkeypatch):
     assert not moe_w2_delta.fp_continue(32, 1)
 
 
+def test_gate_replay_base_misses_follow_replay_contract(monkeypatch):
+    monkeypatch.setattr(moe_w2_delta, "_BASE_MISS_TOL", 0)
+    monkeypatch.setattr(moe_w2_delta, "_BASE_MISS_TOL_FILE", "")
+    monkeypatch.setattr(moe_w2_delta, "_REPLAY_MODE", "strict")
+    moe_w2_delta.gate_validate_base_clean(0)
+    with pytest.raises(RuntimeError, match="gate replay introduced"):
+        moe_w2_delta.gate_validate_base_clean(1)
+
+    monkeypatch.setattr(moe_w2_delta, "_REPLAY_MODE", "approximate")
+    moe_w2_delta.gate_validate_base_clean(1)
+
+
 def test_mandatory_promotion_failure_is_fail_closed():
     from vllm.v1.worker.gpu_model_runner import _moe_w2_promote_consensus
 
