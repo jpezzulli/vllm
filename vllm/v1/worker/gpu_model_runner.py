@@ -956,6 +956,9 @@ class GPUModelRunner(
         # fire decision here. TP/single-GPU re-forwards inline instead.
         self._gate_ctx: dict | None = None
         self._gate_fire: bool = False
+        # One INFO line the first time a gate re-forward re-routes onto a base
+        # pair outside the pool and the shared repair loop fetches it.
+        self._moe_w2_gate_repair_seen: bool = False
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
@@ -4878,6 +4881,19 @@ class GPUModelRunner(
                         # fire floor).
                         _gate_iters = 0
                         _step_budget = moe_w2_gate.step_promote_budget()
+                        _gate_btier = moe_w2_delta._BASE_TIER
+
+                        def _gate_base_miss():
+                            """(this rank's, worst rank's) base misses."""
+                            local = int(_gate_btier.miss_count.item())
+                            if _tp.world_size <= 1:
+                                return local, local
+                            t = torch.tensor([local], device=_gate_btier.dev)
+                            torch.distributed.all_reduce(
+                                t, op=torch.distributed.ReduceOp.MAX,
+                                group=_tp.device_group)
+                            return local, int(t.item())
+
                         while _gate_iters < moe_w2_gate.fire_fp_max():
                             # Promote this rank's COLD routed experts
                             # (per-rank shard side effect, never a per-rank
@@ -4945,20 +4961,77 @@ class GPUModelRunner(
                             # The gate loop runs AFTER mandatory base replay.
                             # Its changed early-layer numerics can route a later
                             # layer onto a new, non-resident base expert. The
-                            # descriptor then zeroes that contribution; strict
-                            # mode must not return those fail-open logits.
-                            _gate_btier = moe_w2_delta._BASE_TIER
+                            # descriptor then zeroes that contribution, so the
+                            # step is repaired the same way the base loop
+                            # repairs its own second-order misses: fetch the
+                            # pairs, replay, re-read — under ONE shared policy
+                            # (moe_w2_delta.gate_repair_continue). Only the
+                            # residue left when that policy stops is fail-open,
+                            # and strict refuses it below.
                             if _gate_btier is not None:
-                                _gate_miss = int(
-                                    _gate_btier.miss_count.item())
-                                if _tp.world_size > 1:
-                                    _gate_miss_t = torch.tensor(
-                                        [_gate_miss], device=logits.device)
-                                    torch.distributed.all_reduce(
-                                        _gate_miss_t,
-                                        op=torch.distributed.ReduceOp.MAX,
-                                        group=_tp.device_group)
-                                    _gate_miss = int(_gate_miss_t.item())
+                                _gate_miss_local, _gate_miss = _gate_base_miss()
+                                _gate_repairs = 0
+                                while moe_w2_delta.gate_repair_continue(
+                                        _gate_repairs, _gate_miss):
+                                    # Same consensus as the base loop: every
+                                    # rank completes its own pack I/O (pinned
+                                    # for the replay that follows) before any
+                                    # rank re-enters the collective.
+                                    _moe_w2_promote_consensus(
+                                        _gate_btier,
+                                        _tp,
+                                        _gate_miss_local,
+                                        pin=True,
+                                        where="TP gate base repair",
+                                    )
+                                    _gate_repairs += 1
+                                    with set_forward_context(
+                                        attn_metadata,
+                                        self.vllm_config,
+                                        num_tokens=num_tokens_padded,
+                                        num_tokens_across_dp=num_tokens_across_dp,
+                                        cudagraph_runtime_mode=cudagraph_mode,
+                                        batch_descriptor=batch_desc,
+                                        ubatch_slices=ubatch_slices_padded,
+                                        slot_mapping=slot_mappings,
+                                        skip_compiled=has_encoder_input,
+                                    ):
+                                        _repair_out = self._model_forward(
+                                            input_ids=input_ids,
+                                            positions=positions,
+                                            intermediate_tensors=intermediate_tensors,
+                                            inputs_embeds=inputs_embeds,
+                                            **model_kwargs,
+                                        )
+                                    if self.use_aux_hidden_state_outputs:
+                                        hidden_states, aux_hidden_states = (
+                                            _repair_out)
+                                    else:
+                                        hidden_states = _repair_out
+                                    sample_hidden_states = hidden_states[
+                                        logits_indices]
+                                    logits = self.model.compute_logits(
+                                        sample_hidden_states)
+                                    _gate_miss_local, _gate_miss = (
+                                        _gate_base_miss())
+                                if _gate_repairs:
+                                    _gate_btier.kpi_gate_repair(_gate_repairs)
+                                    # First repair of the process is INFO: it
+                                    # says the gate is re-routing off a
+                                    # partial base pool, which is a pool-
+                                    # sizing signal and used to be a crash.
+                                    if not self._moe_w2_gate_repair_seen:
+                                        self._moe_w2_gate_repair_seen = True
+                                        logger.info(
+                                            "moe_w2 gate base repair engaged: "
+                                            "%d pass(es), %d missing pairs "
+                                            "left (later repairs at DEBUG)",
+                                            _gate_repairs, _gate_miss)
+                                    else:
+                                        logger.debug(
+                                            "moe_w2 gate base repair: %d "
+                                            "pass(es), %d missing pairs left",
+                                            _gate_repairs, _gate_miss)
                                 moe_w2_delta.gate_validate_base_clean(
                                     _gate_miss)
                             gate_collective_active = False

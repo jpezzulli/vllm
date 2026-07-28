@@ -324,6 +324,7 @@ class DeltaTier:
         self._kpi_unfixed = 0     # experts replay could NOT restore (window)
         self._kpi_deferred = 0    # slotless warm-up fetches (no reader; window)
         self._kpi_2nd = 0         # extra replays for second-order misses
+        self._kpi_gate_repairs = 0  # replays repairing gate-introduced misses
         self._kpi_fp_giveup = 0   # steps that accepted second-order residue
         self._kpi_fp_resid = 0    # residual missing pairs in those steps
         # Slots touched since step_begin(): promoted or hit by any pass of
@@ -1561,6 +1562,8 @@ class DeltaTier:
                         "(benign; pool ~= step working set)")
         if self._kpi_2nd:
             unfixed += (f"; second-order replays: {self._kpi_2nd}")
+        if self._kpi_gate_repairs:
+            unfixed += (f"; gate base repairs: {self._kpi_gate_repairs}")
         if self._kpi_fp_giveup:
             unfixed += (
                 f"; fp-residue: {self._kpi_fp_giveup} steps "
@@ -1586,9 +1589,19 @@ class DeltaTier:
         self._kpi_unfixed = 0
         self._kpi_deferred = 0
         self._kpi_2nd = 0
+        self._kpi_gate_repairs = 0
         self._kpi_fp_giveup = 0
         self._kpi_fp_resid = 0
         self._kpi_prefetched = 0
+
+    def kpi_gate_repair(self, passes: int) -> None:
+        """Runner reports replays spent repairing gate-introduced base misses.
+
+        Each pass is a full extra re-forward, so this is the cost side of
+        serving a gate over a partial base pool — the same knob answer as the
+        replay rate: raise VLLM_MOE_W2_BASE_CACHE_GB.
+        """
+        self._kpi_gate_repairs += passes
 
     def kpi_fp(self, replays: int, residual: int) -> None:
         """Runner reports the step's fixed-point outcome: total replay
@@ -1870,20 +1883,43 @@ def fp_validate_complete(max_miss: int) -> None:
             "quality consent")
 
 
-def gate_validate_base_clean(max_miss: int) -> None:
-    """A gate re-forward runs after the base fixed-point loop.
+def gate_repair_continue(passes: int, max_miss: int) -> bool:
+    """Should the runner repair base misses a gate re-forward introduced?
 
-    It may re-route onto a base expert that was not resident in the accepted
-    base pass. Strict mode cannot return those zero-contribution logits; the
-    base and gate loops are not yet unified, so fail closed. Approximate mode
-    retains its explicit degraded-quality contract.
+    A gate re-forward runs after the base fixed-point loop and upgrades early
+    layers to FP4, which can re-route a later layer onto a base pair outside a
+    partial pool — second-order misses of exactly the kind the base loop
+    already exists to chase. The two loops therefore share ONE policy: strict
+    fetches and replays until the step is miss-free or the bound trips,
+    approximate keeps the mandatory first-order restore plus its THRESH band.
+
+    Without this the gate was unservable over any base pool below full
+    coverage: measured 2026-07-28 on 4x5090 TP4 (base 12 GiB/rank, 64.6%
+    coverage, tau 0.60) the first fire died on all four ranks with 15 gate-
+    introduced misses, and on 1xPRO6000 (base 66 GiB, 88.9% coverage) with 1.
+    """
+    return fp_continue(passes, max_miss)
+
+
+def gate_validate_base_clean(max_miss: int) -> None:
+    """Fail closed when gate-introduced base misses remain unrepaired.
+
+    On the TP/single-GPU path this is reached only after
+    `gate_repair_continue` stopped — converged, or the shared bound
+    exhausted. The PP path keeps its single-pass replay contract, so there
+    the guard still fires on the first re-route. Approximate mode retains its
+    explicit degraded-quality contract in both.
     """
     if (_REPLAY_MODE == "strict"
             and max_miss > base_miss_tol()):
         raise RuntimeError(
-            "moe_w2 strict FP4 gate replay introduced "
-            f"{max_miss} base-cache missing pairs after the base replay "
-            "already converged; refusing zero-contribution logits")
+            "moe_w2 strict FP4 gate replay left "
+            f"{max_miss} base-cache missing pairs unrepaired (tolerance "
+            f"{base_miss_tol()}); the shared gate/base repair loop is "
+            f"bounded at {_FP_MAX} passes and the PP gate replay is "
+            "single-pass by design — grow the base pool or set "
+            "VLLM_MOE_W2_REPLAY_MODE=approximate with explicit "
+            "degraded-quality consent")
 
 
 # Base-cache KPI cadence: every N runner steps log the per-STEP replay rate,

@@ -286,11 +286,42 @@ def test_gate_replay_base_misses_follow_replay_contract(monkeypatch):
     monkeypatch.setattr(moe_w2_delta, "_BASE_MISS_TOL_FILE", "")
     monkeypatch.setattr(moe_w2_delta, "_REPLAY_MODE", "strict")
     moe_w2_delta.gate_validate_base_clean(0)
-    with pytest.raises(RuntimeError, match="gate replay introduced"):
+    with pytest.raises(RuntimeError, match="left 1 base-cache missing"):
         moe_w2_delta.gate_validate_base_clean(1)
 
     monkeypatch.setattr(moe_w2_delta, "_REPLAY_MODE", "approximate")
     moe_w2_delta.gate_validate_base_clean(1)
+
+
+def test_gate_repair_shares_the_base_replay_policy(monkeypatch):
+    """Gate-introduced misses are repaired under the base loop's own policy.
+
+    Strict keeps fetching+replaying until the step is clean or the shared
+    bound trips; approximate keeps the mandatory first-order restore and then
+    only chases residue inside its THRESH band. Anything else would leave the
+    gate unservable over a partial base pool (2026-07-28: 15 misses on 4x5090
+    TP4, 1 on 1xPRO6000).
+    """
+    monkeypatch.setattr(moe_w2_delta, "_BASE_MISS_TOL", 0)
+    monkeypatch.setattr(moe_w2_delta, "_BASE_MISS_TOL_FILE", "")
+    monkeypatch.setattr(moe_w2_delta, "_FP_MAX", 32)
+
+    monkeypatch.setattr(moe_w2_delta, "_REPLAY_MODE", "strict")
+    assert moe_w2_delta.gate_repair_continue(0, 15)
+    assert moe_w2_delta.gate_repair_continue(31, 1)
+    assert not moe_w2_delta.gate_repair_continue(0, 0)
+    assert not moe_w2_delta.gate_repair_continue(32, 1)
+
+    monkeypatch.setattr(moe_w2_delta, "_REPLAY_MODE", "approximate")
+    monkeypatch.setattr(moe_w2_delta, "_FP_THRESH", 8)
+    monkeypatch.setattr(moe_w2_delta, "_FP_THRESH_FILE", "")
+    assert moe_w2_delta.gate_repair_continue(0, 300)
+    assert moe_w2_delta.gate_repair_continue(1, 8)
+    assert not moe_w2_delta.gate_repair_continue(1, 9)
+
+    for passes, miss in ((0, 15), (1, 8), (1, 9), (31, 1), (32, 1)):
+        assert (moe_w2_delta.gate_repair_continue(passes, miss)
+                is moe_w2_delta.fp_continue(passes, miss))
 
 
 def test_mandatory_promotion_failure_is_fail_closed():
