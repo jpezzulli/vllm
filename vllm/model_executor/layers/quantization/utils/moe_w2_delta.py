@@ -1404,20 +1404,17 @@ class DeltaTier:
             return 0
         ids = ids.unique().long()
         mark_seen(self.seen[layer_key], ids.to(self.dev))
-        # snapshot seen (protects eviction) exactly like force_promote
-        main = torch.cuda.current_stream(self.dev)
-        with self._snap_lock:
-            with torch.cuda.stream(self._stream):
-                self._stream.wait_stream(main)
-                self._seen_host.copy_(self.seen, non_blocking=True)
-                ev = torch.cuda.Event()
-                ev.record(self._stream)
-            ev.synchronize()
+        # ONE DtoH for the whole call (perf, 2026-07-30): the profiler put
+        # the old shape at 2 events + 2 D2H copies per layer per prefill
+        # chunk (86 blocking calls per 43-layer chunk; needle@128k paid it
+        # ~44k times). Hit-only layers — the steady-state majority — now
+        # cost this single copy and no events at all.
+        ids_cpu = ids.cpu()
         with self._lock:
             # open THIS layer's pin scope (releases the previous layer's —
             # its GEMMs are done; see _layer_pins in __init__)
             self._layer_pins.clear()
-            slots = self._mirror[layer_key].long()[ids.cpu()]
+            slots = self._mirror[layer_key].long()[ids_cpu]
             hit = slots >= 0
             if bool(hit.any()):
                 # tick-refresh + LAYER-pin cached hits: the eager GEMMs
@@ -1427,7 +1424,27 @@ class DeltaTier:
                 hs = slots[hit]
                 self._owner_tick[hs] = self._tick
                 self._layer_pins.update(hs.tolist())
-            cand = [(layer_key, int(e)) for e in ids.cpu()[~hit].tolist()]
+            cand = [(layer_key, int(e)) for e in ids_cpu[~hit].tolist()]
+        if not cand:
+            return 0
+        # FETCH PATH ONLY: refresh the SOFT eviction-exclusion snapshot.
+        # This layer's hits are HARD-protected by _layer_pins (set above,
+        # honored by every eviction pass incl. emergency), so dropping the
+        # lock between the hit scan and the fetch is safe; the snapshot
+        # keeps the snap_lock -> lock ordering shared with force_promote.
+        main = torch.cuda.current_stream(self.dev)
+        with self._snap_lock:
+            with torch.cuda.stream(self._stream):
+                self._stream.wait_stream(main)
+                self._seen_host.copy_(self.seen, non_blocking=True)
+                ev = torch.cuda.Event()
+                ev.record(self._stream)
+            ev.synchronize()
+        with self._lock:
+            # a racing manager pass may have mapped some candidates while
+            # the lock was dropped — re-filter under the lock.
+            cand = [(li, ei) for li, ei in cand
+                    if int(self._mirror[li, ei]) < 0]
             if not cand:
                 return 0
             # emergency=True: prefill MUST have its whole layer resident —
