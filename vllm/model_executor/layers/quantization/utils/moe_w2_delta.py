@@ -583,7 +583,19 @@ class DeltaTier:
         with self._snap_lock:
             if not self._snapshot_pending or self._snapshot_event is None:
                 return
-            self._snapshot_event.synchronize()
+            # NON-BLOCKING consume (perf, 2026-07-30): the pending snapshot's
+            # event fires only when the GPU drains the step that recorded it.
+            # Blocking here convoyed the whole serve: the runner's
+            # wait_manager_idle safe-point sat behind this synchronize every
+            # step, so the next forward launched only after GPU-drain +
+            # manager bookkeeping (py-spy: MainThread in wait_manager_idle,
+            # manager in synchronize; profiler: 42% GPU idle on the resident
+            # config). If the copy has not landed yet, return — the manager
+            # goes idle immediately, the runner launches the next step, and
+            # this snapshot is consumed on the next wake (one step later,
+            # the same tolerance the seen-window already documents).
+            if not self._snapshot_event.query():
+                return
             self._snapshot_pending = False
             seen = self._seen_host.nonzero()
             # token counts for the hit-rate below — read under the snap lock
