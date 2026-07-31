@@ -556,14 +556,26 @@ class DeltaTier:
                 time.sleep(gap)
             last = time.monotonic()
             self._manager_idle.clear()
+            retry = False
             try:
                 torch.cuda.set_device(self.dev)
-                self._tick_once()
+                retry = bool(self._tick_once())
             except Exception as e:  # noqa: BLE001 - never kill serving
                 logger.warning("delta tick failed: %s", e)
                 time.sleep(1.0)
             finally:
                 self._manager_idle.set()
+            if retry and not self._stop:
+                # Unfired snapshot event: the copy lands once the GPU drains
+                # the recording step. Self-wake after a micro-sleep instead
+                # of waiting for the next step's wake — that wake OVERWRITES
+                # the event with an equally-unfired one, so with fast steps
+                # the consume check always ran too early and NEVER consumed
+                # (livelock: lazy promotion silently dead; measured 2026-07-31
+                # on the gate-OFF resident cell as +4-8% GPQA token inflation
+                # with the manager thread permanently in _wake.wait()).
+                time.sleep(0.0005)
+                self._wake.set()
         self._manager_idle.set()
 
     def wake(self):
@@ -603,7 +615,10 @@ class DeltaTier:
             # this snapshot is consumed on the next wake (one step later,
             # the same tolerance the seen-window already documents).
             if not self._snapshot_event.query():
-                return
+                # tell _loop to retry shortly (see the self-wake there);
+                # returning without it dropped this consume, and the next
+                # step's re-arm kept the event perpetually too fresh.
+                return True
             self._snapshot_pending = False
             # the consumed copy carries every window since the previous
             # consume; start a fresh accumulation at the next step_end
