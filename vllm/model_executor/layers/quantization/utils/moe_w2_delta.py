@@ -256,6 +256,14 @@ class DeltaTier:
         _seen_dtype = torch.int32 if _COUNT else torch.uint8
         self.seen = torch.zeros(n_layers, n_experts, dtype=_seen_dtype,
                                 device=dev)
+        # GPU-side union of step windows since the manager's last consume:
+        # windows MERGE here instead of dropping when the non-blocking
+        # consume (2026-07-30) lets steps outpace the rate-limited manager.
+        # Dropped windows starved lazy promotion on gate-OFF cells
+        # (pro6000x1 GPQA token median +9.7%, sign p=0.005 - the cold-pool
+        # signature at intact accuracy).
+        self._seen_accum = torch.zeros_like(self.seen)
+        self._accum_reset = False
         self._seen_host = torch.zeros_like(self.seen, device="cpu",
                                            pin_memory=True)
         # Host store behind a backend interface: classic pinned/pageable
@@ -597,6 +605,9 @@ class DeltaTier:
             if not self._snapshot_event.query():
                 return
             self._snapshot_pending = False
+            # the consumed copy carries every window since the previous
+            # consume; start a fresh accumulation at the next step_end
+            self._accum_reset = True
             seen = self._seen_host.nonzero()
             # token counts for the hit-rate below — read under the snap lock
             # so a concurrent snapshot can't swap the values underneath.
@@ -1087,8 +1098,17 @@ class DeltaTier:
         with self._snap_lock:
             with torch.cuda.stream(self._stream):
                 self._stream.wait_stream(main)
-                self._seen_host.copy_(self.seen, non_blocking=True)
+                # consume(N) requested an accumulator reset: enqueue it
+                # BEFORE this window's merge (same stream + same lock =>
+                # deterministic order). A copy enqueued between consume(N)
+                # and this reset re-delivers window N once (freq counts it
+                # twice, a decayed heuristic) - windows never drop.
+                if self._accum_reset:
+                    self._seen_accum.zero_()
+                    self._accum_reset = False
+                self._seen_accum.add_(self.seen)
                 self.seen.zero_()
+                self._seen_host.copy_(self._seen_accum, non_blocking=True)
                 event = torch.cuda.Event()
                 event.record(self._stream)
             self._snapshot_event = event
