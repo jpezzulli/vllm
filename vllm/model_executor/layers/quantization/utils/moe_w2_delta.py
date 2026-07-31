@@ -1143,11 +1143,25 @@ class DeltaTier:
                     self._accum_reset = False
                 self._seen_accum.add_(self.seen)
                 self.seen.zero_()
-                self._seen_host.copy_(self._seen_accum, non_blocking=True)
-                event = torch.cuda.Event()
-                event.record(self._stream)
-            self._snapshot_event = event
-            self._snapshot_pending = True
+                if not self._snapshot_pending:
+                    # CHAIN, never overwrite: re-recording a fresh event on
+                    # every step kept the pending snapshot perpetually
+                    # too-new to consume (wait_stream(main) makes it fire
+                    # only after the NEXT step's already-enqueued work
+                    # drains, and by then the next step_end had replaced
+                    # it: consumes landed ~1/s in bursts and unions grew to
+                    # ~7800 pairs, blocking the whole pool as seen).
+                    # While pending, steps merge into the accumulator only;
+                    # the host copy + event happen on the FIRST step_end
+                    # after a consume, so _seen_host is never rewritten
+                    # under the manager's read and every window is
+                    # delivered by the next copy.
+                    self._seen_host.copy_(self._seen_accum,
+                                          non_blocking=True)
+                    event = torch.cuda.Event()
+                    event.record(self._stream)
+                    self._snapshot_event = event
+                    self._snapshot_pending = True
         with self._lock:
             self._step_pins.clear()
             self._layer_pins.clear()
