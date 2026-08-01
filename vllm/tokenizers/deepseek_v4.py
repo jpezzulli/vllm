@@ -40,6 +40,9 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 messages.insert(0, {"role": "system"})
                 messages[0]["tools"] = tools  # type: ignore[typeddict-unknown-key]
 
+            # 0731 encoding levels: low (default, no prompt) / high / max.
+            # "none" disables thinking entirely; unknown strings round up
+            # to "high"; xhigh (OpenAI alias) maps to "max".
             reasoning_effort = kwargs.get("reasoning_effort")
             if not isinstance(reasoning_effort, str):
                 reasoning_effort = None
@@ -48,6 +51,8 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 reasoning_effort = None
             elif reasoning_effort in ("max", "xhigh"):
                 reasoning_effort = "max"
+            elif reasoning_effort == "low":
+                reasoning_effort = "low"
             else:
                 reasoning_effort = "high"
 
