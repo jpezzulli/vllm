@@ -263,10 +263,11 @@ def test_w2_config_contract_rejects_unsafe_runtime_combinations(
             moe_w2_cubit._layer_contract(_contract_layer())
 
 
-def _v2_contract_config():
+def _v2_contract_config(speculative_config=None):
     return SimpleNamespace(
         model_config=SimpleNamespace(dtype=torch.bfloat16),
         use_v2_model_runner=True,
+        speculative_config=speculative_config,
         parallel_config=SimpleNamespace(
             use_ubatching=False,
             ubatch_size=0,
@@ -282,6 +283,82 @@ def test_w2_v2_allows_full_resident_gate_disabled(monkeypatch):
     with mock.patch(
         "vllm.config.get_current_vllm_config",
         return_value=_v2_contract_config(),
+    ):
+        contract = moe_w2_cubit._layer_contract(_contract_layer())
+    assert contract["activation"] == "silu"
+
+
+def _dspark_config(n_mtp_layers=3):
+    return SimpleNamespace(
+        method="dspark",
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(n_mtp_layers=n_mtp_layers)
+        ),
+    )
+
+
+def test_w2_mtp_layer_selection_is_explicit(monkeypatch):
+    monkeypatch.setenv("VLLM_MOE_W2", "1")
+    monkeypatch.setattr(moe_w2_cubit, "_cutoff_cache", 43)
+    monkeypatch.delenv("VLLM_MOE_W2_MTP_LAYERS", raising=False)
+    assert moe_w2_cubit.is_w2_layer("model.layers.42.ffn.experts")
+    assert not moe_w2_cubit.is_w2_layer("model.layers.43.ffn.experts")
+
+    monkeypatch.setenv("VLLM_MOE_W2_MTP_LAYERS", "3")
+    assert moe_w2_cubit.is_w2_layer("model.layers.43.ffn.experts")
+    assert moe_w2_cubit.is_w2_layer("model.layers.45.ffn.experts")
+    assert not moe_w2_cubit.is_w2_layer("model.layers.46.ffn.experts")
+
+
+def test_w2_mtp_layers_do_not_extend_the_target_delta_tier(monkeypatch):
+    monkeypatch.setattr(moe_w2_cubit, "_cutoff_cache", 43)
+    layer = SimpleNamespace(layer_name="model.layers.43.ffn.experts")
+    with mock.patch.object(
+        moe_w2_delta,
+        "get_tier",
+        side_effect=AssertionError("MTP must not create or index target tier"),
+    ):
+        assert moe_w2_cubit._fp4_tier_for_build(
+            256, torch.device("cpu"), 1024, 512, layer
+        ) is None
+
+
+@pytest.mark.parametrize(
+    "use_v2,spec_config,mtp_layers,match",
+    [
+        (False, _dspark_config(), 3, "requires Model Runner V2"),
+        (True, None, 3, "only with DSpark"),
+        (
+            True,
+            SimpleNamespace(method="eagle"),
+            3,
+            "only with DSpark",
+        ),
+        (True, _dspark_config(), 2, "must match DSpark's draft layer count"),
+    ],
+)
+def test_w2_mtp_rejects_unsupported_runtime_configs(
+    monkeypatch, use_v2, spec_config, mtp_layers, match
+):
+    monkeypatch.setenv("VLLM_MOE_W2_MTP_LAYERS", str(mtp_layers))
+    monkeypatch.setattr(moe_w2_delta, "base_enabled", lambda: False)
+    monkeypatch.setattr(moe_w2_gate, "enabled", lambda: False)
+    config = _v2_contract_config(spec_config)
+    config.use_v2_model_runner = use_v2
+    with mock.patch(
+        "vllm.config.get_current_vllm_config", return_value=config
+    ):
+        with pytest.raises(ValueError, match=match):
+            moe_w2_cubit._layer_contract(_contract_layer())
+
+
+def test_w2_mtp_accepts_complete_dspark_draft(monkeypatch):
+    monkeypatch.setenv("VLLM_MOE_W2_MTP_LAYERS", "3")
+    monkeypatch.setattr(moe_w2_delta, "base_enabled", lambda: False)
+    monkeypatch.setattr(moe_w2_gate, "enabled", lambda: False)
+    with mock.patch(
+        "vllm.config.get_current_vllm_config",
+        return_value=_v2_contract_config(_dspark_config()),
     ):
         contract = moe_w2_cubit._layer_contract(_contract_layer())
     assert contract["activation"] == "silu"
