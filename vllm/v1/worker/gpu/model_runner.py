@@ -40,6 +40,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
+from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
@@ -316,6 +317,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             time_after_load - time_before_load,
         )
 
+        # V1 performs the same W2 residency/config guard at this point.
+        if not load_dummy_weights:
+            moe_w2_delta.check_pool_floor_for_config(self.vllm_config)
+
         if not load_dummy_weights:
             prepare_communication_buffer_for_model(self.model)
             if self.speculator is not None:
@@ -587,6 +592,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Non-last PP ranks don't produce output for sampling.
         if not self.is_last_pp_rank:
+            moe_w2_delta.v2_runner_step_end()
             return None, None
 
         assert self.execute_model_state is not None
@@ -645,6 +651,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         assert hidden_states is not None  # Last PP rank always has hidden_states
         sample_hidden_states = hidden_states[input_batch.logits_indices]
+        moe_w2_delta.v2_runner_step_end()
         return hidden_states, sample_hidden_states
 
     @torch.inference_mode()
@@ -792,6 +799,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
         with self.maybe_setup_dummy_loras(self.lora_config):
+            moe_w2_delta.v2_runner_before_forward()
             attn_states = self.cudagraph_manager.capture(
                 self.model,
                 self.model_state,
@@ -807,6 +815,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.speculator is not None:
                 self.speculator.capture(attn_states)
                 self._profile_dspark_cost_table()
+            moe_w2_delta.v2_runner_step_end()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
@@ -1424,6 +1433,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
             del intermediate_tensors
 
+        # W2 delta managers mutate rank-local slot tables and pool storage on
+        # side streams only between steps. Runner V2 keeps this step open
+        # through sample_tokens(), including DSpark proposal.
+        moe_w2_delta.v2_runner_before_forward()
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -1649,6 +1663,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # uniform path.
                 lengths=getattr(self.speculator, "_perreq_batch_len", None),
             )
+
+        # Target verification and draft proposal are both complete. Publish
+        # one event-backed residency snapshot before the next target forward.
+        moe_w2_delta.v2_runner_step_end()
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)

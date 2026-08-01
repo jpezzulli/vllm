@@ -2080,6 +2080,23 @@ def check_pool_floor(top_k: int, n_spec: int, max_num_seqs: int) -> None:
         pass
 
 
+def check_pool_floor_for_config(vllm_config) -> None:
+    """Run the post-load residency/config guard for either GPU runner."""
+    if _BASE_TIER is None and _TIER is None:
+        return
+    top_k = int(getattr(
+        vllm_config.model_config.hf_text_config,
+        "num_experts_per_tok",
+        0,
+    ) or 0)
+    if top_k > 0:
+        check_pool_floor(
+            top_k,
+            vllm_config.num_speculative_tokens,
+            vllm_config.scheduler_config.max_num_seqs,
+        )
+
+
 def gate_armed() -> bool:
     from vllm.model_executor.layers.quantization.utils import moe_w2_gate
     return moe_w2_gate.enabled()
@@ -2105,6 +2122,30 @@ def wake_all() -> None:
     t = _TIER
     if t is not None:
         t.wake()
+
+
+def v2_runner_before_forward() -> None:
+    """Enter a Model Runner V2 target forward at a residency safe point.
+
+    Each worker/rank owns its tiers and invokes this independently. Waiting
+    before every target forward prevents the manager side stream from
+    changing slot ownership while a captured graph reads the slot table.
+    """
+    for tier in (_BASE_TIER, _TIER):
+        if tier is not None:
+            tier.wait_manager_idle()
+
+
+def v2_runner_step_end() -> None:
+    """Publish a completed Model Runner V2 target/speculative step.
+
+    Runner V2 separates target execution from sampling and draft proposal,
+    so callers close the step only after proposal is complete. ``step_end``
+    records the current-stream event consumed by each rank-local manager.
+    """
+    for tier in (_BASE_TIER, _TIER):
+        if tier is not None:
+            tier.step_end()
 
 
 def get_base_tier(n_layers: int, n_experts: int, dev,

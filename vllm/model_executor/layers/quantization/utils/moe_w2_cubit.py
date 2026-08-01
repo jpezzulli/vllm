@@ -513,9 +513,19 @@ def _layer_contract(layer) -> dict:
                 "VLLM_MOE_W2 kernels use BF16 intermediates and currently "
                 f"require model dtype bfloat16, got {cfg.model_config.dtype}")
         if cfg.use_v2_model_runner:
-            raise ValueError(
-                "VLLM_MOE_W2 is not integrated with Model Runner V2 "
-                "(mandatory base replay and gate hooks are absent)")
+            from vllm.model_executor.layers.quantization.utils import (
+                moe_w2_delta, moe_w2_gate)
+
+            unsupported = []
+            if moe_w2_delta.base_enabled():
+                unsupported.append("host-resident base cache/replay")
+            if moe_w2_gate.enabled():
+                unsupported.append("confidence-gate re-forward")
+            if unsupported:
+                raise ValueError(
+                    "VLLM_MOE_W2 with Model Runner V2 currently supports "
+                    "only a full-resident base with the confidence gate "
+                    "disabled; unsupported: " + ", ".join(unsupported))
         pc = cfg.parallel_config
         if (getattr(pc, "use_ubatching", False)
                 or getattr(pc, "ubatch_size", 0)):
