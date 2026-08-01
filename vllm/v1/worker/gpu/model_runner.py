@@ -1424,6 +1424,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
             del intermediate_tensors
 
+        # moe_w2 safe point (V2 integration, resident/delta-only contract):
+        # no background-manager store/CUDA mutation may overlap the forward
+        # (or a capture-time dummy run — pool pointers bake into graphs).
+        # Mirrors the V1 runner's wait at the top of its execute path.
+        from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+        for _w2_tier in (moe_w2_delta._BASE_TIER, moe_w2_delta._TIER):
+            if _w2_tier is not None:
+                _w2_tier.wait_manager_idle()
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -1649,6 +1658,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # uniform path.
                 lengths=getattr(self.speculator, "_perreq_batch_len", None),
             )
+
+        # moe_w2 (V2 integration): the step is fully executed — the verify
+        # forward AND the speculator's drafts (draft heads run the native
+        # path; only the main stack touches the pool) are done. Close the
+        # tiers' SEEN window + pin scope exactly like the V1 runner does
+        # after its replay/gate loops: eviction exclusions and hit-pins
+        # must scope to ONE step, and the window's marks feed the manager
+        # via the snapshot chain.
+        from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+        if (moe_w2_delta._BASE_TIER is not None
+                or moe_w2_delta._TIER is not None):
+            try:
+                if moe_w2_delta._BASE_TIER is not None:
+                    moe_w2_delta._BASE_TIER.step_end()
+                if moe_w2_delta._TIER is not None:
+                    moe_w2_delta._TIER.step_end()
+            except Exception:  # noqa: BLE001 - never crash serving
+                pass
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)

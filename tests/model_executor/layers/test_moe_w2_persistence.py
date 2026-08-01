@@ -240,7 +240,6 @@ def test_w2_clamp_matches_native_deepgemm_precision():
     "dtype,use_v2,use_ubatching,expert_parallel,match",
     [
         (torch.float16, False, False, False, "require model dtype"),
-        (torch.bfloat16, True, False, False, "Model Runner V2"),
         (torch.bfloat16, False, True, False, "ubatching"),
         (torch.bfloat16, False, False, True, "expert parallelism"),
     ],
@@ -260,6 +259,60 @@ def test_w2_config_contract_rejects_unsafe_runtime_combinations(
     with mock.patch(
             "vllm.config.get_current_vllm_config", return_value=config):
         with pytest.raises(ValueError, match=match):
+            moe_w2_cubit._layer_contract(_contract_layer())
+
+
+def _v2_contract_config(pp_size: int = 1):
+    return SimpleNamespace(
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        use_v2_model_runner=True,
+        parallel_config=SimpleNamespace(
+            use_ubatching=False,
+            ubatch_size=0,
+            enable_expert_parallel=False,
+            enable_eplb=False,
+            pipeline_parallel_size=pp_size,
+        ),
+    )
+
+
+def test_w2_config_contract_v2_runner_resident_subset(monkeypatch):
+    """V2 (the DSpark runner) serves the RESIDENT/delta-only contract:
+    accepted with the base cache and confidence gate off, fail-closed on
+    every config that needs the V1-only replay/gate hooks."""
+    from vllm.model_executor.layers.quantization.utils import moe_w2_gate
+
+    # resident/delta-only, gate OFF: accepted
+    monkeypatch.setattr(moe_w2_delta, "base_enabled", lambda: False)
+    monkeypatch.setattr(moe_w2_gate, "_ENABLED", False)
+    with mock.patch(
+            "vllm.config.get_current_vllm_config",
+            return_value=_v2_contract_config()):
+        moe_w2_cubit._layer_contract(_contract_layer())
+
+    # base cache needs the mandatory replay loop: refused
+    monkeypatch.setattr(moe_w2_delta, "base_enabled", lambda: True)
+    with mock.patch(
+            "vllm.config.get_current_vllm_config",
+            return_value=_v2_contract_config()):
+        with pytest.raises(ValueError, match="base cache"):
+            moe_w2_cubit._layer_contract(_contract_layer())
+    monkeypatch.setattr(moe_w2_delta, "base_enabled", lambda: False)
+
+    # confidence gate needs the re-forward hooks: refused
+    monkeypatch.setattr(moe_w2_gate, "_ENABLED", True)
+    with mock.patch(
+            "vllm.config.get_current_vllm_config",
+            return_value=_v2_contract_config()):
+        with pytest.raises(ValueError, match="confidence gate"):
+            moe_w2_cubit._layer_contract(_contract_layer())
+    monkeypatch.setattr(moe_w2_gate, "_ENABLED", False)
+
+    # pipeline parallelism: refused
+    with mock.patch(
+            "vllm.config.get_current_vllm_config",
+            return_value=_v2_contract_config(pp_size=2)):
+        with pytest.raises(ValueError, match="pipeline"):
             moe_w2_cubit._layer_contract(_contract_layer())
 
 

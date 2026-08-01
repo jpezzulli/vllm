@@ -295,6 +295,16 @@ def is_w2_layer(layer_name: str) -> bool:
     measured with the drafter unmodified."""
     if not enabled():
         return False
+    # Draft/speculator modules (DSpark heads, Eagle) are SEPARATE models
+    # built under a non-default compilation model tag, and their layer
+    # indices restart at 0 — name-based filtering cannot tell draft
+    # layer 0 from main layer 0 (measured: DSpark's own MoE stack would
+    # collide with the main pack/planes namespace). Draft numerics only
+    # move the acceptance rate — verify forwards through the main stack
+    # are the correctness boundary — so drafts keep the native path.
+    from vllm.compilation import backends as _cb
+    if getattr(_cb, "model_tag", "backbone") != "backbone":
+        return False
     name = layer_name or ""
     if "mtp" in name:
         return False
@@ -513,9 +523,39 @@ def _layer_contract(layer) -> dict:
                 "VLLM_MOE_W2 kernels use BF16 intermediates and currently "
                 f"require model dtype bfloat16, got {cfg.model_config.dtype}")
         if cfg.use_v2_model_runner:
-            raise ValueError(
-                "VLLM_MOE_W2 is not integrated with Model Runner V2 "
-                "(mandatory base replay and gate hooks are absent)")
+            # V2 integration (2026-08-01, the DSpark runner): the V2 GPU
+            # model runner carries the manager safe-point + step_end hooks
+            # only. That is the complete contract for RESIDENT/delta-only
+            # serving (a pool miss is served from the resident planes —
+            # correct base quality, no replay needed). The base-cache
+            # mandatory replay loops and the confidence-gate re-forwards
+            # are V1-runner code and are NOT ported: fail closed on any
+            # config that needs them.
+            from vllm.model_executor.layers.quantization.utils import (
+                moe_w2_delta)
+            if moe_w2_delta.base_enabled():
+                raise ValueError(
+                    "VLLM_MOE_W2 base cache (VLLM_MOE_W2_BASE_CACHE_GB) is "
+                    "not integrated with Model Runner V2: the mandatory "
+                    "base replay loop is absent — a pool miss would be a "
+                    "silent quality corruption. Serve base-cache configs "
+                    "on the V1 runner.")
+            try:
+                from vllm.model_executor.layers.quantization.utils import (
+                    moe_w2_gate)
+                gate_on = moe_w2_gate.enabled()
+            except ImportError:
+                gate_on = False
+            if gate_on:
+                raise ValueError(
+                    "the VLLM_MOE_W2 confidence gate is not integrated "
+                    "with Model Runner V2 (gate re-forward hooks are "
+                    "absent). Serve gate configs on the V1 runner or set "
+                    "VLLM_MOE_W2_GATE=0.")
+            if cfg.parallel_config.pipeline_parallel_size > 1:
+                raise ValueError(
+                    "VLLM_MOE_W2 on Model Runner V2 does not support "
+                    "pipeline parallelism.")
         pc = cfg.parallel_config
         if (getattr(pc, "use_ubatching", False)
                 or getattr(pc, "ubatch_size", 0)):
