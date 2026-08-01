@@ -648,8 +648,18 @@ class DeltaTier:
         # gate-driven force_promote on the forward thread).
         with self._lock:
             li_idx, ei_idx = seen[:, 0], seen[:, 1]
-            # recency-decayed routing frequency (the hotness signal)
-            self._freq[li_idx, ei_idx] += 1.0
+            # recency-decayed routing frequency (the hotness signal),
+            # WINDOW-WEIGHTED: +1 per consumed union under-counted once
+            # chaining made unions span multiple steps (a flat +1 whether
+            # an expert served 1 token or 300), which flattened the
+            # ranking the eviction victims, promotion candidates AND the
+            # pool-heat warm-start dumps all key on — measured 2026-08-01
+            # as the strict cell's heat file degrading after every serve
+            # (GPQA med -0.3% -> +7.7% across four campaigns). `cnt` is
+            # the union's token count in count-mode and windows-present
+            # in binary mode; both are the per-step-equivalent signal the
+            # pre-chaining manager accrued.
+            self._freq[li_idx, ei_idx] += cnt.to(self._freq.dtype)
             # refresh last_seen for cached owners; collect promotion
             # candidates — all vectorized (no per-pair python)
             slots = self._mirror[li_idx, ei_idx].long()
