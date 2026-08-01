@@ -288,21 +288,35 @@ def _layer_cutoff() -> int:
     return 43
 
 
+def _mtp_layer_count() -> int:
+    """Number of trailing MTP layers explicitly served by W2."""
+    value = int(os.getenv("VLLM_MOE_W2_MTP_LAYERS", "0"))
+    if value < 0:
+        raise ValueError("VLLM_MOE_W2_MTP_LAYERS must be non-negative")
+    return value
+
+
+def _layer_index(layer_name: str) -> int | None:
+    import re
+
+    match = re.search(r"\.layers\.(\d+)\.", layer_name or "")
+    return None if match is None else int(match.group(1))
+
+
+def _is_mtp_layer(layer_name: str) -> bool:
+    index = _layer_index(layer_name)
+    return index is not None and index >= _layer_cutoff()
+
+
 def is_w2_layer(layer_name: str) -> bool:
-    """Main-model routed experts only. The MTP drafter (layer index >=
-    num_hidden_layers, e.g. model.layers.43.* for the 43-layer main stack)
-    keeps its original path: QUANT_PROBE's acceptance numbers were
-    measured with the drafter unmodified."""
+    """Select main-model experts and explicitly enabled MTP layers."""
     if not enabled():
         return False
     name = layer_name or ""
-    if "mtp" in name:
+    index = _layer_index(name)
+    if index is None:
         return False
-    import re
-    m = re.search(r"\.layers\.(\d+)\.", name)
-    if m is None:
-        return False
-    return int(m.group(1)) < _layer_cutoff()
+    return index < _layer_cutoff() + _mtp_layer_count()
 
 
 def _driver():
@@ -436,7 +450,13 @@ def _require_kernels(K13: int, K2: int, need_w4: bool) -> None:
             f"{missing} (dir {_DIR}; set VLLM_MOE_W2_CUBIT_DIR)")
 
 
-def _fp4_tier_for_build(E: int, dev, n13k13: int, n2k2: int):
+def _fp4_tier_for_build(
+    E: int,
+    dev,
+    n13k13: int,
+    n2k2: int,
+    layer=None,
+):
     """FP4 delta tier sized for this model's PER-RANK shapes (n13k13 =
     N13*K13, n2k2 = N2*K2 elements). Over the base cache the FP4 slots must
     carry their OWN block-32 scale sections ([fp4_13|sc13|fp4_2|sc2]) — the
@@ -446,6 +466,10 @@ def _fp4_tier_for_build(E: int, dev, n13k13: int, n2k2: int):
     moe_w2_planes.pack_quintal_fragment_major) and NO scale sections even
     over the base cache — the quintal kernel reads class/sign/scales from
     the base slot the refinement is residency-coupled to."""
+    if layer is not None and _is_mtp_layer(
+        getattr(layer, "layer_name", "")
+    ):
+        return None
     from vllm.model_executor.layers.quantization.utils import moe_w2_delta
     split = moe_w2_delta.split_enabled()
     sc13, sc2 = ((n13k13 // 32, n2k2 // 32)
@@ -526,6 +550,22 @@ def _layer_contract(layer) -> dict:
                     "VLLM_MOE_W2 with Model Runner V2 currently supports "
                     "only a full-resident base with the confidence gate "
                     "disabled; unsupported: " + ", ".join(unsupported))
+        mtp_layers = _mtp_layer_count()
+        if mtp_layers:
+            spec_config = getattr(cfg, "speculative_config", None)
+            if not cfg.use_v2_model_runner:
+                raise ValueError(
+                    "VLLM_MOE_W2_MTP_LAYERS requires Model Runner V2")
+            if getattr(spec_config, "method", None) != "dspark":
+                raise ValueError(
+                    "VLLM_MOE_W2_MTP_LAYERS is supported only with DSpark")
+            draft_config = getattr(spec_config, "draft_model_config", None)
+            draft_hf_config = getattr(draft_config, "hf_config", None)
+            available = getattr(draft_hf_config, "n_mtp_layers", None) or 3
+            if mtp_layers != available:
+                raise ValueError(
+                    "VLLM_MOE_W2_MTP_LAYERS must match DSpark's draft "
+                    f"layer count ({available}), got {mtp_layers}")
         pc = cfg.parallel_config
         if (getattr(pc, "use_ubatching", False)
                 or getattr(pc, "ubatch_size", 0)):
@@ -644,8 +684,17 @@ def plan_pack_skip(layer) -> bool:
         # layer index, sized exactly like process-time try_load).
         lidx = _pc.layer_idx_from_name(getattr(layer, "layer_name", ""))
         if lidx is None or not _pc.cache_has_layer(
-                lidx, _pc.expected_sizes(
-                    E, N13, K13, N2, K2, want_fp4=moe_w2_delta.enabled())):
+            lidx, _pc.expected_sizes(
+                E,
+                N13,
+                K13,
+                N2,
+                K2,
+                want_fp4=(
+                    moe_w2_delta.enabled()
+                    and not _is_mtp_layer(getattr(layer, "layer_name", ""))
+                ),
+            )):
             return False
     for pname in ("w13_weight", "w13_weight_scale",
                   "w2_weight", "w2_weight_scale"):
@@ -822,7 +871,7 @@ def _try_skip_requant(layer, layer_key: int, E: int, N13: int, K13: int,
         w13_bytes=c13len + s13len, w2_bytes=c2len + s2len)
     if layer_key not in btier._store:
         return False
-    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
+    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2, layer)
     if tier is not None and layer_key not in tier._store:
         return False
     from vllm.model_executor.layers.quantization.utils import (
@@ -903,7 +952,7 @@ def build_layer_planes(layer, layer_key: int) -> None:
     # Pass the PER-RANK FP4 plane sizes (N*K//2 bytes/expert) so the delta tier's
     # slots, host store, and pool indexing match the (TP-sharded) planes. On TP1
     # these equal the module constants -> the single-GPU path is unchanged.
-    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
+    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2, layer)
     fp13 = fp2 = None
     if tier is not None:
         # full nibble planes (w4) or quintal planes (w4q, split)
@@ -994,7 +1043,7 @@ def build_layer_planes_fp8(layer, layer_key: int,
     planes2 = torch.empty(E, N2 * K2 // 4, dtype=torch.uint8, device=dev)
     sc2 = torch.empty(E, N2 * K2 // 32, dtype=torch.uint8, device=dev)
 
-    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
+    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2, layer)
     fp13 = fp2 = None
     if tier is not None:
         # full nibble planes (w4) or quintal planes (w4q, split)
@@ -1053,7 +1102,7 @@ def _consume_planes_cache(layer, layer_key: int, dev,
     lidx = planes_cache.layer_idx_from_name(getattr(layer, "layer_name", ""))
     if not planes_cache.enabled() or lidx is None:
         return False
-    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
+    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2, layer)
     cached = planes_cache.try_load(lidx, planes_cache.expected_sizes(
         E, N13, K13, N2, K2, want_fp4=tier is not None))
     if cached is None:
@@ -1153,7 +1202,7 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
     from vllm.model_executor.layers.quantization.utils import (
         moe_w2_planes_cache as planes_cache)
     lidx = planes_cache.layer_idx_from_name(getattr(layer, "layer_name", ""))
-    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
+    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2, layer)
 
     planes13 = torch.empty(E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
     sc13 = torch.empty(E, N13 * K13 // 32, dtype=torch.uint8, device=dev)
@@ -1223,6 +1272,7 @@ def _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
     from vllm.model_executor.layers.quantization.utils import (
         moe_w2_planes_cache as _pc)
     _tl = _pc.layer_idx_from_name(getattr(layer, "layer_name", ""))
+    delta_eligible = not _is_mtp_layer(getattr(layer, "layer_name", ""))
     if moe_w2_delta.base_enabled():
         # BASE cache (inverted delta): the 2-bit planes go to PINNED HOST RAM
         # instead of staying GPU-resident; the GPU holds only the base tier's
@@ -1240,6 +1290,7 @@ def _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
             layer_key, (planes13, sc13), (planes2, sc2))
         _LAYERS[layer_key] = dict(
             N13=N13, K13=K13, N2=N2, K2=K2, E=E, base=True, tl_idx=_tl,
+            delta_eligible=delta_eligible,
             off_s13=c13len, off_c2=c13len + s13len,
             off_s2=c13len + s13len + c2len,
             # FP4 need-pool slot sections ([fp4_13|sc13|fp4_2|sc2]; fp4 codes
@@ -1265,6 +1316,7 @@ def _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
     _LAYERS[layer_key] = dict(
         planes13=planes13, sc13=sc13, planes2=planes2, sc2=sc2,
         N13=N13, K13=K13, N2=N2, K2=K2, E=E, tl_idx=_tl,
+        delta_eligible=delta_eligible,
         **contract,
     )
     # Release checkpoint copies; keep CUDA stubs so device probes stay happy.
@@ -1305,7 +1357,7 @@ def _check_resident_fit(layer_key: int, dev, bytes_per_layer: int) -> None:
         hf = vcfg.model_config.hf_text_config
         n_layers = int(getattr(hf, "num_hidden_layers", 0) or 0)
         n_dense = int(getattr(hf, "first_k_dense_replace", 0) or 0)
-        n_moe = max(n_layers - n_dense, 1)
+        n_moe = max(n_layers - n_dense, 1) + _mtp_layer_count()
         max_len = int(vcfg.model_config.max_model_len)
         spec_on = vcfg.speculative_config is not None
         free_b, _total_b = torch.cuda.mem_get_info(dev)
@@ -2446,7 +2498,9 @@ def _moe_w2_forward_timed(
         if not use_fp4 and not use_pf4:
             tier = None      # downstream w4 launches key off `tier`
     else:
-        tier = moe_w2_delta._TIER       # peek only; created by the plane builder
+        tier = (
+            moe_w2_delta._TIER if st.get("delta_eligible", True) else None
+        )
         # prefill consumes the FP4 tier too (quality lever, see _PREFILL_FP4)
         use_pf4 = (_PREFILL_FP4 and prefill and tier is not None
                    and tier.n_slots > 0)
