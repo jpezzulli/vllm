@@ -296,14 +296,25 @@ def is_w2_layer(layer_name: str) -> bool:
     if not enabled():
         return False
     # Draft/speculator modules (DSpark heads, Eagle) are SEPARATE models
-    # built under a non-default compilation model tag, and their layer
-    # indices restart at 0 — name-based filtering cannot tell draft
-    # layer 0 from main layer 0 (measured: DSpark's own MoE stack would
-    # collide with the main pack/planes namespace). Draft numerics only
-    # move the acceptance rate — verify forwards through the main stack
-    # are the correctness boundary — so drafts keep the native path.
+    # built under a non-default compilation model tag; a draft whose layer
+    # indices restart at 0 would collide with the main pack/planes
+    # namespace, so non-backbone tags are excluded by default. Draft
+    # numerics only move the acceptance rate — verify forwards through
+    # the main stack are the correctness boundary.
+    #
+    # EXCEPTION (opt-in, VLLM_MOE_W2_DRAFT=1): the DSpark head numbers its
+    # layers DISJOINTLY (layers.{num_hidden_layers+i}) so it CAN share the
+    # W2 planes path — set VLLM_MOE_W2_NUM_LAYERS to main+draft so the
+    # cutoff admits it. Motivation: the head is 3 full MoE decoder layers
+    # (~10-19 GiB native) which do not fit a 96 GiB card next to the
+    # fully-resident main planes; as 2-bit planes they cost ~5 GiB, and
+    # rejection sampling keeps the OUTPUT distribution exactly the
+    # target's regardless of draft precision.
     from vllm.compilation import backends as _cb
-    if getattr(_cb, "model_tag", "backbone") != "backbone":
+    _tag = getattr(_cb, "model_tag", "backbone")
+    if _tag != "backbone" and not (
+            _tag == "dspark_head"
+            and os.getenv("VLLM_MOE_W2_DRAFT", "0") == "1"):
         return False
     name = layer_name or ""
     if "mtp" in name:
