@@ -310,6 +310,12 @@ def test_w2_mtp_layer_selection_is_explicit(monkeypatch):
     assert not moe_w2_cubit.is_w2_layer("model.layers.46.ffn.experts")
 
 
+def test_w2_mtp_layer_count_rejects_negative_values(monkeypatch):
+    monkeypatch.setenv("VLLM_MOE_W2_MTP_LAYERS", "-1")
+    with pytest.raises(ValueError, match="must be non-negative"):
+        moe_w2_cubit._mtp_layer_count()
+
+
 def test_w2_mtp_layers_do_not_extend_the_target_delta_tier(monkeypatch):
     monkeypatch.setattr(moe_w2_cubit, "_cutoff_cache", 43)
     layer = SimpleNamespace(layer_name="model.layers.43.ffn.experts")
@@ -333,6 +339,15 @@ def test_w2_mtp_layers_do_not_extend_the_target_delta_tier(monkeypatch):
             SimpleNamespace(method="eagle"),
             3,
             "only with DSpark",
+        ),
+        (
+            True,
+            SimpleNamespace(
+                method="dspark",
+                draft_model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+            ),
+            3,
+            "requires DSpark draft-layer metadata",
         ),
         (True, _dspark_config(), 2, "must match DSpark's draft layer count"),
     ],
