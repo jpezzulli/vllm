@@ -15,6 +15,7 @@ import vllm.envs as vllm_envs
 from vllm.model_executor.layers.quantization.utils import (
     moe_w2_cubit,
     moe_w2_delta,
+    moe_w2_gate,
     moe_w2_planes,
     moe_w2_planes_cache,
     moe_w2_store,
@@ -237,19 +238,18 @@ def test_w2_clamp_matches_native_deepgemm_precision():
 
 
 @pytest.mark.parametrize(
-    "dtype,use_v2,use_ubatching,expert_parallel,match",
+    "dtype,use_ubatching,expert_parallel,match",
     [
-        (torch.float16, False, False, False, "require model dtype"),
-        (torch.bfloat16, True, False, False, "Model Runner V2"),
-        (torch.bfloat16, False, True, False, "ubatching"),
-        (torch.bfloat16, False, False, True, "expert parallelism"),
+        (torch.float16, False, False, "require model dtype"),
+        (torch.bfloat16, True, False, "ubatching"),
+        (torch.bfloat16, False, True, "expert parallelism"),
     ],
 )
 def test_w2_config_contract_rejects_unsafe_runtime_combinations(
-        dtype, use_v2, use_ubatching, expert_parallel, match):
+        dtype, use_ubatching, expert_parallel, match):
     config = SimpleNamespace(
         model_config=SimpleNamespace(dtype=dtype),
-        use_v2_model_runner=use_v2,
+        use_v2_model_runner=False,
         parallel_config=SimpleNamespace(
             use_ubatching=use_ubatching,
             ubatch_size=1 if use_ubatching else 0,
@@ -261,6 +261,81 @@ def test_w2_config_contract_rejects_unsafe_runtime_combinations(
             "vllm.config.get_current_vllm_config", return_value=config):
         with pytest.raises(ValueError, match=match):
             moe_w2_cubit._layer_contract(_contract_layer())
+
+
+def _v2_contract_config():
+    return SimpleNamespace(
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        use_v2_model_runner=True,
+        parallel_config=SimpleNamespace(
+            use_ubatching=False,
+            ubatch_size=0,
+            enable_expert_parallel=False,
+            enable_eplb=False,
+        ),
+    )
+
+
+def test_w2_v2_allows_full_resident_gate_disabled(monkeypatch):
+    monkeypatch.setattr(moe_w2_delta, "base_enabled", lambda: False)
+    monkeypatch.setattr(moe_w2_gate, "enabled", lambda: False)
+    with mock.patch(
+        "vllm.config.get_current_vllm_config",
+        return_value=_v2_contract_config(),
+    ):
+        contract = moe_w2_cubit._layer_contract(_contract_layer())
+    assert contract["activation"] == "silu"
+
+
+@pytest.mark.parametrize(
+    "base_enabled,gate_enabled,match",
+    [
+        (True, False, "base cache/replay"),
+        (False, True, "confidence-gate"),
+    ],
+)
+def test_w2_v2_rejects_replay_dependent_modes(
+    monkeypatch, base_enabled, gate_enabled, match
+):
+    monkeypatch.setattr(moe_w2_delta, "base_enabled", lambda: base_enabled)
+    monkeypatch.setattr(moe_w2_gate, "enabled", lambda: gate_enabled)
+    with mock.patch(
+        "vllm.config.get_current_vllm_config",
+        return_value=_v2_contract_config(),
+    ):
+        with pytest.raises(ValueError, match=match):
+            moe_w2_cubit._layer_contract(_contract_layer())
+
+
+def test_w2_v2_lifecycle_is_rank_local_and_ordered(monkeypatch):
+    calls = []
+
+    class Tier:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_manager_idle(self):
+            calls.append((self.name, "wait"))
+
+        def step_end(self):
+            calls.append((self.name, "end"))
+
+        def wake(self):
+            calls.append((self.name, "wake"))
+
+    monkeypatch.setattr(moe_w2_delta, "_BASE_TIER", Tier("base"))
+    monkeypatch.setattr(moe_w2_delta, "_TIER", Tier("delta"))
+    moe_w2_delta.v2_runner_before_forward()
+    moe_w2_delta.v2_runner_step_end()
+    moe_w2_delta.wake_all()
+    assert calls == [
+        ("base", "wait"),
+        ("delta", "wait"),
+        ("base", "end"),
+        ("delta", "end"),
+        ("base", "wake"),
+        ("delta", "wake"),
+    ]
 
 
 def test_strict_replay_converges_or_fails_closed():
