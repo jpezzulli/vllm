@@ -67,6 +67,14 @@ class DSparkDeepseekV4Model(nn.Module):
         self.target_layer_ids = tuple(config.dspark_target_layer_ids)
 
         self.num_dspark_layers = getattr(config, "n_mtp_layers", None) or 3
+        # Target layers are constructed before this draft model, and some
+        # checkpoints rely on DSpark's model-specific default instead of
+        # publishing n_mtp_layers. Validate MoET's complete-draft selection
+        # against the count this model will actually instantiate.
+        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
+
+        if moe_w2_cubit.enabled():
+            moe_w2_cubit.validate_mtp_layer_count(self.num_dspark_layers)
 
         # Shared with the target (aliased by the speculator's loading utility).
         self.embed_tokens = VocabParallelEmbedding(

@@ -297,6 +297,27 @@ def _mtp_layer_count() -> int:
     return value
 
 
+def validate_mtp_layer_count(available: int) -> None:
+    """Validate the resolved DSpark layer count once its model is built.
+
+    Target MoE layers are constructed before the DSpark draft model. Some
+    checkpoints omit ``n_mtp_layers`` and let the draft implementation resolve
+    its model-specific default, so create-time target validation cannot require
+    that metadata. The draft constructor calls this function with the count it
+    will actually instantiate, preserving a fail-closed whole-draft check.
+    """
+    configured = _mtp_layer_count()
+    if not configured:
+        return
+    if available <= 0:
+        raise ValueError(
+            f"DSpark resolved an invalid draft layer count: {available}")
+    if configured != available:
+        raise ValueError(
+            "VLLM_MOE_W2_MTP_LAYERS must match DSpark's resolved draft "
+            f"layer count ({available}), got {configured}")
+
+
 def _layer_index(layer_name: str) -> int | None:
     import re
 
@@ -563,15 +584,8 @@ def _layer_contract(layer) -> dict:
             draft_config = getattr(spec_config, "draft_model_config", None)
             draft_hf_config = getattr(draft_config, "hf_config", None)
             available = getattr(draft_hf_config, "n_mtp_layers", None)
-            if not available:
-                raise ValueError(
-                    "VLLM_MOE_W2_MTP_LAYERS requires DSpark draft-layer "
-                    "metadata (n_mtp_layers) to validate the complete draft"
-                )
-            if mtp_layers != available:
-                raise ValueError(
-                    "VLLM_MOE_W2_MTP_LAYERS must match DSpark's draft "
-                    f"layer count ({available}), got {mtp_layers}")
+            if available is not None:
+                validate_mtp_layer_count(int(available))
         pc = cfg.parallel_config
         if (getattr(pc, "use_ubatching", False)
                 or getattr(pc, "ubatch_size", 0)):

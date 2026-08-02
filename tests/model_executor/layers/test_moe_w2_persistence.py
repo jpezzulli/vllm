@@ -342,14 +342,10 @@ def test_w2_mtp_layers_do_not_extend_the_target_delta_tier(monkeypatch):
         ),
         (
             True,
-            SimpleNamespace(
-                method="dspark",
-                draft_model_config=SimpleNamespace(hf_config=SimpleNamespace()),
-            ),
-            3,
-            "requires DSpark draft-layer metadata",
+            _dspark_config(),
+            2,
+            "must match DSpark's resolved draft layer count",
         ),
-        (True, _dspark_config(), 2, "must match DSpark's draft layer count"),
     ],
 )
 def test_w2_mtp_rejects_unsupported_runtime_configs(
@@ -365,6 +361,28 @@ def test_w2_mtp_rejects_unsupported_runtime_configs(
     ):
         with pytest.raises(ValueError, match=match):
             moe_w2_cubit._layer_contract(_contract_layer())
+
+
+def test_w2_mtp_missing_metadata_defers_until_dspark_construction(monkeypatch):
+    monkeypatch.setenv("VLLM_MOE_W2_MTP_LAYERS", "3")
+    monkeypatch.setattr(moe_w2_delta, "base_enabled", lambda: False)
+    monkeypatch.setattr(moe_w2_gate, "enabled", lambda: False)
+    spec_config = SimpleNamespace(
+        method="dspark",
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+    )
+    with mock.patch(
+        "vllm.config.get_current_vllm_config",
+        return_value=_v2_contract_config(spec_config),
+    ):
+        moe_w2_cubit._layer_contract(_contract_layer())
+
+
+def test_w2_mtp_deferred_validation_uses_resolved_dspark_count(monkeypatch):
+    monkeypatch.setenv("VLLM_MOE_W2_MTP_LAYERS", "3")
+    moe_w2_cubit.validate_mtp_layer_count(3)
+    with pytest.raises(ValueError, match="resolved draft layer count"):
+        moe_w2_cubit.validate_mtp_layer_count(2)
 
 
 def test_w2_mtp_accepts_complete_dspark_draft(monkeypatch):
