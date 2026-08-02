@@ -37,6 +37,7 @@ import os
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils import moe_w2_mapped_host
 from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
     mxfp4_to_codes,
     pack_fragment_major,
@@ -901,6 +902,7 @@ def _try_skip_requant(layer, layer_key: int, E: int, N13: int, K13: int,
     return True
 
 
+@moe_w2_mapped_host.cleanup_on_failure
 def build_layer_planes(layer, layer_key: int) -> None:
     """Quantize one FusedMoE layer's experts to 2-bit planes (GPU, chunked).
 
@@ -908,6 +910,7 @@ def build_layer_planes(layer, layer_key: int) -> None:
     builds fragment-major code planes + scale planes on the GPU, then
     replaces the originals with empty stubs.
     """
+    moe_w2_mapped_host.require_supported_builder(layer_key, "mxfp4")
     _layer_contract(layer)
     if not _ensure_ready():
         raise RuntimeError("moe_w2 cubins missing or failed to load")
@@ -947,10 +950,29 @@ def build_layer_planes(layer, layer_key: int) -> None:
             layer, layer_key, dev, E, N13, K13, N2, K2):
         return
 
-    planes13 = torch.empty(E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
-    sc13 = torch.empty(E, N13 * K13 // 32, dtype=torch.uint8, device=dev)
-    planes2 = torch.empty(E, N2 * K2 // 4, dtype=torch.uint8, device=dev)
-    sc2 = torch.empty(E, N2 * K2 // 32, dtype=torch.uint8, device=dev)
+    mapped = moe_w2_mapped_host.allocate_canonical_layer(
+        layer_key,
+        {
+            "planes13": (E, N13 * K13 // 4),
+            "sc13": (E, N13 * K13 // 32),
+            "planes2": (E, N2 * K2 // 4),
+            "sc2": (E, N2 * K2 // 32),
+        },
+    )
+    if mapped is None:
+        planes13 = torch.empty(
+            E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
+        sc13 = torch.empty(
+            E, N13 * K13 // 32, dtype=torch.uint8, device=dev)
+        planes2 = torch.empty(
+            E, N2 * K2 // 4, dtype=torch.uint8, device=dev)
+        sc2 = torch.empty(
+            E, N2 * K2 // 32, dtype=torch.uint8, device=dev)
+    else:
+        planes13 = mapped["planes13"]
+        sc13 = mapped["sc13"]
+        planes2 = mapped["planes2"]
+        sc2 = mapped["sc2"]
 
     from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
         mxfp4_to_nibbles, pack_fp4_fragment_major)
@@ -1003,6 +1025,23 @@ def build_layer_planes(layer, layer_key: int) -> None:
         # created; the old "start on layer NUM_LAYERS-1" trigger never fired
         # under PP, where layer_keys are local per rank and never reach 42)
 
+    if mapped is not None:
+        # Quantization writes into the canonical host-mapped tensors from the
+        # normal CUDA stream. Complete those writes before descriptors retain
+        # their stable UVA pointers and graph capture can begin.
+        torch.cuda.synchronize(dev)
+        free_bytes, _ = torch.cuda.mem_get_info(dev)
+        moe_w2_mapped_host.record_constructed(
+            layer_key,
+            {
+                "planes13": planes13,
+                "sc13": sc13,
+                "planes2": planes2,
+                "sc2": sc2,
+            },
+            free_bytes,
+        )
+
     _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
                   N13, K13, N2, K2, E,
                   ("w13_weight", "w13_weight_scale", "w2_weight",
@@ -1021,6 +1060,7 @@ def build_layer_planes_fp8(layer, layer_key: int,
     fragment-major planes, then replaces the originals with empty stubs. The
     e2m1 nibbles of the same requant feed the optional FP4 delta tier.
     """
+    moe_w2_mapped_host.require_supported_builder(layer_key, "fp8")
     from vllm.model_executor.layers.quantization.utils import moe_w2_delta
     from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
         fp8_block_to_codes_scales, pack_fp4_fragment_major)
@@ -1112,13 +1152,45 @@ def _consume_planes_cache(layer, layer_key: int, dev,
         E, N13, K13, N2, K2, want_fp4=tier is not None))
     if cached is None:
         return False
-    planes13 = cached["planes13"].view(E, -1).to(dev)
-    sc13 = cached["sc13"].view(E, -1).to(dev)
-    planes2 = cached["planes2"].view(E, -1).to(dev)
-    sc2 = cached["sc2"].view(E, -1).to(dev)
+    mapped = moe_w2_mapped_host.allocate_canonical_layer(
+        layer_key,
+        {
+            "planes13": (E, N13 * K13 // 4),
+            "sc13": (E, N13 * K13 // 32),
+            "planes2": (E, N2 * K2 // 4),
+            "sc2": (E, N2 * K2 // 32),
+        },
+    )
+    if mapped is None:
+        planes13 = cached["planes13"].view(E, -1).to(dev)
+        sc13 = cached["sc13"].view(E, -1).to(dev)
+        planes2 = cached["planes2"].view(E, -1).to(dev)
+        sc2 = cached["sc2"].view(E, -1).to(dev)
+    else:
+        planes13 = mapped["planes13"]
+        sc13 = mapped["sc13"]
+        planes2 = mapped["planes2"]
+        sc2 = mapped["sc2"]
+        planes13.copy_(cached["planes13"].view(E, -1))
+        sc13.copy_(cached["sc13"].view(E, -1))
+        planes2.copy_(cached["planes2"].view(E, -1))
+        sc2.copy_(cached["sc2"].view(E, -1))
     if tier is not None:
         _stage_fp4_host(tier, layer_key, cached["fp13"].view(E, -1),
                         sc13, cached["fp2"].view(E, -1), sc2)
+    if mapped is not None:
+        torch.cuda.synchronize(dev)
+        free_bytes, _ = torch.cuda.mem_get_info(dev)
+        moe_w2_mapped_host.record_constructed(
+            layer_key,
+            {
+                "planes13": planes13,
+                "sc13": sc13,
+                "planes2": planes2,
+                "sc2": sc2,
+            },
+            free_bytes,
+        )
     _finish_layer(layer, layer_key, dev, planes13, sc13, planes2,
                   sc2, N13, K13, N2, K2, E,
                   ("w13_weight", "w13_weight_scale", "w2_weight",
@@ -1139,6 +1211,7 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
     same requant feed the optional FP4 delta tier. The UE8M0 block-32 output
     scales absorb scale_2, so serving needs no extra per-tensor factor.
     """
+    moe_w2_mapped_host.require_supported_builder(layer_key, "nvfp4")
     from vllm.model_executor.layers.quantization.utils import moe_w2_delta
     from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
         nvfp4_to_codes_scales, pack_fp4_fragment_major)
@@ -1315,13 +1388,15 @@ def _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
                     E * btier.slot_bytes / 2**30)
         return
 
-    _check_resident_fit(layer_key, dev,
-                        planes13.nbytes + sc13.nbytes
-                        + planes2.nbytes + sc2.nbytes)
+    mapped = moe_w2_mapped_host.layer_enabled(layer_key)
+    if not mapped:
+        _check_resident_fit(layer_key, dev,
+                            planes13.nbytes + sc13.nbytes
+                            + planes2.nbytes + sc2.nbytes)
     _LAYERS[layer_key] = dict(
         planes13=planes13, sc13=sc13, planes2=planes2, sc2=sc2,
         N13=N13, K13=K13, N2=N2, K2=K2, E=E, tl_idx=_tl,
-        delta_eligible=delta_eligible,
+        delta_eligible=delta_eligible, mapped_host=mapped,
         **contract,
     )
     # Release checkpoint copies; keep CUDA stubs so device probes stay happy.
@@ -1329,9 +1404,9 @@ def _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
     for name in param_names:
         layer.register_parameter(
             name, torch.nn.Parameter(stub, requires_grad=False))
-    logger.info("moe_w2: layer %d planes built (%.2f GiB)", layer_key,
+    logger.info("moe_w2: layer %d planes built (%.2f GiB%s)", layer_key,
                 (planes13.nbytes + sc13.nbytes + planes2.nbytes + sc2.nbytes)
-                / 2**30)
+                / 2**30, ", canonical mapped host" if mapped else "")
 
 
 _resident_fit_checked = False
@@ -2300,6 +2375,10 @@ def _moe_w2_forward_timed(
     # lowers it on low-concurrency configs so short prompts reach the
     # prefill path (and the ensure guarantee) — see _PREFILL_T.
     prefill = T > _PREFILL_T
+    if st.get("mapped_host", False):
+        moe_w2_mapped_host.note_real_kernel_dispatch(
+            layer_key, T, prefill,
+            torch.cuda.is_current_stream_capturing())
     mblock = 16 if prefill else _BLOCK
     sorted_ids, expert_blocks, num_post = moe_align_block_size(
         topk_ids, mblock, st["E"])
@@ -2758,7 +2837,10 @@ def shutdown() -> None:
     """Release model-owned registries/workspaces while retaining cubin modules."""
     global _n_created, _skip_logged, _stream_logged
     global _cutoff_cache, _resident_fit_checked
+    # CUDA graphs are already destroyed by gpu_worker before this hook. Drop
+    # the last tensor views before cudaFreeHost releases their mapped backing.
     _LAYERS.clear()
+    moe_w2_mapped_host.shutdown()
     _WS.clear()
     _n_created = 0
     _skip_logged = False
