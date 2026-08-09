@@ -623,7 +623,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # in process_weights_after_loading.
         from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
         if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
-            if moe_w2_cubit.plan_pack_skip(layer):
+            if moe_w2_cubit.plan_pack_skip(
+                    layer, allow_direct_delta=True):
                 return
             for pname in ("w13_weight", "w13_weight_scale", "w2_weight",
                           "w2_weight_scale"):

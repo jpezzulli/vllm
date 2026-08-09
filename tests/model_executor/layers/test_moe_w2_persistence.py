@@ -226,7 +226,7 @@ def test_direct_cache_plan_requires_matching_delta_and_stubs_all(
         return layer
 
     hit = make_layer()
-    assert moe_w2_cubit.plan_pack_skip(hit)
+    assert moe_w2_cubit.plan_pack_skip(hit, allow_direct_delta=True)
     assert hit._moe_w2_direct_cache
     assert all(
         getattr(hit, name).numel() == 0
@@ -239,7 +239,7 @@ def test_direct_cache_plan_requires_matching_delta_and_stubs_all(
     moe_w2_cubit._fast_loader = None
     monkeypatch.setattr(moe_w2_store, "pack_has_layer", lambda *args: False)
     miss = make_layer()
-    assert not moe_w2_cubit.plan_pack_skip(miss)
+    assert not moe_w2_cubit.plan_pack_skip(miss, allow_direct_delta=True)
     assert miss.w13_weight.numel() > 0
 
 
@@ -252,8 +252,14 @@ def test_fast_generation_uses_planes_cache_plus_separate_delta(
     monkeypatch.setattr(moe_w2_delta, "base_enabled", lambda: False)
     monkeypatch.setattr(moe_w2_delta, "split_enabled", lambda: False)
     tensors = [torch.zeros(1, dtype=torch.uint8) for _ in range(6)]
-    parts = moe_w2_cubit._planes_cache_parts(*tensors)
+    parts = moe_w2_cubit._planes_cache_parts(
+        *tensors, allow_separate_delta=True)
     assert set(parts) == {"planes13", "sc13", "planes2", "sc2"}
+
+    compatible = moe_w2_cubit._planes_cache_parts(*tensors)
+    assert set(compatible) == {
+        "planes13", "sc13", "planes2", "sc2", "fp13", "fp2"
+    }
 
 
 def test_concurrent_pack_writers_merge_layer_manifest(tmp_path, monkeypatch):

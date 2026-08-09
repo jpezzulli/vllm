@@ -514,7 +514,16 @@ def _fp4_plane_nbytes(n: int, k: int) -> int:
     return n * k * 5 // 16 if moe_w2_delta.split_enabled() else n * k // 2
 
 
-def _planes_cache_parts(planes13, sc13, planes2, sc2, fp13, fp2):
+def _planes_cache_parts(
+    planes13,
+    sc13,
+    planes2,
+    sc2,
+    fp13,
+    fp2,
+    *,
+    allow_separate_delta: bool = False,
+):
     """Parts persisted in the existing planes-cache representation.
 
     With the corrected direct loader, the standalone delta pack is the
@@ -529,7 +538,8 @@ def _planes_cache_parts(planes13, sc13, planes2, sc2, fp13, fp2):
     )
     from vllm.model_executor.layers.quantization.utils import moe_w2_delta
     separate_delta = (
-        os.getenv("VLLM_MOE_W2_FAST_LOAD", "0") == "1"
+        allow_separate_delta
+        and os.getenv("VLLM_MOE_W2_FAST_LOAD", "0") == "1"
         and bool(os.getenv("VLLM_MOE_W2_STORE_DIR", "").strip())
         and moe_w2_delta.enabled()
         and not moe_w2_delta.base_enabled()
@@ -663,7 +673,7 @@ def _noop_loader(*args, **kwargs):
     return True if kwargs.get("return_success") else None
 
 
-def plan_pack_skip(layer) -> bool:
+def plan_pack_skip(layer, *, allow_direct_delta: bool = False) -> bool:
     """CREATE-time twin of the boot-from-cache paths: assign this layer's
     key (the same build-order counter process_weights_after_loading uses),
     probe whichever store this config will serve from — the pack sidecars
@@ -726,7 +736,8 @@ def plan_pack_skip(layer) -> bool:
         if files is None:
             return False
         direct = (
-            os.getenv("VLLM_MOE_W2_FAST_LOAD", "0") == "1"
+            allow_direct_delta
+            and os.getenv("VLLM_MOE_W2_FAST_LOAD", "0") == "1"
             and moe_w2_delta.enabled()
             and not moe_w2_delta.split_enabled()
         )
@@ -1080,7 +1091,8 @@ def build_layer_planes(layer, layer_key: int) -> None:
         planes_cache.store(
             lidx,
             _planes_cache_parts(
-                planes13, sc13, planes2, sc2, fp13, fp2))
+                planes13, sc13, planes2, sc2, fp13, fp2,
+                allow_separate_delta=True))
 
     if tier is not None:
         _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
