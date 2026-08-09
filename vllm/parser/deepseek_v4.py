@@ -18,7 +18,6 @@ DeepSeek V4 output format::
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import json
 from typing import TYPE_CHECKING
@@ -50,43 +49,128 @@ DSML_INVOKE_END = f"</{_DSML}invoke>"
 DSML_PARAM_CLOSE = f"</{_DSML}parameter>"
 
 _ESCAPED_DSML = re.escape(_DSML)
-_PARAM_RE = re.compile(
+_PARAM_OPEN_RE = re.compile(
     rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
-    rf"(.*?)</{_ESCAPED_DSML}parameter>",
-    re.DOTALL,
 )
-_PARTIAL_PARAM_RE = re.compile(
-    rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
-    rf"(.*)$",
-    re.DOTALL,
-)
+_MISSING = object()
+
+
+def _skip_space(text: str, pos: int) -> int:
+    while pos < len(text) and text[pos].isspace():
+        pos += 1
+    return pos
+
+
+def _find_unquoted_close(text: str, pos: int) -> int:
+    """Find a parameter close outside a JSON string."""
+    in_string = False
+    escaped = False
+    while pos < len(text):
+        char = text[pos]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            pos += 1
+            continue
+        if char == '"':
+            in_string = True
+            pos += 1
+            continue
+        if text.startswith(DSML_PARAM_CLOSE, pos):
+            return pos
+        pos += 1
+    return -1
+
+
+def _decode_nonstring(value: str) -> object:
+    stripped = value.strip()
+    if not stripped:
+        return {}
+    try:
+        return json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return value
+
+
+def _parse_dsml_sequence(
+    text: str,
+    pos: int,
+    *,
+    partial: bool,
+    expect_close: bool,
+) -> tuple[dict[str, object], int, bool]:
+    params: dict[str, object] = {}
+    while True:
+        pos = _skip_space(text, pos)
+        if expect_close and text.startswith(DSML_PARAM_CLOSE, pos):
+            return params, pos + len(DSML_PARAM_CLOSE), True
+        if pos >= len(text):
+            return params, pos, not expect_close
+
+        match = _PARAM_OPEN_RE.match(text, pos)
+        if match is None:
+            return params, len(text) if partial else pos, False
+
+        name, is_string = match.group(1), match.group(2) == "true"
+        value, pos, complete = _parse_dsml_value(
+            text,
+            match.end(),
+            is_string=is_string,
+            partial=partial,
+        )
+        if value is not _MISSING:
+            params[name] = value
+        if not complete:
+            return params, pos, False
+
+
+def _parse_dsml_value(
+    text: str,
+    pos: int,
+    *,
+    is_string: bool,
+    partial: bool,
+) -> tuple[object, int, bool]:
+    if is_string:
+        close = text.find(DSML_PARAM_CLOSE, pos)
+        if close >= 0:
+            return text[pos:close], close + len(DSML_PARAM_CLOSE), True
+        if partial:
+            return text[pos:], len(text), False
+        return _MISSING, pos, False
+
+    nested_start = _skip_space(text, pos)
+    if _PARAM_OPEN_RE.match(text, nested_start) is not None:
+        return _parse_dsml_sequence(
+            text,
+            nested_start,
+            partial=partial,
+            expect_close=True,
+        )
+
+    close = _find_unquoted_close(text, pos)
+    if close >= 0:
+        value = _decode_nonstring(text[pos:close])
+        return value, close + len(DSML_PARAM_CLOSE), True
+    if partial:
+        try:
+            return json.loads(text[pos:].strip()), len(text), False
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return _MISSING, pos, False
 
 
 def _dsml_arg_converter(raw_args: str, partial: bool) -> str:
-    params: dict[str, object] = {}
-
-    last_end = 0
-    for m in _PARAM_RE.finditer(raw_args):
-        name, is_str, value = m.group(1), m.group(2), m.group(3)
-        if is_str == "true":
-            params[name] = value
-        else:
-            try:
-                params[name] = json.loads(value)
-            except (json.JSONDecodeError, ValueError):
-                params[name] = value
-        last_end = m.end()
-
-    if partial:
-        pm = _PARTIAL_PARAM_RE.search(raw_args, last_end)
-        if pm:
-            name, is_str, value = pm.group(1), pm.group(2), pm.group(3)
-            if is_str == "true":
-                params[name] = value
-            else:
-                with contextlib.suppress(json.JSONDecodeError, ValueError):
-                    params[name] = json.loads(value)
-
+    params, _, _ = _parse_dsml_sequence(
+        raw_args,
+        0,
+        partial=partial,
+        expect_close=False,
+    )
     return json.dumps(params, ensure_ascii=False)
 
 

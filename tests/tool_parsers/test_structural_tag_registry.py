@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from xgrammar import StructuralTag
+from xgrammar import Grammar, StructuralTag
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedFunction,
@@ -120,6 +120,7 @@ def test_get_model_structural_tag_supports_vllm_hermes(
                             "required": ["city"],
                         },
                         "style": "json",
+                        "any_order": False,
                     },
                     "end": "}\n</tool_call>",
                 },
@@ -134,6 +135,7 @@ def test_get_model_structural_tag_supports_vllm_hermes(
                             "required": ["city"],
                         },
                         "style": "json",
+                        "any_order": False,
                     },
                     "end": "}</tool_call>",
                 },
@@ -348,3 +350,34 @@ def test_get_function_parameters_relaxes_function_strict_false():
     )
 
     assert _get_function_parameters(function) is True
+
+
+def test_deepseek_v4_strict_open_object_compiles():
+    tool = ChatCompletionToolsParam(
+        type="function",
+        function={
+            "name": "tool_call",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "arguments": {"type": "object"},
+                },
+                "required": ["name", "arguments"],
+                "additionalProperties": False,
+            },
+        },
+    )
+
+    tag = get_model_structural_tag(
+        model="deepseek_v4",
+        tools=[tool],
+        tool_choice="auto",
+        reasoning=True,
+    )
+
+    assert isinstance(tag, StructuralTag)
+    grammar = Grammar.from_structural_tag(tag)
+    assert grammar is not None
+    assert "xml_object" in str(grammar)

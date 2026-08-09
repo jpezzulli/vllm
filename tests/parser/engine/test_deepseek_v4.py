@@ -165,6 +165,73 @@ class TestArgConverter:
         assert result["n"] == "42"
         assert isinstance(result["n"], str)
 
+    def test_recursive_open_object(self):
+        nested = self._raw(
+            ("command", "true", "printf ready"),
+            ("timeout", "false", "30"),
+        )
+        raw = self._raw(
+            ("name", "true", "terminal"),
+            ("arguments", "false", nested),
+        )
+
+        result = json.loads(_dsml_arg_converter(raw, partial=False))
+
+        assert result == {
+            "name": "terminal",
+            "arguments": {"command": "printf ready", "timeout": 30},
+        }
+
+    def test_deeply_nested_open_object(self):
+        limits = self._raw(("minimum", "false", "2"))
+        filters = self._raw(
+            ("warehouse", "true", "east"),
+            ("limits", "false", limits),
+        )
+        arguments = self._raw(
+            ("sku", "true", "BRIDGE-731"),
+            ("filters", "false", filters),
+        )
+        raw = self._raw(
+            ("name", "true", "inventory_lookup"),
+            ("arguments", "false", arguments),
+        )
+
+        result = json.loads(_dsml_arg_converter(raw, partial=False))
+
+        assert result["arguments"] == {
+            "sku": "BRIDGE-731",
+            "filters": {"warehouse": "east", "limits": {"minimum": 2}},
+        }
+
+    def test_empty_open_object(self):
+        raw = self._raw(
+            ("name", "true", "terminal"),
+            ("arguments", "false", ""),
+        )
+        result = json.loads(_dsml_arg_converter(raw, partial=False))
+        assert result == {"name": "terminal", "arguments": {}}
+
+    def test_partial_recursive_open_object(self):
+        raw = (
+            f"<{_PARAM_OPEN.format(name='arguments', is_str='false')}\n"
+            f"<{_PARAM_OPEN.format(name='command', is_str='true')}printf rea"
+        )
+        result = json.loads(_dsml_arg_converter(raw, partial=True))
+        assert result == {"arguments": {"command": "printf rea"}}
+
+    def test_json_string_may_contain_parameter_close_text(self):
+        marker = "</｜DSML｜parameter>"
+        raw = self._raw(("meta", "false", json.dumps({"text": marker})))
+        result = json.loads(_dsml_arg_converter(raw, partial=False))
+        assert result == {"meta": {"text": marker}}
+
+    def test_string_value_may_contain_parameter_open_text(self):
+        marker = '<｜DSML｜parameter name="quoted" string="true">'
+        raw = self._raw(("text", "true", marker))
+        result = json.loads(_dsml_arg_converter(raw, partial=False))
+        assert result == {"text": marker}
+
 
 # ── Bare </think> absorption and duplicate <think> absorption ─────────
 
@@ -217,8 +284,10 @@ class TestMissingInvokeEnd:
         parser = DeepSeekV4Parser(mock_tokenizer)
         chunks = [
             DSML_TOOL_START,
-            f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
-            f"{_param('location', 'true', 'NYC')}\n",
+            (
+                f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
+                f"{_param('location', 'true', 'NYC')}\n"
+            ),
             DSML_TOOL_END,
             "Done.",
         ]
@@ -538,6 +607,83 @@ def _invoke(name, *params):
 
 def _tool_calls(*invokes):
     return DSML_TOOL_START + "\n".join(invokes) + DSML_TOOL_END
+
+
+class TestNestedOpenObject:
+    @pytest.fixture
+    def bridge_tool(self):
+        return _make_tool(
+            "tool_call",
+            {
+                "name": {"type": "string"},
+                "arguments": {"type": "object"},
+            },
+        )
+
+    def _output(self) -> str:
+        arguments = "\n".join(
+            [
+                _param("command", "true", "printf ready"),
+                _param("timeout", "false", "30"),
+                _param("environment", "false", '{"MODE":"safe"}'),
+            ]
+        )
+        return _tool_calls(
+            _invoke(
+                "tool_call",
+                ("name", "true", "terminal"),
+                ("arguments", "false", arguments),
+            )
+        )
+
+    def test_non_streaming(self, mock_tokenizer, mock_request, bridge_tool):
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[bridge_tool])
+        mock_request.tools = [bridge_tool]
+
+        result = parser.extract_tool_calls(self._output(), mock_request)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        call = result.tool_calls[0]
+        assert call.function.name == "tool_call"
+        assert json.loads(call.function.arguments) == {
+            "name": "terminal",
+            "arguments": {
+                "command": "printf ready",
+                "timeout": 30,
+                "environment": {"MODE": "safe"},
+            },
+        }
+
+    @pytest.mark.parametrize("chunk_size", [1, 5, 17, 64])
+    def test_streaming(
+        self,
+        mock_tokenizer,
+        mock_request,
+        bridge_tool,
+        chunk_size,
+    ):
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[bridge_tool])
+        mock_request.tools = [bridge_tool]
+        output = self._output()
+        chunks = [output[i : i + chunk_size] for i in range(0, len(output), chunk_size)]
+
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+        arguments = collect_tool_arguments(results)
+        content = collect_content(results)
+
+        assert collect_function_name(results) == "tool_call"
+        assert json.loads(arguments) == {
+            "name": "terminal",
+            "arguments": {
+                "command": "printf ready",
+                "timeout": 30,
+                "environment": {"MODE": "safe"},
+            },
+        }
+        assert "DSML" not in arguments
+        assert "DSML" not in content
+        assert "R0TURN" not in content
 
 
 class TestParallelUnwrapping:
