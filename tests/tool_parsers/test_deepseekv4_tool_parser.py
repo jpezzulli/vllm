@@ -377,34 +377,6 @@ def test_guarded_artificial_wrapper_rejects_unknown_inner_keys():
     }
 
 
-def _image_tool() -> ChatCompletionToolsParam:
-    return ChatCompletionToolsParam(
-        type="function",
-        function={
-            "name": "image_generate",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "prompt": {"type": "string"},
-                    "options": {
-                        "type": "object",
-                        "properties": {
-                            "size": {
-                                "type": "object",
-                                "properties": {
-                                    "width": {"type": "integer"},
-                                    "height": {"type": "integer"},
-                                },
-                            },
-                            "seed": {"type": "integer"},
-                        },
-                    },
-                },
-            },
-        },
-    )
-
-
 def _terminal_tool() -> ChatCompletionToolsParam:
     return ChatCompletionToolsParam(
         type="function",
@@ -421,36 +393,36 @@ def _terminal_tool() -> ChatCompletionToolsParam:
     )
 
 
-def _image_invoke() -> str:
+def _terminal_invoke() -> str:
     return (
-        f'{INV_START}image_generate">'
-        f'{PARAM_START}prompt" string="true">draw a copper owl{PARAM_END}'
-        f'{PARAM_START}options" string="false">'
-        '{"size":{"width":1024,"height":768},"seed":731}'
+        f'{INV_START}terminal_exec">'
+        f'{PARAM_START}command" string="true">printf ready{PARAM_END}'
+        f'{PARAM_START}environment" string="false">'
+        '{"MODE":"safe","FLAGS":{"trace":false}}'
         f"{PARAM_END}{INV_END}"
     )
 
 
-def test_orphan_invoke_recovers_declared_nested_image_tool_non_streaming():
-    tool = _image_tool()
-    output = _image_invoke() + TC_END + "\nImage queued."
+def test_orphan_invoke_recovers_declared_nested_terminal_tool_non_streaming():
+    tool = _terminal_tool()
+    output = _terminal_invoke() + TC_END + "\nCommand queued."
     parser = make_parser([tool])
 
     result = parser.extract_tool_calls(output, make_request([tool]))
 
     assert result.tools_called
-    assert result.content == "\nImage queued."
-    assert result.tool_calls[0].function.name == "image_generate"
+    assert result.content == "\nCommand queued."
+    assert result.tool_calls[0].function.name == "terminal_exec"
     assert json.loads(result.tool_calls[0].function.arguments) == {
-        "prompt": "draw a copper owl",
-        "options": {"size": {"width": 1024, "height": 768}, "seed": 731},
+        "command": "printf ready",
+        "environment": {"MODE": "safe", "FLAGS": {"trace": False}},
     }
 
 
 def test_orphan_invoke_streams_without_control_text_leakage():
-    tool = _image_tool()
+    tool = _terminal_tool()
     parser = make_parser([tool])
-    output = _image_invoke() + TC_END
+    output = _terminal_invoke() + TC_END
 
     deltas = stream(parser, output, chunk_size=1, request=make_request([tool]))
 
@@ -462,10 +434,10 @@ def test_orphan_invoke_streams_without_control_text_leakage():
     ]
     arguments = reconstruct_args(deltas)
     content = "".join(delta.content or "" for delta in deltas)
-    assert names == ["image_generate"]
-    assert json.loads(arguments)["options"]["size"] == {
-        "width": 1024,
-        "height": 768,
+    assert names == ["terminal_exec"]
+    assert json.loads(arguments)["environment"] == {
+        "MODE": "safe",
+        "FLAGS": {"trace": False},
     }
     assert "DSML" not in content
     assert "R0TURN" not in content
@@ -476,11 +448,11 @@ def test_orphan_invoke_streams_without_control_text_leakage():
 
 @pytest.mark.parametrize("mode", ["unknown", "no-tools", "tool-choice-none"])
 def test_false_orphan_invoke_stays_content(mode: str):
-    tool = _image_tool()
+    tool = _terminal_tool()
     request = make_request([tool])
-    output = _image_invoke()
+    output = _terminal_invoke()
     if mode == "unknown":
-        output = output.replace("image_generate", "unknown_image_tool", 1)
+        output = output.replace("terminal_exec", "unknown_terminal_tool", 1)
     elif mode == "no-tools":
         request.tools = []
     else:
@@ -496,11 +468,11 @@ def test_false_orphan_invoke_stays_content(mode: str):
 
 @pytest.mark.parametrize("mode", ["unknown", "no-tools", "tool-choice-none"])
 def test_false_orphan_invoke_streaming_stays_content(mode: str):
-    tool = _image_tool()
+    tool = _terminal_tool()
     request = make_request([tool])
-    output = _image_invoke()
+    output = _terminal_invoke()
     if mode == "unknown":
-        output = output.replace("image_generate", "unknown_image_tool", 1)
+        output = output.replace("terminal_exec", "unknown_terminal_tool", 1)
     elif mode == "no-tools":
         request.tools = []
     else:
@@ -517,15 +489,7 @@ def test_quoted_marker_then_real_wrapped_terminal_call():
     tool = _terminal_tool()
     request = make_request([tool])
     quoted = f"Documentation quotes {INV_START} literally. "
-    invoke = (
-        f'{INV_START}terminal_exec">'
-        f'{PARAM_START}command" string="true">printf ready{PARAM_END}'
-        f'{PARAM_START}environment" string="false">'
-        '{"MODE":"safe","FLAGS":{"trace":false}}'
-        f"{PARAM_END}"
-        f"{INV_END}"
-    )
-    output = quoted + TC_START + invoke + TC_END
+    output = quoted + TC_START + _terminal_invoke() + TC_END
 
     result = make_parser([tool]).extract_tool_calls(output, request)
     parser = make_parser([tool])
@@ -545,10 +509,10 @@ def test_quoted_marker_then_real_wrapped_terminal_call():
 
 
 def test_foreign_wrapper_is_preserved_as_content():
-    tool = _image_tool()
+    tool = _terminal_tool()
     foreign = (
         "<｜DSML｜function_calls>"
-        + _image_invoke()
+        + _terminal_invoke()
         + "</｜DSML｜function_calls>"
     )
 
@@ -563,24 +527,26 @@ def test_foreign_wrapper_is_preserved_as_content():
 
 
 def test_declared_names_do_not_leak_between_streams():
-    tool = _image_tool()
+    tool = _terminal_tool()
     parser = make_parser([tool])
-    first = stream(parser, _image_invoke(), 3, make_request([tool]))
-    assert json.loads(reconstruct_args(first))["prompt"] == "draw a copper owl"
+    first = stream(parser, _terminal_invoke(), 3, make_request([tool]))
+    assert json.loads(reconstruct_args(first))["command"] == "printf ready"
 
-    second = stream(parser, _image_invoke(), 3, make_request([]))
+    second = stream(parser, _terminal_invoke(), 3, make_request([]))
 
     assert reconstruct_args(second) == ""
-    assert "".join(delta.content or "" for delta in second) == _image_invoke()
+    assert "".join(delta.content or "" for delta in second) == _terminal_invoke()
 
     non_streaming = make_parser([tool])
     first_result = non_streaming.extract_tool_calls(
-        _image_invoke(), make_request([tool])
+        _terminal_invoke(), make_request([tool])
     )
-    second_result = non_streaming.extract_tool_calls(_image_invoke(), make_request([]))
+    second_result = non_streaming.extract_tool_calls(
+        _terminal_invoke(), make_request([])
+    )
     assert first_result.tools_called
     assert not second_result.tools_called
-    assert second_result.content == _image_invoke()
+    assert second_result.content == _terminal_invoke()
 
 
 @pytest.mark.skip_global_cleanup
