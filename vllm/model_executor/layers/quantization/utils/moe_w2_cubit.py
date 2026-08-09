@@ -33,6 +33,7 @@ The MTP drafter keeps the stock DeepGEMM-MXFP4 path: layer names containing
 import ctypes
 import functools
 import os
+import time
 
 import torch
 
@@ -513,6 +514,32 @@ def _fp4_plane_nbytes(n: int, k: int) -> int:
     return n * k * 5 // 16 if moe_w2_delta.split_enabled() else n * k // 2
 
 
+def _planes_cache_parts(planes13, sc13, planes2, sc2, fp13, fp2):
+    """Parts persisted in the existing planes-cache representation.
+
+    With the corrected direct loader, the standalone delta pack is the
+    authoritative FP4 cache. Avoid writing a second 138 GiB FP4 copy into
+    the planes cache; all other configurations retain their existing parts.
+    """
+    parts = dict(
+        planes13=planes13,
+        sc13=sc13,
+        planes2=planes2,
+        sc2=sc2,
+    )
+    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+    separate_delta = (
+        os.getenv("VLLM_MOE_W2_FAST_LOAD", "0") == "1"
+        and bool(os.getenv("VLLM_MOE_W2_STORE_DIR", "").strip())
+        and moe_w2_delta.enabled()
+        and not moe_w2_delta.base_enabled()
+        and not moe_w2_delta.split_enabled()
+    )
+    if not separate_delta:
+        parts.update(fp13=fp13, fp2=fp2)
+    return parts
+
+
 # Loader-level skip (the planes-cache/pack "v1.5 follow-up"): layers the
 # pack already serves never need their checkpoint experts in host RAM at
 # all. Decided at CREATE time (sidecar probe), executed by stubbing the big
@@ -523,6 +550,9 @@ def _fp4_plane_nbytes(n: int, k: int) -> int:
 # that intermittently OOM'd the box when boots overlapped.
 _n_created = 0
 _skip_logged = False
+_fast_loader = None
+_fast_probe_s = 0.0
+_fast_probe_layers = 0
 
 
 def _layer_contract(layer) -> dict:
@@ -681,14 +711,56 @@ def plan_pack_skip(layer) -> bool:
             if not pack_has_layer(ftag, key, n_keys, E, fslot):
                 return False
     else:
-        # GPU-resident: the planes cache is the only source that can
-        # replace the checkpoint requant — probe it (keyed by transformer
-        # layer index, sized exactly like process-time try_load).
+        # GPU-resident: cached 2-bit planes are the runtime base. In the
+        # corrected fast path the matching delta pack supplies FP4 directly,
+        # so the planes cache does not need a duplicate FP4 representation.
         lidx = _pc.layer_idx_from_name(getattr(layer, "layer_name", ""))
-        if lidx is None or not _pc.cache_has_layer(
-                lidx, _pc.expected_sizes(
-                    E, N13, K13, N2, K2, want_fp4=moe_w2_delta.enabled())):
+        base_sizes = _pc.expected_sizes(
+            E, N13, K13, N2, K2, want_fp4=False)
+        t0 = time.perf_counter()
+        files = None if lidx is None else _pc.cache_layer_files(
+            lidx, base_sizes)
+        global _fast_probe_s, _fast_probe_layers
+        _fast_probe_s += time.perf_counter() - t0
+        _fast_probe_layers += 1
+        if files is None:
             return False
+        direct = (
+            os.getenv("VLLM_MOE_W2_FAST_LOAD", "0") == "1"
+            and moe_w2_delta.enabled()
+            and not moe_w2_delta.split_enabled()
+        )
+        if direct:
+            n_keys = _layer_cutoff() + 1
+            delta_slot = N13 * K13 // 2 + N2 * K2 // 2
+            if not pack_has_layer(
+                    "delta", key, n_keys, E, delta_slot):
+                return False
+            from vllm.model_executor.layers.quantization.utils.moe_w2_fast_loader import (  # noqa: E501
+                DirectPlaneBatchLoader,
+            )
+            global _fast_loader
+            if _fast_loader is None:
+                workers = int(os.getenv(
+                    "VLLM_MOE_W2_FAST_LOAD_WORKERS", "4"))
+                batch_layers = int(os.getenv(
+                    "VLLM_MOE_W2_FAST_LOAD_BATCH_LAYERS", "12"))
+                _fast_loader = DirectPlaneBatchLoader(
+                    workers=workers, batch_layers=batch_layers)
+                logger.info(
+                    "moe_w2 FAST-LOAD direct armed: existing planes cache "
+                    "+ matching delta pack; workers=%d batch_layers=%d; "
+                    "no CPU W2 projection or reconstruction",
+                    workers, batch_layers)
+            _fast_loader.add_layer(key, files, base_sizes)
+            layer._moe_w2_direct_cache = True
+        elif moe_w2_delta.enabled():
+            # Preserve the original serial cache path for configurations that
+            # keep FP4 parts alongside the base planes.
+            full_sizes = _pc.expected_sizes(
+                E, N13, K13, N2, K2, want_fp4=True)
+            if _pc.cache_layer_files(lidx, full_sizes) is None:
+                return False
     for pname in ("w13_weight", "w13_weight_scale",
                   "w2_weight", "w2_weight_scale"):
         p = getattr(layer, pname)
@@ -704,6 +776,11 @@ def plan_pack_skip(layer) -> bool:
             "neither host-staged nor copied from the checkpoint "
             "(first: key %d)", key)
     logger.debug("moe_w2: layer key %d loader-skipped", key)
+    if key + 1 == _layer_cutoff():
+        logger.info(
+            "moe_w2 FAST-LOAD cache eligibility: %d layer probes in "
+            "%.3f s",
+            _fast_probe_layers, _fast_probe_s)
     return True
 
 
@@ -1002,8 +1079,8 @@ def build_layer_planes(layer, layer_key: int) -> None:
     if planes_cache.enabled() and lidx is not None:
         planes_cache.store(
             lidx,
-            dict(planes13=planes13, sc13=sc13, planes2=planes2, sc2=sc2,
-                 fp13=fp13, fp2=fp2))
+            _planes_cache_parts(
+                planes13, sc13, planes2, sc2, fp13, fp2))
 
     if tier is not None:
         _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
@@ -1135,8 +1212,18 @@ def _consume_planes_cache(layer, layer_key: int, dev,
     if not planes_cache.enabled() or lidx is None:
         return False
     tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
-    cached = planes_cache.try_load(lidx, planes_cache.expected_sizes(
-        E, N13, K13, N2, K2, want_fp4=tier is not None))
+    direct = getattr(layer, "_moe_w2_direct_cache", False)
+    if direct:
+        if _fast_loader is None:
+            raise RuntimeError("moe_w2 direct fast-load coordinator missing")
+        if tier is None or layer_key not in tier._store:
+            raise RuntimeError(
+                f"moe_w2 direct fast-load layer {layer_key} lost its "
+                "matching delta cache")
+        cached = _fast_loader.take(layer_key)
+    else:
+        cached = planes_cache.try_load(lidx, planes_cache.expected_sizes(
+            E, N13, K13, N2, K2, want_fp4=tier is not None))
     if cached is None:
         return False
     mapped = moe_w2_mapped_host.allocate_canonical_layer(
@@ -1162,7 +1249,7 @@ def _consume_planes_cache(layer, layer_key: int, dev,
         sc13.copy_(cached["sc13"].view(E, -1))
         planes2.copy_(cached["planes2"].view(E, -1))
         sc2.copy_(cached["sc2"].view(E, -1))
-    if tier is not None:
+    if tier is not None and not direct:
         _stage_fp4_host(tier, layer_key, cached["fp13"].view(E, -1),
                         sc13, cached["fp2"].view(E, -1), sc2)
     if mapped is not None:
@@ -1182,7 +1269,11 @@ def _consume_planes_cache(layer, layer_key: int, dev,
                   sc2, N13, K13, N2, K2, E,
                   ("w13_weight", "w13_weight_scale", "w2_weight",
                    "w2_weight_scale"))
-    logger.info("moe_w2: layer %d planes from cache", lidx)
+    if direct:
+        _fast_loader.release_consumed(layer_key)
+    logger.info(
+        "moe_w2: layer %d planes direct from cache%s",
+        lidx, ", delta direct from pack" if direct else "")
     return True
 
 
@@ -1313,9 +1404,10 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
                 fp2[e0 + i] = _pack_fp4_plane(nib)
 
     if planes_cache.enabled() and lidx is not None:
-        planes_cache.store(lidx, dict(planes13=planes13, sc13=sc13,
-                                      planes2=planes2, sc2=sc2,
-                                      fp13=fp13, fp2=fp2))
+        planes_cache.store(
+            lidx,
+            _planes_cache_parts(
+                planes13, sc13, planes2, sc2, fp13, fp2))
 
     if tier is not None:
         _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
@@ -2820,6 +2912,7 @@ def shutdown() -> None:
     """Release model-owned registries/workspaces while retaining cubin modules."""
     global _n_created, _skip_logged, _stream_logged
     global _cutoff_cache, _resident_fit_checked
+    global _fast_loader, _fast_probe_s, _fast_probe_layers
     # CUDA graphs are already destroyed by gpu_worker before this hook. Drop
     # the last tensor views before cudaFreeHost releases their mapped backing.
     _LAYERS.clear()
@@ -2830,4 +2923,9 @@ def shutdown() -> None:
     _stream_logged = False
     _cutoff_cache = None
     _resident_fit_checked = False
+    if _fast_loader is not None:
+        _fast_loader.close()
+    _fast_loader = None
+    _fast_probe_s = 0.0
+    _fast_probe_layers = 0
     ready.cache_clear()

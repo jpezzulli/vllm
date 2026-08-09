@@ -15,6 +15,7 @@ import vllm.envs as vllm_envs
 from vllm.model_executor.layers.quantization.utils import (
     moe_w2_cubit,
     moe_w2_delta,
+    moe_w2_fast_loader,
     moe_w2_planes,
     moe_w2_planes_cache,
     moe_w2_store,
@@ -141,6 +142,118 @@ def test_manifest_geometry_and_layer_range_are_strict(pack_env):
         json.dump(meta, f)
 
     assert not moe_w2_store.pack_has_layer("base", 0, 2, 2, 16)
+
+
+def test_plane_cache_file_contract_is_cheap_and_fail_closed(
+    tmp_path, monkeypatch
+):
+    meta = {"cache": "expected"}
+    monkeypatch.setattr(moe_w2_planes_cache, "_rank_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(moe_w2_planes_cache, "_meta", lambda: meta)
+    monkeypatch.setenv("VLLM_MOE_W2_PLANES_CACHE", str(tmp_path))
+    with open(tmp_path / "meta.json", "w") as f:
+        json.dump(meta, f)
+    sizes = {"planes13": 8, "sc13": 4}
+    for part, size in sizes.items():
+        (tmp_path / f"layer7.{part}.bin").write_bytes(bytes(size))
+
+    files = moe_w2_planes_cache.cache_layer_files(7, sizes)
+    assert files is not None
+    assert set(files) == set(sizes)
+    (tmp_path / "layer7.sc13.bin").write_bytes(b"bad")
+    assert moe_w2_planes_cache.cache_layer_files(7, sizes) is None
+
+
+def test_direct_plane_loader_batches_without_projection(tmp_path):
+    sizes = {"planes13": 8, "sc13": 4, "planes2": 6, "sc2": 2}
+    loader = moe_w2_fast_loader.DirectPlaneBatchLoader(
+        workers=2, batch_layers=2)
+    for key in range(3):
+        files = {}
+        for part, size in sizes.items():
+            path = tmp_path / f"layer{key}.{part}.bin"
+            path.write_bytes(bytes([key + 1]) * size)
+            files[part] = str(path)
+        loader.add_layer(key, files, sizes)
+
+    for key in range(3):
+        cached = loader.take(key)
+        assert set(cached) == set(sizes)
+        assert all(
+            torch.equal(value, torch.full_like(value, key + 1))
+            for value in cached.values()
+        )
+        loader.release_consumed(key)
+    assert [event["layers"] for event in loader.batch_events] == [[0, 1], [2]]
+    assert all(event["workers"] == 2 for event in loader.batch_events)
+    loader.close()
+
+
+def test_direct_cache_plan_requires_matching_delta_and_stubs_all(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("VLLM_MOE_W2", "1")
+    monkeypatch.setenv("VLLM_MOE_W2_FAST_LOAD", "1")
+    monkeypatch.setenv("VLLM_MOE_W2_NUM_LAYERS", "2")
+    monkeypatch.setattr(moe_w2_delta, "base_enabled", lambda: False)
+    monkeypatch.setattr(moe_w2_delta, "enabled", lambda: True)
+    monkeypatch.setattr(moe_w2_delta, "split_enabled", lambda: False)
+    monkeypatch.setattr(
+        moe_w2_planes_cache,
+        "cache_layer_files",
+        lambda _idx, sizes: {
+            part: str(tmp_path / f"{part}.bin") for part in sizes
+        },
+    )
+    monkeypatch.setattr(moe_w2_store, "pack_has_layer", lambda *args: True)
+    moe_w2_cubit._n_created = 0
+    moe_w2_cubit._cutoff_cache = None
+    moe_w2_cubit._fast_loader = None
+
+    def make_layer():
+        layer = _contract_layer(layer_name="model.layers.0.mlp.experts")
+        layer.w13_weight = torch.nn.Parameter(
+            torch.zeros(2, 16, 32, dtype=torch.uint8), requires_grad=False)
+        layer.w13_weight_scale = torch.nn.Parameter(
+            torch.zeros(2, 16, 2, dtype=torch.uint8), requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(
+            torch.zeros(2, 16, 32, dtype=torch.uint8), requires_grad=False)
+        layer.w2_weight_scale = torch.nn.Parameter(
+            torch.zeros(2, 16, 2, dtype=torch.uint8), requires_grad=False)
+        for name in ("w13_weight", "w13_weight_scale", "w2_weight",
+                     "w2_weight_scale"):
+            getattr(layer, name).weight_loader = lambda *_a, **_k: None
+        return layer
+
+    hit = make_layer()
+    assert moe_w2_cubit.plan_pack_skip(hit)
+    assert hit._moe_w2_direct_cache
+    assert all(
+        getattr(hit, name).numel() == 0
+        for name in ("w13_weight", "w13_weight_scale", "w2_weight",
+                     "w2_weight_scale")
+    )
+
+    moe_w2_cubit._n_created = 0
+    moe_w2_cubit._fast_loader.close()
+    moe_w2_cubit._fast_loader = None
+    monkeypatch.setattr(moe_w2_store, "pack_has_layer", lambda *args: False)
+    miss = make_layer()
+    assert not moe_w2_cubit.plan_pack_skip(miss)
+    assert miss.w13_weight.numel() > 0
+
+
+def test_fast_generation_uses_planes_cache_plus_separate_delta(
+    monkeypatch,
+):
+    monkeypatch.setenv("VLLM_MOE_W2_FAST_LOAD", "1")
+    monkeypatch.setenv("VLLM_MOE_W2_STORE_DIR", "/cache")
+    monkeypatch.setattr(moe_w2_delta, "enabled", lambda: True)
+    monkeypatch.setattr(moe_w2_delta, "base_enabled", lambda: False)
+    monkeypatch.setattr(moe_w2_delta, "split_enabled", lambda: False)
+    tensors = [torch.zeros(1, dtype=torch.uint8) for _ in range(6)]
+    parts = moe_w2_cubit._planes_cache_parts(*tensors)
+    assert set(parts) == {"planes13", "sc13", "planes2", "sc2"}
 
 
 def test_concurrent_pack_writers_merge_layer_manifest(tmp_path, monkeypatch):

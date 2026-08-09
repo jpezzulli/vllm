@@ -207,20 +207,39 @@ def cache_has_layer(layer_idx: int, sizes: dict[str, int]) -> bool:
     reading a byte of plane data? Same validity rules (meta match + every
     required part at its exact expected size); os.path.getsize only. Never
     raises."""
+    return cache_layer_files(layer_idx, sizes) is not None
+
+
+def cache_layer_files(
+    layer_idx: int,
+    sizes: dict[str, int],
+) -> dict[str, str] | None:
+    """Return exact-size files for one compatible cached layer.
+
+    This is the cheap eligibility contract used by loader-level skipping:
+    cache-key metadata plus existence and exact size for every requested
+    part. The payload is deliberately not read or hashed here.
+    """
     if not enabled() or _broken:
-        return False
+        return None
     try:
         d = _rank_dir()
         mp = os.path.join(d, "meta.json")
-        if not os.path.exists(mp) or json.load(open(mp)) != _meta():
-            return False
+        if not os.path.exists(mp):
+            return None
+        with open(mp) as f:
+            meta = json.load(f)
+        if meta != _meta():
+            return None
+        files = {}
         for part, nbytes in sizes.items():
             p = os.path.join(d, f"layer{layer_idx}.{part}.bin")
             if not os.path.exists(p) or os.path.getsize(p) != nbytes:
-                return False
-        return True
+                return None
+            files[part] = p
+        return files
     except Exception:  # noqa: BLE001 - probe only, staging path still works
-        return False
+        return None
 
 
 def try_load(layer_idx: int,
@@ -229,28 +248,15 @@ def try_load(layer_idx: int,
     if not enabled() or _broken:
         return None
     try:
-        d = _rank_dir()
-        mp = os.path.join(d, "meta.json")
-        if not os.path.exists(mp):
-            return None
-        if json.load(open(mp)) != _meta():
-            logger.warning(
-                "moe_w2 planes cache: metadata mismatch in %s — treating "
-                "as a normal cache miss", d)
+        files = cache_layer_files(layer_idx, sizes)
+        if files is None:
             return None
         out = {}
         for part, nbytes in sizes.items():
-            p = os.path.join(d, f"layer{layer_idx}.{part}.bin")
-            if not os.path.exists(p):
-                logger.info("moe_w2 planes cache: MISS layer %d (%s absent)",
-                            layer_idx, part)
+            raw = np.fromfile(files[part], dtype=np.uint8)
+            if raw.nbytes != nbytes:
                 return None
-            if os.path.getsize(p) != nbytes:
-                logger.info(
-                    "moe_w2 planes cache: MISS layer %d (%s size %d != %d)",
-                    layer_idx, part, os.path.getsize(p), nbytes)
-                return None
-            out[part] = torch.from_numpy(np.fromfile(p, dtype=np.uint8))
+            out[part] = torch.from_numpy(raw)
         return out
     except Exception as e:  # noqa: BLE001
         logger.warning("moe_w2 planes cache: read failed (%s) — rebuilding",
