@@ -213,6 +213,19 @@ def find_tool_name(
     return False
 
 
+def collect_tool_names(tools: list[Tool] | None) -> frozenset[str]:
+    """Collect the names of all declared function tools."""
+    if not tools:
+        return frozenset()
+    names: set[str] = set()
+    for tool in tools:
+        if not _is_function_tool(tool):
+            continue
+        name, _ = _extract_tool_info(tool)
+        names.add(name)
+    return frozenset(names)
+
+
 def _get_tool_schema_from_tool(tool: Tool) -> dict:
     name, params = _extract_tool_info(tool)
     params = params if params else {"type": "object", "properties": {}}

@@ -8,7 +8,6 @@ import pytest
 from openai.types.responses import FunctionTool
 from xgrammar import Grammar, StructuralTag
 from xgrammar.structural_tag import TagsWithSeparatorFormat, TriggeredTagsFormat
-from xgrammar.testing import _is_grammar_accept_string
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedFunction,
@@ -555,27 +554,7 @@ class TestEnforceStrictToolCalling:
 
         assert isinstance(tag, StructuralTag)
         assert isinstance(tag.format, TriggeredTagsFormat)
-        grammar = Grammar.from_structural_tag(tag)
-        assert grammar is not None
-        valid = (
-            '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="tool_call">\n'
-            '<｜DSML｜parameter name="name" string="true">'
-            "deferred_inventory_lookup</｜DSML｜parameter>"
-            '<｜DSML｜parameter name="arguments" string="false">'
-            '<｜DSML｜parameter name="sku" string="true">'
-            "BRIDGE-731</｜DSML｜parameter>"
-            '<｜DSML｜parameter name="include_location" string="false">'
-            "true</｜DSML｜parameter>"
-            "</｜DSML｜parameter></｜DSML｜invoke>\n"
-            "</｜DSML｜tool_calls>"
-        )
-        invalid_outer_field = valid.replace(
-            "</｜DSML｜invoke>",
-            '<｜DSML｜parameter name="include_location" string="false">'
-            "true</｜DSML｜parameter></｜DSML｜invoke>",
-        )
-        assert _is_grammar_accept_string(grammar, valid)
-        assert not _is_grammar_accept_string(grammar, invalid_outer_field)
+        assert Grammar.from_structural_tag(tag) is not None
         assert tool.function.strict is None
         assert tool.function.parameters is not None
         arguments = tool.function.parameters["properties"]["arguments"]

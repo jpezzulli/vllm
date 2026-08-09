@@ -14,4 +14,6 @@ class DeepSeekV4ToolParser(DeepSeekV32ToolParser):
 
     tool_call_start_token: str = "<｜DSML｜tool_calls>"
     tool_call_end_token: str = "</｜DSML｜tool_calls>"
+    foreign_tool_call_start_token: str = "<｜DSML｜function_calls>"
+    foreign_tool_call_end_token: str = "</｜DSML｜function_calls>"
     structural_tag_model = "deepseek_v4"

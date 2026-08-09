@@ -74,6 +74,7 @@ def make_parser(tools=None) -> DeepSeekV4ToolParser:
 def make_request(tools=None) -> MagicMock:
     req = MagicMock()
     req.tools = tools
+    req.tool_choice = "auto"
     return req
 
 
@@ -84,9 +85,15 @@ def build_tool_call(func_name: str, params: dict[str, str]) -> str:
     return f'{TC_START}\n{INV_START}{func_name}">\n{param_strs}{INV_END}\n{TC_END}'
 
 
-def stream(parser: DeepSeekV4ToolParser, full_text: str, chunk_size: int = 7):
+def stream(
+    parser: DeepSeekV4ToolParser,
+    full_text: str,
+    chunk_size: int = 7,
+    request=None,
+):
     deltas = []
     previous_text = ""
+    request = request or make_request(parser.tools)
     for start in range(0, len(full_text), chunk_size):
         delta_text = full_text[start : start + chunk_size]
         current_text = previous_text + delta_text
@@ -97,7 +104,7 @@ def stream(parser: DeepSeekV4ToolParser, full_text: str, chunk_size: int = 7):
             previous_token_ids=[],
             current_token_ids=[],
             delta_token_ids=[1],
-            request=make_request(),
+            request=request,
         )
         previous_text = current_text
         if delta is not None:
@@ -171,7 +178,8 @@ def test_streaming_extracts_complete_invokes():
     assert json.loads(reconstruct_args(deltas)) == {"query": "deepseek v4"}
 
 
-def test_streaming_emits_incremental_argument_chunks():
+@pytest.mark.parametrize("chunk_size", [1, 4, 17])
+def test_streaming_emits_incremental_argument_chunks(chunk_size: int):
     tool = ChatCompletionToolsParam(
         function=FunctionDefinition(
             name="plan_trip",
@@ -199,7 +207,7 @@ def test_streaming_emits_incremental_argument_chunks():
         f"{TC_END}"
     )
 
-    deltas = stream(parser, full_text, chunk_size=4)
+    deltas = stream(parser, full_text, chunk_size=chunk_size)
     arg_chunks = [
         tool_call.function.arguments
         for delta in deltas
@@ -214,6 +222,11 @@ def test_streaming_emits_incremental_argument_chunks():
         "cities": ["Beijing", "Shanghai", "Tokyo", "New York"],
         "notes": "靠窗座位",
     }
+    content = "".join(delta.content or "" for delta in deltas)
+    assert "DSML" not in content
+    assert not parser._in_tool_calls
+    assert parser._active_tool_index is None
+    assert parser._buffer == ""
 
 
 def _with_strict(
@@ -303,164 +316,271 @@ def test_extract_tool_calls_arguments_wrapper():
     assert args == {"location": "Beijing"}
 
 
-def _deferred_bridge_tool() -> ChatCompletionToolsParam:
-    return ChatCompletionToolsParam(
+def test_string_attribute_and_guarded_wrapper_semantics():
+    tool = ChatCompletionToolsParam(
         type="function",
         function={
-            "name": "tool_call",
-            "description": "Invoke a deferred tool by name with the given arguments.",
+            "name": "record_values",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string"},
+                    "literal": {"type": "integer"},
+                    "coerced": {"type": "integer"},
                     "arguments": {"type": "object"},
                 },
-                "required": ["name", "arguments"],
+            },
+        },
+    )
+    parser = make_parser([tool])
+    output = (
+        f'{TC_START}{INV_START}record_values">'
+        f'{PARAM_START}literal" string="true">007{PARAM_END}'
+        f'{PARAM_START}coerced" string="false">7{PARAM_END}'
+        f'{PARAM_START}arguments" string="false">'
+        '{"nested":{"enabled":true}}'
+        f"{PARAM_END}"
+        f"{INV_END}{TC_END}"
+    )
+
+    result = parser.extract_tool_calls(output, make_request([tool]))
+
+    assert json.loads(result.tool_calls[0].function.arguments) == {
+        "literal": "007",
+        "coerced": 7,
+        "arguments": {"nested": {"enabled": True}},
+    }
+
+
+def test_guarded_artificial_wrapper_rejects_unknown_inner_keys():
+    tool = ChatCompletionToolsParam(
+        type="function",
+        function={
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+            },
+        },
+    )
+    parser = make_parser([tool])
+    output = (
+        f'{TC_START}{INV_START}get_weather">'
+        f'{PARAM_START}arguments" string="false">'
+        '{"unknown":"Beijing"}'
+        f"{PARAM_END}{INV_END}{TC_END}"
+    )
+
+    result = parser.extract_tool_calls(output, make_request([tool]))
+
+    assert json.loads(result.tool_calls[0].function.arguments) == {
+        "arguments": '{"unknown":"Beijing"}'
+    }
+
+
+def _image_tool() -> ChatCompletionToolsParam:
+    return ChatCompletionToolsParam(
+        type="function",
+        function={
+            "name": "image_generate",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "options": {
+                        "type": "object",
+                        "properties": {
+                            "size": {
+                                "type": "object",
+                                "properties": {
+                                    "width": {"type": "integer"},
+                                    "height": {"type": "integer"},
+                                },
+                            },
+                            "seed": {"type": "integer"},
+                        },
+                    },
+                },
             },
         },
     )
 
 
-def _deferred_bridge_output() -> str:
-    return (
-        f"{TC_START}\n"
-        f'{INV_START}tool_call">\n'
-        f'{PARAM_START}name" string="true">'
-        f"deferred_inventory_lookup{PARAM_END}\n"
-        f'{PARAM_START}arguments" string="false">\n'
-        f'{PARAM_START}sku" string="true">BRIDGE-731{PARAM_END}\n'
-        f'{PARAM_START}include_location" string="false">true{PARAM_END}\n'
-        f"{PARAM_END}\n"
-        f"{INV_END}\n"
-        f"{TC_END}"
+def _terminal_tool() -> ChatCompletionToolsParam:
+    return ChatCompletionToolsParam(
+        type="function",
+        function={
+            "name": "terminal_exec",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "environment": {"type": "object"},
+                },
+            },
+        },
     )
 
 
-def _nested_deferred_bridge_output() -> str:
+def _image_invoke() -> str:
     return (
-        f"{TC_START}\n"
-        f'{INV_START}tool_call">\n'
-        f'{PARAM_START}name" string="true">'
-        f"deferred_inventory_lookup{PARAM_END}\n"
-        f'{PARAM_START}arguments" string="false">\n'
-        f'{PARAM_START}sku" string="true">BRIDGE-731{PARAM_END}\n'
-        f'{PARAM_START}filters" string="false">\n'
-        f'{PARAM_START}warehouse" string="true">east{PARAM_END}\n'
-        f'{PARAM_START}limits" string="false">\n'
-        f'{PARAM_START}minimum" string="false">2{PARAM_END}\n'
-        f"{PARAM_END}\n"
-        f"{PARAM_END}\n"
-        f"{PARAM_END}\n"
-        f"{INV_END}\n"
-        f"{TC_END}"
+        f'{INV_START}image_generate">'
+        f'{PARAM_START}prompt" string="true">draw a copper owl{PARAM_END}'
+        f'{PARAM_START}options" string="false">'
+        '{"size":{"width":1024,"height":768},"seed":731}'
+        f"{PARAM_END}{INV_END}"
     )
 
 
-def test_extract_nested_open_object_for_deferred_bridge():
-    tool = _deferred_bridge_tool()
-    parser = make_parser(tools=[tool])
+def test_orphan_invoke_recovers_declared_nested_image_tool_non_streaming():
+    tool = _image_tool()
+    output = _image_invoke() + TC_END + "\nImage queued."
+    parser = make_parser([tool])
 
-    result = parser.extract_tool_calls(_deferred_bridge_output(), make_request([tool]))
+    result = parser.extract_tool_calls(output, make_request([tool]))
 
     assert result.tools_called
-    assert len(result.tool_calls) == 1
-    assert result.tool_calls[0].function.name == "tool_call"
+    assert result.content == "\nImage queued."
+    assert result.tool_calls[0].function.name == "image_generate"
     assert json.loads(result.tool_calls[0].function.arguments) == {
-        "name": "deferred_inventory_lookup",
-        "arguments": {"sku": "BRIDGE-731", "include_location": True},
+        "prompt": "draw a copper owl",
+        "options": {"size": {"width": 1024, "height": 768}, "seed": 731},
     }
 
 
-def test_extract_empty_open_object_for_deferred_bridge():
-    tool = _deferred_bridge_tool()
-    parser = make_parser(tools=[tool])
-    model_output = (
-        f"{TC_START}\n"
-        f'{INV_START}tool_call">\n'
-        f'{PARAM_START}name" string="true">'
-        f"deferred_inventory_lookup{PARAM_END}\n"
-        f'{PARAM_START}arguments" string="false">{PARAM_END}\n'
-        f"{INV_END}\n"
-        f"{TC_END}"
-    )
+def test_orphan_invoke_streams_without_control_text_leakage():
+    tool = _image_tool()
+    parser = make_parser([tool])
+    output = _image_invoke() + TC_END
 
-    result = parser.extract_tool_calls(model_output, make_request([tool]))
+    deltas = stream(parser, output, chunk_size=1, request=make_request([tool]))
 
-    assert json.loads(result.tool_calls[0].function.arguments) == {
-        "name": "deferred_inventory_lookup",
-        "arguments": {},
-    }
-
-
-def test_extract_deeply_nested_open_object_for_deferred_bridge():
-    tool = _deferred_bridge_tool()
-    parser = make_parser(tools=[tool])
-
-    result = parser.extract_tool_calls(
-        _nested_deferred_bridge_output(), make_request([tool])
-    )
-
-    assert json.loads(result.tool_calls[0].function.arguments) == {
-        "name": "deferred_inventory_lookup",
-        "arguments": {
-            "sku": "BRIDGE-731",
-            "filters": {"warehouse": "east", "limits": {"minimum": 2}},
-        },
-    }
-
-
-@pytest.mark.parametrize("chunk_size", [1, 5, 17, 64])
-def test_streaming_nested_open_object_for_deferred_bridge(chunk_size: int):
-    tool = _deferred_bridge_tool()
-    parser = make_parser(tools=[tool])
-
-    deltas = stream(parser, _deferred_bridge_output(), chunk_size=chunk_size)
-    arguments = reconstruct_args(deltas)
-
-    assert json.loads(arguments) == {
-        "name": "deferred_inventory_lookup",
-        "arguments": {"sku": "BRIDGE-731", "include_location": True},
-    }
-    assert "DSML" not in arguments
     names = [
-        tool_call.function.name
+        call.function.name
         for delta in deltas
-        for tool_call in delta.tool_calls or []
-        if tool_call.function and tool_call.function.name
+        for call in delta.tool_calls or []
+        if call.function and call.function.name
     ]
+    arguments = reconstruct_args(deltas)
     content = "".join(delta.content or "" for delta in deltas)
-    assert names == ["tool_call"]
+    assert names == ["image_generate"]
+    assert json.loads(arguments)["options"]["size"] == {
+        "width": 1024,
+        "height": 768,
+    }
     assert "DSML" not in content
     assert "R0TURN" not in content
-    assert parser.prev_tool_call_arr == [
-        {
-            "name": "tool_call",
-            "arguments": {
-                "name": "deferred_inventory_lookup",
-                "arguments": {"sku": "BRIDGE-731", "include_location": True},
-            },
-        }
-    ]
     assert not parser._in_tool_calls
     assert parser._active_tool_index is None
     assert parser._buffer == ""
 
 
-def test_streaming_deeply_nested_open_object_for_deferred_bridge():
-    tool = _deferred_bridge_tool()
-    parser = make_parser(tools=[tool])
+@pytest.mark.parametrize("mode", ["unknown", "no-tools", "tool-choice-none"])
+def test_false_orphan_invoke_stays_content(mode: str):
+    tool = _image_tool()
+    request = make_request([tool])
+    output = _image_invoke()
+    if mode == "unknown":
+        output = output.replace("image_generate", "unknown_image_tool", 1)
+    elif mode == "no-tools":
+        request.tools = []
+    else:
+        request.tool_choice = "none"
+    parser = make_parser([tool])
 
-    deltas = stream(parser, _nested_deferred_bridge_output(), chunk_size=1)
+    result = parser.extract_tool_calls(output, request)
 
-    assert json.loads(reconstruct_args(deltas)) == {
-        "name": "deferred_inventory_lookup",
-        "arguments": {
-            "sku": "BRIDGE-731",
-            "filters": {"warehouse": "east", "limits": {"minimum": 2}},
-        },
+    assert not result.tools_called
+    assert result.tool_calls == []
+    assert result.content == output
+
+
+@pytest.mark.parametrize("mode", ["unknown", "no-tools", "tool-choice-none"])
+def test_false_orphan_invoke_streaming_stays_content(mode: str):
+    tool = _image_tool()
+    request = make_request([tool])
+    output = _image_invoke()
+    if mode == "unknown":
+        output = output.replace("image_generate", "unknown_image_tool", 1)
+    elif mode == "no-tools":
+        request.tools = []
+    else:
+        request.tool_choice = "none"
+    parser = make_parser([tool])
+
+    deltas = stream(parser, output, chunk_size=1, request=request)
+
+    assert reconstruct_args(deltas) == ""
+    assert "".join(delta.content or "" for delta in deltas) == output
+
+
+def test_quoted_marker_then_real_wrapped_terminal_call():
+    tool = _terminal_tool()
+    request = make_request([tool])
+    quoted = f"Documentation quotes {INV_START} literally. "
+    invoke = (
+        f'{INV_START}terminal_exec">'
+        f'{PARAM_START}command" string="true">printf ready{PARAM_END}'
+        f'{PARAM_START}environment" string="false">'
+        '{"MODE":"safe","FLAGS":{"trace":false}}'
+        f"{PARAM_END}"
+        f"{INV_END}"
+    )
+    output = quoted + TC_START + invoke + TC_END
+
+    result = make_parser([tool]).extract_tool_calls(output, request)
+    parser = make_parser([tool])
+    deltas = stream(parser, output, chunk_size=1, request=request)
+
+    assert result.tools_called
+    assert result.content == quoted
+    assert json.loads(result.tool_calls[0].function.arguments) == {
+        "command": "printf ready",
+        "environment": {"MODE": "safe", "FLAGS": {"trace": False}},
     }
-    assert not parser._in_tool_calls
-    assert parser._active_tool_index is None
+    assert json.loads(reconstruct_args(deltas)) == json.loads(
+        result.tool_calls[0].function.arguments
+    )
+    streamed_content = "".join(delta.content or "" for delta in deltas)
+    assert streamed_content == quoted
+
+
+def test_foreign_wrapper_is_preserved_as_content():
+    tool = _image_tool()
+    foreign = (
+        "<｜DSML｜function_calls>"
+        + _image_invoke()
+        + "</｜DSML｜function_calls>"
+    )
+
+    result = make_parser([tool]).extract_tool_calls(foreign, make_request([tool]))
+    parser = make_parser([tool])
+    deltas = stream(parser, foreign, chunk_size=1, request=make_request([tool]))
+
+    assert not result.tools_called
+    assert result.content == foreign
+    assert reconstruct_args(deltas) == ""
+    assert "".join(delta.content or "" for delta in deltas) == foreign
+
+
+def test_declared_names_do_not_leak_between_streams():
+    tool = _image_tool()
+    parser = make_parser([tool])
+    first = stream(parser, _image_invoke(), 3, make_request([tool]))
+    assert json.loads(reconstruct_args(first))["prompt"] == "draw a copper owl"
+
+    second = stream(parser, _image_invoke(), 3, make_request([]))
+
+    assert reconstruct_args(second) == ""
+    assert "".join(delta.content or "" for delta in second) == _image_invoke()
+
+    non_streaming = make_parser([tool])
+    first_result = non_streaming.extract_tool_calls(
+        _image_invoke(), make_request([tool])
+    )
+    second_result = non_streaming.extract_tool_calls(_image_invoke(), make_request([]))
+    assert first_result.tools_called
+    assert not second_result.tools_called
+    assert second_result.content == _image_invoke()
 
 
 @pytest.mark.skip_global_cleanup

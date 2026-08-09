@@ -338,6 +338,32 @@ Supported models:
 
 Flags: `--tool-call-parser deepseek_v31 --chat-template {see_above}`
 
+### DeepSeek-V3.2 and DeepSeek-V4 Models
+
+Flags: `--tool-call-parser deepseek_v32` or
+`--tool-call-parser deepseek_v4`, matching the model's DSML wrapper.
+
+This v0.24 reconciliation carries the following upstream parser behavior:
+
+* `string="true|false"` conversion and guarded artificial
+  `arguments`/`input` wrapper unwrapping from vLLM PR
+  [#41801](https://github.com/vllm-project/vllm/pull/41801), merge commit
+  `95582868efd4db0b120e3640bbc61dcfce20d59f`.
+* Incremental argument streaming and split-marker buffering from vLLM PR
+  [#42879](https://github.com/vllm-project/vllm/pull/42879), merge commit
+  `b372ad3e9018f032478619adbc7f7fdcc9318212`.
+* Declared-tool-only recovery of a complete invoke missing its opening wrapper
+  from open vLLM PR
+  [#49117](https://github.com/vllm-project/vllm/pull/49117), adopted at head
+  `7ef0ae2480799e95fb7cb801a8105c1db2585164`.
+
+The #49117 behavior is mechanically adapted to the v0.24 tool-parser state
+machine. Recovery is disabled when no tools are declared or `tool_choice` is
+`none`; rejected and foreign DSML remains content, and request state is reset
+between streams. Object and array parameters use JSON text inside a
+`string="false"` parameter. Recursively nested DSML parameters are not
+supported.
+
 ### OpenAI OSS Models (`openai`)
 
 Supported models:
