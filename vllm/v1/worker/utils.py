@@ -40,10 +40,12 @@ logger = init_logger(__name__)
 @triton.jit
 def _zero_kv_blocks_kernel(
     seg_addrs_ptr,
+    seg_block_strides_ptr,
+    seg_page_sizes_ptr,
     block_ids_ptr,
     n_blocks,
     N_SEGS: tl.constexpr,
-    PAGE_SIZE_EL: tl.constexpr,
+    MAX_CHUNKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Zero KV cache blocks across all segments in a single launch.
@@ -59,19 +61,23 @@ def _zero_kv_blocks_kernel(
     Programs are mapped as (block_index, seg_index, chunk_index).
     """
     pid = tl.program_id(0)
-    chunks = PAGE_SIZE_EL // BLOCK_SIZE
-    work_per_block = N_SEGS * chunks
+    work_per_block = N_SEGS * MAX_CHUNKS
     block_index = pid // work_per_block
     if block_index >= n_blocks:
         return
     remainder = pid % work_per_block
-    seg_index = remainder // chunks
-    chunk_index = remainder % chunks
+    seg_index = remainder // MAX_CHUNKS
+    chunk_index = remainder % MAX_CHUNKS
+    block_stride_el = tl.load(seg_block_strides_ptr + seg_index)
+    page_size_el = tl.load(seg_page_sizes_ptr + seg_index)
+    if chunk_index >= page_size_el // BLOCK_SIZE:
+        return
     block_id = tl.load(block_ids_ptr + block_index)
     seg_addr = tl.load(seg_addrs_ptr + seg_index)
     ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
     offset = (
-        block_id.to(tl.int64) * PAGE_SIZE_EL + chunk_index.to(tl.int64) * BLOCK_SIZE
+        block_id.to(tl.int64) * block_stride_el.to(tl.int64)
+        + chunk_index.to(tl.int64) * BLOCK_SIZE
     )
     cols = tl.arange(0, BLOCK_SIZE).to(tl.int64)
     tl.store(ptr + offset + cols, tl.zeros([BLOCK_SIZE], dtype=tl.int32))
@@ -102,14 +108,16 @@ class KVBlockZeroer:
 
         Block IDs from the scheduler reference logical blocks whose size
         may differ from the kernel block size (virtual block splitting).
-        PAGE_SIZE_EL accounts for this ratio so that
-        ``block_id * PAGE_SIZE_EL`` lands at the correct offset.
+        Each virtual block is represented as an independent segment so its
+        physical block stride and zeroed page span remain independent.
 
         Only AttentionSpec layers are processed; Mamba layers are skipped.
         """
         self.device = device
         self.pin_memory = pin_memory
-        self._meta: tuple[torch.Tensor, int, int, int] | None = None
+        self._meta: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
+        ) = None
         self._id_cap: int = 0
         self._ids_pinned: torch.Tensor | None = None
         self._ids_gpu: torch.Tensor | None = None
@@ -118,7 +126,8 @@ class KVBlockZeroer:
             runner_only_attn_layers = set()
         seen_ptrs: set[int] = set()
         seg_addrs: list[int] = []
-        page_size_el: int | None = None
+        seg_block_strides: list[int] = []
+        seg_page_sizes: list[int] = []
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
@@ -127,6 +136,7 @@ class KVBlockZeroer:
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
             kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
+            assert spec.block_size % kernel_bs == 0
             ratio = spec.block_size // kernel_bs
             block_dim = group.backend.get_kv_cache_block_dim(
                 kernel_bs,
@@ -147,33 +157,42 @@ class KVBlockZeroer:
                 seen_ptrs.add(dp)
 
                 el = kv.element_size()
-                cur_bytes = kv.stride(block_dim) * el
-                assert cur_bytes % 4 == 0
-                kernel_block_el = cur_bytes // 4
-                cur_page_el = kernel_block_el * ratio
-                if page_size_el is None:
-                    page_size_el = cur_page_el
-                else:
-                    assert page_size_el == cur_page_el, (
-                        f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
-                    )
-
-                block_stride_bytes = cur_bytes
+                block_stride_bytes = kv.stride(block_dim) * el
+                assert block_stride_bytes % 4 == 0
+                assert kv.shape[block_dim] % ratio == 0
                 outer_dims = [
                     d
                     for d in range(block_dim)
                     if kv.stride(d) * el > block_stride_bytes
                 ]
                 outer_strides = [kv.stride(d) * el for d in outer_dims]
+                inner_dims = [
+                    d for d in range(kv.ndim) if d != block_dim and d not in outer_dims
+                ]
+                kernel_page_bytes = el + sum(
+                    (kv.shape[d] - 1) * kv.stride(d) * el for d in inner_dims
+                )
+                assert kernel_page_bytes % 4 == 0
+                logical_block_stride_bytes = block_stride_bytes * ratio
                 for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
                     off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
-                    seg_addrs.append(dp + off_bytes)
+                    assert (dp + off_bytes) % 4 == 0
+                    for virtual_index in range(ratio):
+                        seg_addrs.append(
+                            dp + off_bytes + virtual_index * block_stride_bytes
+                        )
+                        seg_block_strides.append(logical_block_stride_bytes // 4)
+                        seg_page_sizes.append(kernel_page_bytes // 4)
 
-        if not seg_addrs or page_size_el is None:
+        if not seg_addrs:
             self._meta = None
             return
 
-        blk_size = min(largest_power_of_2_divisor(page_size_el), 1024)
+        max_page_size_el = max(seg_page_sizes)
+        blk_size = min(
+            min(largest_power_of_2_divisor(ps) for ps in seg_page_sizes),
+            1024,
+        )
         self._id_cap = 8192
         self._ids_pinned = torch.empty(
             self._id_cap,
@@ -183,7 +202,9 @@ class KVBlockZeroer:
         self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
         self._meta = (
             torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
-            page_size_el,
+            torch.tensor(seg_block_strides, dtype=torch.int64, device=self.device),
+            torch.tensor(seg_page_sizes, dtype=torch.int64, device=self.device),
+            max_page_size_el // blk_size,
             blk_size,
             len(seg_addrs),
         )
@@ -192,7 +213,14 @@ class KVBlockZeroer:
         """Zero the KV cache memory for the given block IDs."""
         if not block_ids or self._meta is None:
             return
-        seg_addrs, page_size_el, blk_size, n_segs = self._meta
+        (
+            seg_addrs,
+            seg_block_strides,
+            seg_page_sizes,
+            max_chunks,
+            blk_size,
+            n_segs,
+        ) = self._meta
         n_blocks = len(block_ids)
         if n_blocks > self._id_cap:
             self._id_cap = n_blocks * 2
@@ -208,13 +236,15 @@ class KVBlockZeroer:
         self._ids_pinned[:n_blocks].numpy()[:] = block_ids
         idx = self._ids_gpu[:n_blocks]
         idx.copy_(self._ids_pinned[:n_blocks], non_blocking=True)
-        grid = (n_blocks * n_segs * (page_size_el // blk_size),)
+        grid = (n_blocks * n_segs * max_chunks,)
         _zero_kv_blocks_kernel[grid](
             seg_addrs,
+            seg_block_strides,
+            seg_page_sizes,
             idx,
             n_blocks,
             N_SEGS=n_segs,
-            PAGE_SIZE_EL=page_size_el,
+            MAX_CHUNKS=max_chunks,
             BLOCK_SIZE=blk_size,
         )
 
