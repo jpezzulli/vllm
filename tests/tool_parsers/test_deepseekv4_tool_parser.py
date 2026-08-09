@@ -303,6 +303,166 @@ def test_extract_tool_calls_arguments_wrapper():
     assert args == {"location": "Beijing"}
 
 
+def _deferred_bridge_tool() -> ChatCompletionToolsParam:
+    return ChatCompletionToolsParam(
+        type="function",
+        function={
+            "name": "tool_call",
+            "description": "Invoke a deferred tool by name with the given arguments.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "arguments": {"type": "object"},
+                },
+                "required": ["name", "arguments"],
+            },
+        },
+    )
+
+
+def _deferred_bridge_output() -> str:
+    return (
+        f"{TC_START}\n"
+        f'{INV_START}tool_call">\n'
+        f'{PARAM_START}name" string="true">'
+        f"deferred_inventory_lookup{PARAM_END}\n"
+        f'{PARAM_START}arguments" string="false">\n'
+        f'{PARAM_START}sku" string="true">BRIDGE-731{PARAM_END}\n'
+        f'{PARAM_START}include_location" string="false">true{PARAM_END}\n'
+        f"{PARAM_END}\n"
+        f"{INV_END}\n"
+        f"{TC_END}"
+    )
+
+
+def _nested_deferred_bridge_output() -> str:
+    return (
+        f"{TC_START}\n"
+        f'{INV_START}tool_call">\n'
+        f'{PARAM_START}name" string="true">'
+        f"deferred_inventory_lookup{PARAM_END}\n"
+        f'{PARAM_START}arguments" string="false">\n'
+        f'{PARAM_START}sku" string="true">BRIDGE-731{PARAM_END}\n'
+        f'{PARAM_START}filters" string="false">\n'
+        f'{PARAM_START}warehouse" string="true">east{PARAM_END}\n'
+        f'{PARAM_START}limits" string="false">\n'
+        f'{PARAM_START}minimum" string="false">2{PARAM_END}\n'
+        f"{PARAM_END}\n"
+        f"{PARAM_END}\n"
+        f"{PARAM_END}\n"
+        f"{INV_END}\n"
+        f"{TC_END}"
+    )
+
+
+def test_extract_nested_open_object_for_deferred_bridge():
+    tool = _deferred_bridge_tool()
+    parser = make_parser(tools=[tool])
+
+    result = parser.extract_tool_calls(_deferred_bridge_output(), make_request([tool]))
+
+    assert result.tools_called
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].function.name == "tool_call"
+    assert json.loads(result.tool_calls[0].function.arguments) == {
+        "name": "deferred_inventory_lookup",
+        "arguments": {"sku": "BRIDGE-731", "include_location": True},
+    }
+
+
+def test_extract_empty_open_object_for_deferred_bridge():
+    tool = _deferred_bridge_tool()
+    parser = make_parser(tools=[tool])
+    model_output = (
+        f"{TC_START}\n"
+        f'{INV_START}tool_call">\n'
+        f'{PARAM_START}name" string="true">'
+        f"deferred_inventory_lookup{PARAM_END}\n"
+        f'{PARAM_START}arguments" string="false">{PARAM_END}\n'
+        f"{INV_END}\n"
+        f"{TC_END}"
+    )
+
+    result = parser.extract_tool_calls(model_output, make_request([tool]))
+
+    assert json.loads(result.tool_calls[0].function.arguments) == {
+        "name": "deferred_inventory_lookup",
+        "arguments": {},
+    }
+
+
+def test_extract_deeply_nested_open_object_for_deferred_bridge():
+    tool = _deferred_bridge_tool()
+    parser = make_parser(tools=[tool])
+
+    result = parser.extract_tool_calls(
+        _nested_deferred_bridge_output(), make_request([tool])
+    )
+
+    assert json.loads(result.tool_calls[0].function.arguments) == {
+        "name": "deferred_inventory_lookup",
+        "arguments": {
+            "sku": "BRIDGE-731",
+            "filters": {"warehouse": "east", "limits": {"minimum": 2}},
+        },
+    }
+
+
+@pytest.mark.parametrize("chunk_size", [1, 5, 17, 64])
+def test_streaming_nested_open_object_for_deferred_bridge(chunk_size: int):
+    tool = _deferred_bridge_tool()
+    parser = make_parser(tools=[tool])
+
+    deltas = stream(parser, _deferred_bridge_output(), chunk_size=chunk_size)
+    arguments = reconstruct_args(deltas)
+
+    assert json.loads(arguments) == {
+        "name": "deferred_inventory_lookup",
+        "arguments": {"sku": "BRIDGE-731", "include_location": True},
+    }
+    assert "DSML" not in arguments
+    names = [
+        tool_call.function.name
+        for delta in deltas
+        for tool_call in delta.tool_calls or []
+        if tool_call.function and tool_call.function.name
+    ]
+    content = "".join(delta.content or "" for delta in deltas)
+    assert names == ["tool_call"]
+    assert "DSML" not in content
+    assert "R0TURN" not in content
+    assert parser.prev_tool_call_arr == [
+        {
+            "name": "tool_call",
+            "arguments": {
+                "name": "deferred_inventory_lookup",
+                "arguments": {"sku": "BRIDGE-731", "include_location": True},
+            },
+        }
+    ]
+    assert not parser._in_tool_calls
+    assert parser._active_tool_index is None
+    assert parser._buffer == ""
+
+
+def test_streaming_deeply_nested_open_object_for_deferred_bridge():
+    tool = _deferred_bridge_tool()
+    parser = make_parser(tools=[tool])
+
+    deltas = stream(parser, _nested_deferred_bridge_output(), chunk_size=1)
+
+    assert json.loads(reconstruct_args(deltas)) == {
+        "name": "deferred_inventory_lookup",
+        "arguments": {
+            "sku": "BRIDGE-731",
+            "filters": {"warehouse": "east", "limits": {"minimum": 2}},
+        },
+    }
+    assert not parser._in_tool_calls
+    assert parser._active_tool_index is None
+
+
 @pytest.mark.skip_global_cleanup
 def test_composed_schema_converts_object_and_array_params():
     tool = ChatCompletionToolsParam(

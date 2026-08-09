@@ -83,10 +83,6 @@ class DeepSeekV32ToolParser(ToolParser):
         self.invoke_complete_regex = re.compile(
             r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>', re.DOTALL
         )
-        self.parameter_complete_regex = re.compile(
-            r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>(.*?)</｜DSML｜parameter>',
-            re.DOTALL,
-        )
         self.invoke_start_regex = re.compile(r'<｜DSML｜invoke\s+name="([^"]+)"\s*>')
         self.parameter_start_regex = re.compile(
             r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>'
@@ -120,12 +116,55 @@ class DeepSeekV32ToolParser(ToolParser):
         """Generate a unique tool call ID."""
         return f"call_{uuid.uuid4().hex[:24]}"
 
+    def _find_parameter_end(
+        self,
+        text: str,
+        content_start: int = 0,
+    ) -> tuple[int, int] | None:
+        """Find the closing tag paired with an already-consumed parameter.
+
+        DeepSeek's structural grammar represents object-valued parameters as
+        nested DSML parameter tags. A non-greedy regex therefore stops at the
+        first child closing tag instead of the outer parameter boundary.
+        """
+        end_token = "</｜DSML｜parameter>"
+        depth = 1
+        cursor = content_start
+        while True:
+            next_start = self.parameter_start_regex.search(text, cursor)
+            next_end = text.find(end_token, cursor)
+            if next_end == -1:
+                return None
+            if next_start is not None and next_start.start() < next_end:
+                depth += 1
+                cursor = next_start.end()
+                continue
+            depth -= 1
+            if depth == 0:
+                return next_end, next_end + len(end_token)
+            cursor = next_end + len(end_token)
+
     def _parse_invoke_params(self, invoke_str: str) -> dict[str, tuple[str, str]]:
+        """Parse the top-level parameters of one invoke, preserving children."""
         param_dict: dict[str, tuple[str, str]] = {}
-        for param_name, string_attr, param_val in self.parameter_complete_regex.findall(
-            invoke_str
-        ):
-            param_dict[param_name] = (param_val, string_attr)
+        cursor = 0
+        while cursor < len(invoke_str):
+            while cursor < len(invoke_str) and invoke_str[cursor].isspace():
+                cursor += 1
+            if cursor == len(invoke_str):
+                break
+            match = self.parameter_start_regex.match(invoke_str, cursor)
+            if match is None:
+                raise ValueError("Unexpected text in DeepSeek DSML invoke parameters")
+            bounds = self._find_parameter_end(invoke_str, match.end())
+            if bounds is None:
+                raise ValueError("Unclosed DeepSeek DSML parameter")
+            end_start, end_after = bounds
+            param_dict[match.group(1)] = (
+                invoke_str[match.end() : end_start],
+                match.group(2),
+            )
+            cursor = end_after
         return param_dict
 
     @staticmethod
@@ -158,13 +197,53 @@ class DeepSeekV32ToolParser(ToolParser):
         """Convert raw string param values using the tool schema types."""
         param_config = find_tool_properties(self.tools, function_name)
 
+        return self._convert_param_dict(param_dict, param_config)
+
+    def _convert_param_dict(
+        self,
+        param_dict: dict[str, tuple[str, str]],
+        param_config: dict[str, Any],
+        *,
+        open_object: bool = False,
+    ) -> dict[str, Any]:
+        """Convert one DSML object, including nested parameter objects."""
+
         converted: dict[str, Any] = {}
         for name, (value, string_attr) in param_dict.items():
             if string_attr == "true":
                 converted[name] = value
                 continue
 
-            param_types = extract_types_from_schema(param_config.get(name, {}))
+            schema = param_config.get(name, {})
+            param_types = extract_types_from_schema(schema)
+            stripped = value.strip()
+            if not stripped and ("object" in param_types or open_object):
+                converted[name] = {}
+                continue
+            nested_parameter = self.parameter_start_regex.match(stripped)
+            if nested_parameter and (
+                "object" in param_types or (open_object and not schema)
+            ):
+                nested_config = (
+                    schema.get("properties", {}) if isinstance(schema, dict) else {}
+                )
+                nested_params = self._parse_invoke_params(stripped)
+                converted[name] = self._convert_param_dict(
+                    nested_params,
+                    nested_config,
+                    open_object=(
+                        open_object
+                        if not schema
+                        else schema.get("additionalProperties", True) is not False
+                    ),
+                )
+                continue
+            if open_object and not schema:
+                try:
+                    converted[name] = json.loads(stripped)
+                except json.JSONDecodeError:
+                    converted[name] = value
+                continue
             converted[name] = coerce_to_schema_type(value, param_types)
         return self._repair_param_dict(converted, param_config)
 
@@ -444,11 +523,28 @@ class DeepSeekV32ToolParser(ToolParser):
             index = self._active_tool_index
 
             if self._active_param_mode is not None:
+                if self._active_param_mode in ("wrapper", "object"):
+                    combined = "".join(self._active_param_parts) + self._buffer
+                    bounds = self._find_parameter_end(combined)
+                    if bounds is None:
+                        self._active_param_parts[:] = [combined]
+                        self._buffer = ""
+                        return
+                    end_pos, end_after = bounds
+                    self._active_param_parts[:] = [combined[:end_pos]]
+                    self._buffer = combined[end_after:]
+                    self._finish_buffered_param(tool_call_deltas, index)
+                    self._active_param_name = None
+                    self._active_param_string_attr = None
+                    self._active_param_mode = None
+                    self._active_param_parts.clear()
+                    continue
+
                 end_pos = self._buffer.find(parameter_end_token)
                 if end_pos != -1:
                     raw_content = self._buffer[:end_pos]
                     self._buffer = self._buffer[end_pos + len(parameter_end_token) :]
-                    if self._active_param_mode in ("wrapper", "buffered"):
+                    if self._active_param_mode == "buffered":
                         self._active_param_parts.append(raw_content)
                         self._finish_buffered_param(tool_call_deltas, index)
                     elif self._active_param_mode == "string":
@@ -472,7 +568,7 @@ class DeepSeekV32ToolParser(ToolParser):
                 if safe_len > 0:
                     raw_content = self._buffer[:safe_len]
                     self._buffer = self._buffer[safe_len:]
-                    if self._active_param_mode in ("wrapper", "buffered"):
+                    if self._active_param_mode == "buffered":
                         self._active_param_parts.append(raw_content)
                     elif self._active_param_mode == "string":
                         self._add_tool_call_delta(
@@ -516,6 +612,9 @@ class DeepSeekV32ToolParser(ToolParser):
                 continue
 
             param_types = self._param_types_for_name(name)
+            if "object" in param_types:
+                self._active_param_mode = "object"
+                continue
             if not self._can_stream_raw_param(param_types):
                 self._active_param_mode = "buffered"
                 continue
