@@ -119,8 +119,10 @@ def _hermes_config() -> ParserEngineConfig:
 def _make_engine(
     config: ParserEngineConfig | None = None,
     tools: list | None = None,
+    vocab: dict[str, int] | None = None,
+    special_tokens: list[str] | None = None,
 ) -> ParserEngine:
-    tokenizer = make_mock_tokenizer(_VOCAB)
+    tokenizer = make_mock_tokenizer(vocab or _VOCAB, special_tokens=special_tokens)
     cfg = config or _combined_config()
     return ParserEngine(
         tokenizer,
@@ -1490,6 +1492,8 @@ class TestCoercionInstabilityRegression:
         assert parsed["val"] == "4e"
         assert isinstance(parsed["val"], str)
         assert parsed["extra"] == "ok"
+
+
 _DROP_VOCAB: dict[str, int] = {
     **_VOCAB,
     "<bos>": 204,

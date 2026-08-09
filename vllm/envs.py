@@ -2022,9 +2022,11 @@ def _is_moet_extension_env(name: str) -> bool:
 
 def validate_environ(hard_fail: bool) -> None:
     for env in os.environ:
-        if (env.startswith("VLLM_")
-                and env not in environment_variables
-                and not _is_moet_extension_env(env)):
+        if (
+            env.startswith("VLLM_")
+            and env not in environment_variables
+            and not _is_moet_extension_env(env)
+        ):
             if hard_fail:
                 raise ValueError(f"Unknown vLLM environment variable detected: {env}")
             else:
