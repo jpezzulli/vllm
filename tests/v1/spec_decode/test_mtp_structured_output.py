@@ -93,6 +93,22 @@ def test_bitmask_when_grammar_terminates_mid_window(backend):
     assert not grammar.is_terminated()
 
 
+def test_xgrammar_accept_tokens_stops_after_speculative_eos():
+    """Trailing speculative tokens do not advance a terminated matcher."""
+    tokenizer, _, request, prompt = _make_manager_and_request("xgrammar")
+    grammar = request.structured_output_request.grammar
+
+    assert grammar.accept_tokens(request.request_id, prompt)
+    processed_before_eos = grammar.num_processed_tokens
+
+    eos = tokenizer.eos_token_id
+    trailing_draft = tokenizer.encode("\n")[0]
+    assert grammar.accept_tokens(request.request_id, [eos, trailing_draft])
+
+    assert grammar.is_terminated()
+    assert grammar.num_processed_tokens == processed_before_eos + 1
+
+
 @pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
 def test_bitmask_idempotent_across_calls(backend):
     """Repeated calls with the same input return the same bitmask."""

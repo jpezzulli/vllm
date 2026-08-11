@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from unittest.mock import Mock
+
 import pytest
 from transformers import AutoTokenizer
 
 from vllm.config import DeviceConfig, StructuredOutputsConfig, VllmConfig
 from vllm.v1.structured_output.backend_types import StructuredOutputOptions
-from vllm.v1.structured_output.backend_xgrammar import XgrammarBackend
+from vllm.v1.structured_output.backend_xgrammar import (
+    XgrammarBackend,
+    XgrammarGrammar,
+)
 
 TOKENIZER = "openai-community/gpt2"
 VOCAB_SIZE = 50257
@@ -64,3 +69,14 @@ def test_request_stop_tokens_gated_to_grammar_terminal(backend: XgrammarBackend)
     assert _token_allowed(bm_override[0], LETTER)
     assert _token_allowed(bm_default[0], EOS)
     assert _token_allowed(bm_override[0], EOS)
+
+
+def test_rejected_token_synchronizes_terminated_state():
+    """A rejected token cannot leave the cached matcher state stale."""
+    matcher = Mock()
+    matcher.is_terminated.side_effect = [False, True]
+    matcher.accept_token.return_value = False
+    grammar = XgrammarGrammar(vocab_size=1, matcher=matcher, ctx=Mock())
+
+    assert not grammar.accept_tokens("req", [7])
+    assert grammar.is_terminated()

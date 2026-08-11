@@ -1626,8 +1626,10 @@ class Scheduler(SchedulerInterface):
                         request, new_token_ids
                     )
                 )
-                if advance_token_ids and not grammar.accept_tokens(
-                    req_id, advance_token_ids
+                if (
+                    advance_token_ids
+                    and not grammar.is_terminated()
+                    and not grammar.accept_tokens(req_id, advance_token_ids)
                 ):
                     logger.error(
                         "Unexpected: grammar rejected tokens %s for request %s. "
@@ -1942,7 +1944,9 @@ class Scheduler(SchedulerInterface):
             # Add newly generated spec token ids to the request.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
-                spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
+                assert metadata is not None and metadata.grammar is not None
+                if not metadata.grammar.is_terminated():
+                    spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)
             request.spec_token_ids = spec_token_ids
 
     def update_draft_token_ids_in_output(
@@ -1972,7 +1976,8 @@ class Scheduler(SchedulerInterface):
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
                 assert metadata is not None and metadata.grammar is not None
-                spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)
+                if not metadata.grammar.is_terminated():
+                    spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)
             # Pad to original number of spec tokens.
             num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)
             if num_invalid_tokens:

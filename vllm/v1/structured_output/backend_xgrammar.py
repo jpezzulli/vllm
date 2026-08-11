@@ -162,7 +162,15 @@ class XgrammarGrammar(StructuredOutputGrammar):
         if self._is_terminated:
             return False
         for token in tokens:
+            if self.matcher.is_terminated():
+                # A speculative batch may contain tokens after the stop token.
+                # Do not feed those trailing drafts to a terminated matcher.
+                self._is_terminated = True
+                break
             if not self.matcher.accept_token(token):
+                # Keep the cached state synchronized if the matcher terminates
+                # while rejecting a token (vllm-project/vllm#37506).
+                self._is_terminated = self.matcher.is_terminated()
                 logger.error(
                     "Failed to advance FSM for request %s "
                     "for tokens %s. Please file an issue.",
