@@ -76,10 +76,21 @@ def test_deepseek_v4_tokenizer_registered():
     )
 
 
-def test_deepseek_v4_defaults_to_chat_mode():
+def test_deepseek_v4_defaults_to_thinking_mode():
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
         tokenize=False,
+    )
+
+    assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜><think>")
+
+
+@pytest.mark.parametrize("kwargs", [{"thinking": False}, {"enable_thinking": False}])
+def test_deepseek_v4_explicitly_disables_thinking(kwargs):
+    prompt = _tokenizer().apply_chat_template(
+        [{"role": "user", "content": "Hello"}],
+        tokenize=False,
+        **kwargs,
     )
 
     assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>")
@@ -123,7 +134,7 @@ def test_deepseek_v4_uses_v4_tool_prompt_from_request_tools():
     assert "</｜DSML｜tool_calls>" in prompt
     assert "function_calls" not in prompt
     assert '"name": "get_weather"' in prompt
-    assert prompt.endswith("<｜User｜>Weather?<｜Assistant｜></think>")
+    assert prompt.endswith("<｜User｜>Weather?<｜Assistant｜><think>")
 
 
 def test_deepseek_v4_renders_parsed_history_tool_arguments():
@@ -280,7 +291,7 @@ def test_deepseek_v4_maps_xhigh_to_reference_max_reasoning_effort():
         (1, {"thinking": True}),
         (2, {"thinking": True}),
         (3, {"thinking": True}),
-        (4, {}),
+        (4, {"thinking": False}),
     ],
 )
 def test_deepseek_v4_matches_reference_golden_fixtures(case_id, kwargs):

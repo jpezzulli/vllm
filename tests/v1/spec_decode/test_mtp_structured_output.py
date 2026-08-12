@@ -93,6 +93,22 @@ def test_bitmask_when_grammar_terminates_mid_window(backend):
     assert not grammar.is_terminated()
 
 
+def test_xgrammar_accept_tokens_stops_after_speculative_eos():
+    """Trailing speculative tokens do not advance a terminated matcher."""
+    tokenizer, _, request, prompt = _make_manager_and_request("xgrammar")
+    grammar = request.structured_output_request.grammar
+
+    assert grammar.accept_tokens(request.request_id, prompt)
+    processed_before_eos = grammar.num_processed_tokens
+
+    eos = tokenizer.eos_token_id
+    trailing_draft = tokenizer.encode("\n")[0]
+    assert grammar.accept_tokens(request.request_id, [eos, trailing_draft])
+
+    assert grammar.is_terminated()
+    assert grammar.num_processed_tokens == processed_before_eos + 1
+
+
 @pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
 def test_bitmask_idempotent_across_calls(backend):
     """Repeated calls with the same input return the same bitmask."""
@@ -189,7 +205,9 @@ def test_bitmask_constrained_when_reasoning_ends_midwindow(backend):
 
 
 @pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
-def test_bitmask_post_reasoning_end_drafts_skip_grammar_advance(backend):
+def test_bitmask_post_reasoning_end_drafts_skip_grammar_advance(
+    backend, caplog, monkeypatch
+):
     """Post-marker drafts predate the bitmask and may be grammar-invalid;
     grammar_bitmask must skip the grammar advance instead of asserting.
     """
@@ -221,7 +239,24 @@ def test_bitmask_post_reasoning_end_drafts_skip_grammar_advance(backend):
     # A token that the JSON grammar would reject as the first post-marker
     # token; without the fix grammar.accept_tokens fires the assertion.
     invalid_post = tokenizer.encode("z")[0]
-    drafts = [pre, marker, invalid_post]
+    unreachable_post = tokenizer.encode('"')[0]
+    drafts = [pre, marker, invalid_post, unreachable_post]
+
+    validate_calls = []
+    accept_calls = []
+    original_validate = grammar.validate_tokens
+    original_accept = grammar.accept_tokens
+
+    def validate_spy(tokens):
+        validate_calls.append(list(tokens))
+        return original_validate(tokens)
+
+    def accept_spy(req_id, tokens):
+        accept_calls.append((req_id, list(tokens)))
+        return original_accept(req_id, tokens)
+
+    monkeypatch.setattr(grammar, "validate_tokens", validate_spy)
+    monkeypatch.setattr(grammar, "accept_tokens", accept_spy)
 
     bitmask = manager.grammar_bitmask(
         requests={request.request_id: request},
@@ -235,6 +270,94 @@ def test_bitmask_post_reasoning_end_drafts_skip_grammar_advance(backend):
     assert not (bitmask[2] == -1).all()
     # Grammar must not have advanced through the unvalidated draft.
     assert not grammar.is_terminated()
+    assert validate_calls == [[invalid_post]]
+    assert accept_calls == []
+    assert "Failed to advance FSM" not in caplog.text
+
+
+@pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
+def test_bitmask_valid_post_reasoning_draft_advances_then_rolls_back(
+    backend, caplog, monkeypatch
+):
+    """A valid post-marker draft is persisted for the next bitmask row, then
+    rolled back so repeated scheduler probes remain idempotent.
+    """
+    tokenizer, manager, request, _ = _make_manager_and_request(backend, prompt_str="{")
+    grammar = request.structured_output_request.grammar
+    assert grammar.accept_tokens(request.request_id, tokenizer.encode("{"))
+    processed_before = getattr(grammar, "num_processed_tokens", None)
+
+    marker = tokenizer.encode("\n")[0]
+    manager.reasoner_cls = _MarkerReasoner
+    request.structured_output_request.reasoner = _MarkerReasoner(marker)
+    request.structured_output_request.reasoning_ended = False
+
+    valid_post = tokenizer.encode('"')[0]
+    drafts = [tokenizer.encode(" ")[0], marker, valid_post]
+    validate_calls = []
+    accept_calls = []
+    original_validate = grammar.validate_tokens
+    original_accept = grammar.accept_tokens
+
+    def validate_spy(tokens):
+        validate_calls.append(list(tokens))
+        return original_validate(tokens)
+
+    def accept_spy(req_id, tokens):
+        accept_calls.append((req_id, list(tokens)))
+        return original_accept(req_id, tokens)
+
+    monkeypatch.setattr(grammar, "validate_tokens", validate_spy)
+    monkeypatch.setattr(grammar, "accept_tokens", accept_spy)
+
+    first = manager.grammar_bitmask(
+        requests={request.request_id: request},
+        structured_output_request_ids=[request.request_id],
+        scheduled_spec_decode_tokens={request.request_id: drafts},
+    )
+    second = manager.grammar_bitmask(
+        requests={request.request_id: request},
+        structured_output_request_ids=[request.request_id],
+        scheduled_spec_decode_tokens={request.request_id: drafts},
+    )
+
+    assert first is not None and second is not None
+    assert (first == second).all()
+    assert validate_calls == [[valid_post], [valid_post]]
+    assert accept_calls == [
+        (request.request_id, [valid_post]),
+        (request.request_id, [valid_post]),
+    ]
+    if processed_before is not None:
+        assert grammar.num_processed_tokens == processed_before
+    assert not grammar.is_terminated()
+    assert "Failed to advance FSM" not in caplog.text
+
+
+def test_bitmask_post_reasoning_validation_accept_mismatch_fails_closed(monkeypatch):
+    """A backend state mismatch is not an expected speculative rejection."""
+    tokenizer, manager, request, _ = _make_manager_and_request(
+        "xgrammar", prompt_str="{"
+    )
+    grammar = request.structured_output_request.grammar
+    assert grammar.accept_tokens(request.request_id, tokenizer.encode("{"))
+
+    marker = tokenizer.encode("\n")[0]
+    manager.reasoner_cls = _MarkerReasoner
+    request.structured_output_request.reasoner = _MarkerReasoner(marker)
+    request.structured_output_request.reasoning_ended = False
+    post = tokenizer.encode('"')[0]
+    drafts = [tokenizer.encode(" ")[0], marker, post]
+
+    monkeypatch.setattr(grammar, "validate_tokens", lambda tokens: list(tokens))
+    monkeypatch.setattr(grammar, "accept_tokens", lambda req_id, tokens: False)
+
+    with pytest.raises(AssertionError):
+        manager.grammar_bitmask(
+            requests={request.request_id: request},
+            structured_output_request_ids=[request.request_id],
+            scheduled_spec_decode_tokens={request.request_id: drafts},
+        )
 
 
 @pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
