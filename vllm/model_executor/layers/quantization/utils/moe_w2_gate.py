@@ -58,6 +58,33 @@ Env knobs:
                                 measured 200-1400 promotes = ~6 GiB H2D
                                 per fire = 56->3 tok/s).
   VLLM_MOE_W2_GATE_TRACE   0 (default) | 1 log each fire/re-forward.
+  VLLM_MOE_W2_GATE_AUDIT   probability p (default 0 = off): on an armed step
+                           that did NOT fire, force the fire path with prob p
+                           ("audit fire"). The replay's re-decided logits are
+                           used as usual (strictly-better quality), and with
+                           GATE_DUMP set the pre/post argmax comparison yields
+                           UNBIASED live labels for the silent-flip rate
+                           P(argmax changes under promotion | signal > tau) —
+                           the class no logit threshold can see (P5 measured
+                           3.65% @ tau0.60 offline; this measures it live).
+                           [O] 2026-07-31, gate mechanism v2 probe P9.
+  VLLM_MOE_W2_GATE_DUMP    path (default "" = off): append one JSONL row per
+                           FIRED/AUDITED step: worst signal value, per-row
+                           signal, pre/post per-row argmax, flips, promotes,
+                           replays, audit flag. Measurement mode: adds argmax
+                           syncs on fired steps only; leave unset for formal
+                           runs.
+  VLLM_MOE_W2_GATE_FIRE_TIMING  0 (default) | 1: with GATE_DUMP set, the
+                           runner times every promote->replay iteration of a
+                           fired step (host wall clock, explicit GPU syncs at
+                           the phase boundaries) and attaches the per-iteration
+                           breakdown to the step's JSONL row ("timing"):
+                           promote_ms (with the delta tier's snap/select/read/
+                           h2d/map split), n promoted, replay_ms. Measurement
+                           mode for the P11 fire-stall decomposition (plan item
+                           4, 2026-08-01) — the added syncs serialize what the
+                           FP loop already serializes, but leave unset for
+                           formal runs.
   VLLM_MOE_W2_GATE_FP_MAX  max promote->replay iterations per fired step
                            (default 3). A single replay is only FIRST-order:
                            upgraded early layers re-route later layers onto
@@ -69,7 +96,10 @@ Env knobs:
                            state costs nothing (first check promotes 0).
 """
 
+import json
 import os
+import random
+import time
 
 import torch
 
@@ -119,18 +149,98 @@ _REFORWARD = os.getenv("VLLM_MOE_W2_GATE_REFORWARD", "1") == "1"
 # no scalar or fitted combination beat max_prob materially (live labels
 # 10.9% -> 10.3% fire@recall90), so max_prob stays the only signal here.
 _SPEC_MASK = os.getenv("VLLM_MOE_W2_GATE_SPEC_MASK", "0") == "1"
+# C>1 aggregation (Faza-3 item 7, [P] 2026-08-03; default = the FROZEN
+# batch-min): VLLM_MOE_W2_GATE_AGG=min fires when ANY row is uncertain
+# (replay cost scales with batch — measured expensive at C>1);
+# =q:<float> fires when the q-quantile of row signals is <= tau, i.e.
+# only when ENOUGH of the batch is uncertain (Gupta-style quantile
+# aggregation). Evaluation knob for batched serving; single-row decode
+# is unaffected (quantile of 1 row == min).
+_AGG = os.getenv("VLLM_MOE_W2_GATE_AGG", "min")
+_AGG_Q = float(_AGG.split(":", 1)[1]) if _AGG.startswith("q:") else 0.0
+# P9 audit + dump (see header). Both default-off; the disabled path adds
+# only falsy checks to the existing decision.
+_AUDIT_P = float(os.getenv("VLLM_MOE_W2_GATE_AUDIT", "0") or "0")
+_DUMP_PATH = os.getenv("VLLM_MOE_W2_GATE_DUMP", "")
+# P11 fire-stall timing (see header). Default-off; requires DUMP for output.
+_FIRE_TIMING = os.getenv("VLLM_MOE_W2_GATE_FIRE_TIMING", "0") == "1"
+
+
+def fire_timing_enabled() -> bool:
+    return _FIRE_TIMING and bool(_DUMP_PATH)
+
+
+# 9b step-1 hidden-state capture ([P] 2026-08-03, default-off): with
+# VLLM_MOE_W2_GATE_HCAP_DIR set (and DUMP on), the runner snapshots the
+# EXL3 forward's per-layer h_l buffer at DECISION time on every dumped
+# (fired/audited) step and hands it here; shards of {steps, h} tensors
+# flush to the dir every _HCAP_FLUSH records. Offline consumers join on
+# the dump JSONL's `step` field. Telemetry-only, never in formal runs.
+_HCAP_DIR = os.getenv("VLLM_MOE_W2_GATE_HCAP_DIR", "")
+_HCAP_FLUSH = int(os.getenv("VLLM_MOE_W2_GATE_HCAP_FLUSH", "256"))
+_hcap_steps: list[int] = []
+_hcap_tensors: list[torch.Tensor] = []
+_hcap_shard = 0
+
+
+def hcap_enabled() -> bool:
+    return bool(_HCAP_DIR) and bool(_DUMP_PATH)
+
+
+def hcap_store(step: int, h: torch.Tensor) -> None:
+    """Queue one decision-time h snapshot ([n_layers, H] half, GPU);
+    moved to CPU here (fired steps only — measurement mode)."""
+    global _hcap_shard
+    try:
+        _hcap_steps.append(int(step))
+        _hcap_tensors.append(h.to("cpu", non_blocking=False))
+        if len(_hcap_steps) >= _HCAP_FLUSH:
+            os.makedirs(_HCAP_DIR, exist_ok=True)
+            path = os.path.join(_HCAP_DIR, f"hcap-{_hcap_shard:05d}.pt")
+            torch.save(dict(steps=list(_hcap_steps),
+                            h=torch.stack(_hcap_tensors)), path)
+            _hcap_shard += 1
+            _hcap_steps.clear()
+            _hcap_tensors.clear()
+    except Exception:  # noqa: BLE001 - observability must not break serving
+        pass
+
+
+def hcap_flush() -> None:
+    """Final partial-shard flush (shutdown/atexit path)."""
+    global _hcap_shard
+    if _HCAP_DIR and _hcap_steps:
+        try:
+            os.makedirs(_HCAP_DIR, exist_ok=True)
+            path = os.path.join(_HCAP_DIR, f"hcap-{_hcap_shard:05d}.pt")
+            torch.save(dict(steps=list(_hcap_steps),
+                            h=torch.stack(_hcap_tensors)), path)
+            _hcap_shard += 1
+            _hcap_steps.clear()
+            _hcap_tensors.clear()
+        except Exception:  # noqa: BLE001
+            pass
 
 # observability (cheap; only mutated when the gate is enabled)
 _n_steps = 0
 _n_fired = 0
 _n_reforwarded = 0
 _n_promoted = 0
+_n_audit = 0
+# last-decision snapshot for dump_step (single-threaded step execution:
+# should_reforward -> [replay loop] -> dump_step, no interleaving)
+_last_worst = float("nan")
+_last_audit = False
+_last_spec = False
+_last_rows: torch.Tensor | None = None
 
 
 def shutdown() -> None:
     """Reset mutable gate state between in-process engines."""
     global _ENABLED, _tau_dyn, _tau_mtime, _mp_dyn, _mp_mtime
     global _n_steps, _n_fired, _n_reforwarded, _n_promoted
+    global _n_audit, _last_worst, _last_audit, _last_spec, _last_rows
+    hcap_flush()
     _ENABLED = os.getenv("VLLM_MOE_W2_GATE", "0") == "1"
     _tau_dyn = _TAU
     _tau_mtime = -1.0
@@ -140,6 +250,11 @@ def shutdown() -> None:
     _n_fired = 0
     _n_reforwarded = 0
     _n_promoted = 0
+    _n_audit = 0
+    _last_worst = float("nan")
+    _last_audit = False
+    _last_spec = False
+    _last_rows = None
 
 
 def enabled() -> bool:
@@ -242,7 +357,8 @@ def should_reforward(logits: torch.Tensor, spec=None) -> bool:
     softmax: margin = top1_logit - top2_logit == log p1 - log p2 (the softmax
     normaliser cancels), and max_prob = exp(top1_logit - logsumexp(logits)).
     """
-    global _n_steps, _n_fired
+    global _n_steps, _n_fired, _n_audit
+    global _last_worst, _last_audit, _last_spec, _last_rows
     _n_steps += 1
     if logits is None or logits.numel() == 0:
         return False
@@ -263,13 +379,41 @@ def should_reforward(logits: torch.Tensor, spec=None) -> bool:
         # all-masked batch (cannot happen: row 0 of each request is always
         # reachable) would fall through to no-fire, which is safe.
         rows = torch.where(mask, rows, torch.full_like(rows, float("inf")))
-    worst = rows.min()
-    fire = bool((worst <= tau).item())
+    if _AGG_Q > 0.0 and rows.numel() > 1:
+        # quantile aggregation for C>1: the decision statistic is the
+        # q-quantile of finite row signals (masked +inf rows excluded by
+        # clamping the quantile index into the finite prefix after sort).
+        srt = rows.sort().values
+        n_fin = torch.isfinite(srt).sum()
+        qi = (n_fin.float() * _AGG_Q).long().clamp(min=0,
+                                                   max=rows.numel() - 1)
+        worst = srt[qi]
+    else:
+        worst = rows.min()
+    # single GPU->CPU sync, same count as the old `(worst <= tau).item()`
+    # (and one FEWER when TRACE is on, which used to float(worst) again)
+    worst_f = float(worst.item())
+    fire = worst_f <= tau
+    audit = False
+    if not fire and _AUDIT_P > 0.0 and random.random() < _AUDIT_P:
+        # P9 audit: force the fire path on a confident step to obtain an
+        # unbiased live label for P(flip | signal > tau). Replay logits
+        # are consumed as usual (strictly-better re-decision).
+        fire = True
+        audit = True
+    _last_worst = worst_f
+    _last_audit = audit
+    _last_spec = spec is not None
+    _last_rows = rows.detach() if _DUMP_PATH else None
     if fire:
-        _n_fired += 1
+        if audit:
+            _n_audit += 1
+        else:
+            _n_fired += 1
         if _TRACE:
-            logger.info("[gate] fire: %s worst=%.3f <= tau=%.3f (step %d)",
-                        _SIGNAL, float(worst), tau, _n_steps)
+            logger.info("[gate] %s: %s worst=%.3f %s tau=%.3f (step %d)",
+                        "audit" if audit else "fire", _SIGNAL, worst_f,
+                        "> " if audit else "<=", tau, _n_steps)
     return fire
 
 
@@ -336,7 +480,41 @@ def force_promote_step(layers=None, max_promote="default") -> int:
     return n
 
 
+def dump_enabled() -> bool:
+    return bool(_DUMP_PATH)
+
+
+def dump_step(pre_top1: torch.Tensor, post_top1: torch.Tensor,
+              n_promoted: int, n_replays: int, timing=None) -> None:
+    """Append one JSONL record for a fired/audited step (see header).
+    Measurement-only path: never raises into serving. `pre_top1` /
+    `post_top1` are per-row argmax of the logits before the first and
+    after the last replay; equal tensors (n_replays==0) are still dumped
+    (fires that could not promote are informative). `timing` (P11): the
+    runner's per-iteration stall breakdown, attached verbatim."""
+    if not _DUMP_PATH:
+        return
+    try:
+        pre = pre_top1.tolist()
+        post = post_top1.tolist()
+        rows = _last_rows.tolist() if _last_rows is not None else []
+        rec = dict(
+            t=round(time.time(), 3), step=_n_steps, signal=_SIGNAL,
+            tau=_current_tau(), worst=_last_worst, audit=_last_audit,
+            spec=_last_spec, n_promoted=int(n_promoted),
+            n_replays=int(n_replays), pre=pre, post=post,
+            flips=sum(1 for a, b in zip(pre, post) if a != b),
+            rows=[round(float(v), 6) for v in rows])
+        if timing is not None:
+            rec["timing"] = timing
+        with open(_DUMP_PATH, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:  # noqa: BLE001 - observability must not break serving
+        pass
+
+
 def stats() -> dict:
     return dict(steps=_n_steps, fired=_n_fired, reforwarded=_n_reforwarded,
-                promoted=_n_promoted, signal=_SIGNAL, tau=_TAU,
+                promoted=_n_promoted, audited=_n_audit, signal=_SIGNAL,
+                tau=_TAU, audit_p=_AUDIT_P,
                 fire_rate=(_n_fired / _n_steps if _n_steps else 0.0))

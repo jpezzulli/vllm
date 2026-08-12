@@ -418,13 +418,13 @@ def test_w2_config_contract_v2_runner_resident_subset(monkeypatch):
             moe_w2_cubit._layer_contract(_contract_layer())
     monkeypatch.setattr(moe_w2_delta, "base_enabled", lambda: False)
 
-    # confidence gate needs the re-forward hooks: refused
+    # confidence gate is V2-integrated (runner _moe_w2_gate_reforward):
+    # accepted on the single-pipeline path
     monkeypatch.setattr(moe_w2_gate, "_ENABLED", True)
     with mock.patch(
             "vllm.config.get_current_vllm_config",
             return_value=_v2_contract_config()):
-        with pytest.raises(ValueError, match="confidence gate"):
-            moe_w2_cubit._layer_contract(_contract_layer())
+        moe_w2_cubit._layer_contract(_contract_layer())
     monkeypatch.setattr(moe_w2_gate, "_ENABLED", False)
 
     # pipeline parallelism: refused
