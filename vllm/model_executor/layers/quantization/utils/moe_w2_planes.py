@@ -402,3 +402,54 @@ def reference_dequant(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor
     vals = levels[codes.long()]
     s = torch.exp2(scales.float() - 127.0).repeat_interleave(32, dim=-1)
     return vals * s
+
+
+# --- inverse packers: fragment-major FP4 plane / scale plane -> row-major ----
+# Exact inverses of pack_fp4_fragment_major and pack_scales, used by the
+# EXL3 v2 need-pool apply (moe_w2_cubit._exl3_fp4_apply) to reconstruct an
+# FP4 expert's weights from a pinned/pool slot in torch — the eager,
+# correctness-first path (no moe_w4_mm cubin, which is fused into the 2-bit
+# base desc machinery a resident EXL3 base does not build). Round-tripped
+# against the forward packers in tools/test_moe_w2_exl3.py.
+def unpack_fp4_fragment_major(plane: torch.Tensor, N: int, K: int) -> torch.Tensor:
+    """Inverse of pack_fp4_fragment_major: [N*K/2] u8 -> [N, K] u8 e2m1
+    nibbles (0..15). The plane byte stream is [nb, kb, g, t, tile, k32,
+    half, jhalf] with each byte packing two adjacent j (low=even, high=odd);
+    the forward view/permute is codes.view(N//16,2,8,K//64,2,2,4,4)
+    .permute(0,3,2,6,1,4,5,7) over [nb,tile,g,kb,k32,half,t,j]."""
+    assert N % 16 == 0 and K % 64 == 0
+    b = plane.reshape(N // 16, K // 64, 8, 4, 2, 2, 2, 2)  # ..half, jhalf
+    nib = torch.stack((b & 0xF, b >> 4), dim=-1)           # ..jhalf, pair(2)
+    # [nb, kb, g, t, tile, k32, half, j]
+    nib = nib.reshape(N // 16, K // 64, 8, 4, 2, 2, 2, 4)
+    # inverse of permute(0,3,2,6,1,4,5,7) is permute(0,4,2,1,5,6,3,7)
+    nib = nib.permute(0, 4, 2, 1, 5, 6, 3, 7).contiguous()  # [nb,tile,g,kb,k32,half,t,j]
+    return nib.reshape(N, K).to(torch.uint8)
+
+
+def unpack_scales(sc: torch.Tensor, N: int, K: int) -> torch.Tensor:
+    """Inverse of pack_scales: [N*K/32] u8 -> [N, K/32] u8 e8m0."""
+    assert N % 16 == 0
+    KS = K // 32
+    s = sc.reshape(N // 16, KS, 16).transpose(1, 2).contiguous()  # [nb, 16, KS]
+    return s.reshape(N, KS).to(torch.uint8)
+
+
+_E2M1_VALS_F32 = _E2M1_VALS.float()
+
+
+def dequant_fp4_expert(codes_plane: torch.Tensor, sc_plane: torch.Tensor,
+                       N: int, K: int) -> torch.Tensor:
+    """Fragment-major FP4 plane + scale plane for one [N, K] matrix ->
+    row-major f32 weights. True weight = e2m1(nibble) * 2^(e8m0-127) per
+    block-32 (matches nvfp4_to_codes_scales / the moe_w4_mm decode).
+
+    f32 throughout (the e2m1 grid and power-of-two scales are exact in f32),
+    and the block-32 scale is broadcast via a [N, K/32, 32] view instead of
+    repeat_interleave — no [N, K] scale temporary. Peak = 2x the [N, K] f32
+    output, which the caller (moe_w2_cubit._exl3_fp4_apply) frees per expert."""
+    nib = unpack_fp4_fragment_major(codes_plane, N, K).long()
+    vals = _E2M1_VALS_F32.to(codes_plane.device)[nib]                  # [N,K] f32
+    sc = unpack_scales(sc_plane, N, K)                                 # [N,K/32] u8
+    scale = torch.exp2(sc.float() - 127.0)                            # [N,K/32] f32
+    return (vals.view(N, K // 32, 32) * scale.unsqueeze(-1)).view(N, K)

@@ -86,6 +86,17 @@ _TRACE = int(os.getenv("VLLM_MOE_W2_DELTA_TRACE", "0"))
 _TRACE_EVERY = max(int(os.getenv("VLLM_MOE_W2_DELTA_TRACE_EVERY", "64")), 1)
 _DUMP_PATH = os.getenv("VLLM_MOE_W2_DELTA_DUMP", "")
 
+# P11 fire-stall decomposition (2026-08-01, measurement-only, default-off):
+# with VLLM_MOE_W2_GATE_FIRE_TIMING=1 each force_promote call records its
+# wall-clock phase breakdown here (ms): snap (seen snapshot incl. the
+# wait-for-forward cross-stream sync), select (candidate ranking + slot
+# taking), read (host-store row staging), h2d (pool copies + the single
+# event sync), map (slot-table writes). The gate's dump_step attaches the
+# runner-assembled record to the fired step's JSONL row. Each call rebinds
+# a fresh dict, so a consumer holding the previous reference is safe.
+_FIRE_TIMING = os.getenv("VLLM_MOE_W2_GATE_FIRE_TIMING", "0") == "1"
+LAST_FORCE_TIMING: dict | None = None
+
 # Routing-trace capture for offline policy study (gated, off by default): record
 # each tick's seen (layer,expert) frame and periodically write a .npy of
 # [frame, layer, expert] rows. Replay it through candidate promote/evict
@@ -242,6 +253,13 @@ class DeltaTier:
                                      dtype=torch.int32, device=dev)
         self._mirror = torch.full((n_layers, n_experts), -1,
                                   dtype=torch.int32)
+        # Post-mutation hooks: called (host-side, eager) after any batch of
+        # slot_table writes commits or rolls back, so consumers keeping
+        # derived views of the mapping (the EXL3 decode-wave ptab stack)
+        # refresh at MUTATION time instead of every step. All mutation flows
+        # run in eager host code (gate promote loop, prefill ensure,
+        # prefetch, manager tick) — never inside a capture/replay.
+        self.mutate_hooks: list = []
         # slot -> (layer, expert, last_seen_tick) as three flat CPU tensors;
         # layer -1 = free. Tensor form keeps the eviction/refresh paths fully
         # vectorized: the old list-of-tuples cost three O(n_slots) python
@@ -266,6 +284,18 @@ class DeltaTier:
         self._accum_reset = False
         self._seen_host = torch.zeros_like(self.seen, device="cpu",
                                            pin_memory=True)
+        # P10 (VLLM_MOE_W2_DELTA_RANK=step_w): per-(layer,expert) max routing
+        # weight of the current seen window, scattered in-graph next to
+        # `seen` (amax reduce, fixed shapes). Read only by force_promote's
+        # candidate ranking on CAP-BOUND fires — measured motivation: 62.5%
+        # of natural fires hit the 64 cap and flip at 21.7% (vs 13.8%
+        # uncapped), so WHICH experts enter the cap matters. Allocated
+        # unconditionally (2x n_layers*n_experts fp32 = trivial); written
+        # only when the mode is armed.
+        self.seen_w = torch.zeros(n_layers, n_experts, dtype=torch.float32,
+                                  device=dev)
+        self._seen_w_host = torch.zeros_like(self.seen_w, device="cpu",
+                                             pin_memory=True)
         # Host store behind a backend interface: classic pinned/pageable
         # tensors (default), or an on-disk pack file with the kernel page
         # cache as the RAM tier (VLLM_MOE_W2_STORE_DIR) — see moe_w2_store.
@@ -995,6 +1025,7 @@ class DeltaTier:
                     # pairing ends the whole take (later pairs only worse).
                     if len(out) >= len(admission_keys) or \
                             not (admission_keys[len(out)] > vk):
+                        self._fire_mutate_hooks()
                         return out
                 vli = int(self._owner_li[s])
                 vei = int(self._owner_ei[s])
@@ -1009,12 +1040,22 @@ class DeltaTier:
                         self._tick - int(self._owner_tick[s]))
                 taken.add(s)
                 out.append(s)
+        self._fire_mutate_hooks()
         return out
 
     def _take_slot(self, seen_set=None):
         """Single-slot wrapper (kept for the unit tests / external callers)."""
         slots = self._take_slots_batch(1)
         return slots[0] if slots else None
+
+    def _fire_mutate_hooks(self) -> None:
+        """Notify derived-view consumers after slot_table writes. Idempotent
+        and cheap (the EXL3 ptab refresh is ~14 small kernels vectorized over
+        layers); fired from every mutation flow INCLUDING eviction-only and
+        rollback paths, so a consumer can never observe a stale mapping via
+        a later graph replay."""
+        for hook in self.mutate_hooks:
+            hook()
 
     def _promote(self, li, ei, slot):
         try:
@@ -1043,6 +1084,7 @@ class DeltaTier:
             self._owner_tick[slot] = 0
             if slot not in self._free:
                 self._free.append(slot)
+            self._fire_mutate_hooks()
             raise
         self._mirror[li, ei] = slot
         self._own(slot, li, ei)
@@ -1051,6 +1093,7 @@ class DeltaTier:
         if _TRACE >= 2:
             logger.info("[%s] promote L%-2d E%-3d  slot %-4d (tick %d)",
                         self._tag, li, ei, slot, self._tick)
+        self._fire_mutate_hooks()
 
     def _promote_batch(self, candidates) -> int:
         """Manager safe-point promotion with one store batch and one sync."""
@@ -1083,6 +1126,7 @@ class DeltaTier:
                 self._owner_tick[slot] = 0
                 if slot not in self._free:
                     self._free.append(slot)
+            self._fire_mutate_hooks()
             raise
         for (li, ei), slot in plan:
             self._mirror[li, ei] = slot
@@ -1093,6 +1137,7 @@ class DeltaTier:
                 logger.info(
                     "[%s] promote L%-2d E%-3d  slot %-4d (tick %d)",
                     self._tag, li, ei, slot, self._tick)
+        self._fire_mutate_hooks()
         return len(plan)
 
     # ---- confidence-gated re-forward (directive 2 / Step B) --------------
@@ -1283,6 +1328,7 @@ class DeltaTier:
             self._n_promoted += len(plan)
             self._win_promoted += len(plan)
             self._kpi_prefetched += len(plan)
+        self._fire_mutate_hooks()
         return len(plan)
 
     def force_promote(self, layers=None, max_promote=None,
@@ -1319,6 +1365,19 @@ class DeltaTier:
         Returns:
             number of experts newly promoted to FP4.
         """
+        _ft = None
+        if _FIRE_TIMING:
+            global LAST_FORCE_TIMING
+            _ft = {"snap": 0.0, "select": 0.0, "read": 0.0, "h2d": 0.0,
+                   "map": 0.0, "n": 0, "cand": 0}
+            LAST_FORCE_TIMING = _ft
+            _ft_t = time.perf_counter()
+
+            def _ft_mark(key: str) -> None:
+                nonlocal _ft_t
+                now = time.perf_counter()
+                _ft[key] = round((now - _ft_t) * 1e3, 3)
+                _ft_t = now
         if len(self._store) == 0:
             return 0
         # snapshot the forward's routed-expert scatter. The side stream must
@@ -1330,10 +1389,14 @@ class DeltaTier:
             with torch.cuda.stream(self._stream):
                 self._stream.wait_stream(main)
                 self._seen_host.copy_(self.seen, non_blocking=True)
+                if STEP_W:
+                    self._seen_w_host.copy_(self.seen_w, non_blocking=True)
                 ev = torch.cuda.Event()
                 ev.record(self._stream)
             ev.synchronize()
             seen = self._seen_host.nonzero()
+        if _ft is not None:
+            _ft_mark("snap")
         if seen.numel() == 0:
             return 0
         # Bound the working set to RECENT steps: `seen` otherwise accumulates
@@ -1344,6 +1407,10 @@ class DeltaTier:
         # H2D). Zeroing after the snapshot is the manager's own idiom; a flag
         # lost to the in-flight scatter race only delays a lazy promotion.
         self.seen.zero_()
+        if STEP_W:
+            # same window discipline as `seen`: the weights belong to the
+            # snapshot just taken; amax would otherwise blend windows.
+            self.seen_w.zero_()
         layer_filter = set(layers) if layers is not None else None
         with self._lock:
             li_idx, ei_idx = seen[:, 0], seen[:, 1]
@@ -1378,11 +1445,20 @@ class DeltaTier:
                 return 0
             # capped promote prioritizes the most-NEEDED experts under the gate-driven
             # policy (repeat offenders first); hottest-first otherwise.
+            # P10 (step_w): THIS window's max routing weight primary, the
+            # policy rank only as tie-break — under a binding cap the fired
+            # token's heaviest experts enter first.
             if len(cand) > 1:
                 ca = torch.tensor(cand)
                 rank = self._need if self._policy == "need" else self._freq
-                order = torch.argsort(rank[ca[:, 0], ca[:, 1]], descending=True)
+                key = rank[ca[:, 0], ca[:, 1]].double()
+                if STEP_W:
+                    key = (self._seen_w_host[ca[:, 0], ca[:, 1]].double()
+                           + 1e-9 * key)
+                order = torch.argsort(key, descending=True)
                 cand = [cand[i] for i in order.tolist()]
+            if _ft is not None:
+                _ft["cand"] = len(cand)
             if max_promote is not None:
                 cand = cand[:max_promote]
             # take ALL slots in one vectorized batch (evictions unmap on the
@@ -1413,10 +1489,14 @@ class DeltaTier:
             plan = [((li, ei), slot) for (li, ei), slot in zip(cand, slots)]
             if not plan:
                 return 0
+            if _ft is not None:
+                _ft_mark("select")
             # one batched host read (pack-file store: mmap -> pinned stage;
             # pinned store: zero-copy views), THEN the H2D copies — all stage
             # rows stay valid until the single sync below.
             rows = self._store.rows_for([p for p, _ in plan])
+            if _ft is not None:
+                _ft_mark("read")
             for ((li, ei), slot), row in zip(plan, rows):
                 self._own(slot, li, ei)
                 if pin:
@@ -1427,12 +1507,17 @@ class DeltaTier:
                 ev = torch.cuda.Event()
                 ev.record(self._stream)
             ev.synchronize()
+            if _ft is not None:
+                _ft_mark("h2d")
             for (li, ei), slot in plan:
                 self.slot_table[li, ei] = slot
                 self._mirror[li, ei] = slot
                 self._freq[li, ei] += 1.0
             self._n_promoted += len(plan)
             self._win_promoted += len(plan)
+            if _ft is not None:
+                _ft_mark("map")
+                _ft["n"] = len(plan)
         if len(plan) < len(cand):
             if self._policy == "need":
                 # Opportunistic tier: the shortfall is admission control
@@ -1470,6 +1555,7 @@ class DeltaTier:
         if _TRACE >= 2:
             logger.info("[%s] force-promote %d experts (gate)",
                         self._tag, len(plan))
+        self._fire_mutate_hooks()
         return len(plan)
 
     def ensure_resident(self, layer_key: int, ids: torch.Tensor) -> int:
@@ -1573,6 +1659,7 @@ class DeltaTier:
                     "moe_w2 [%s] prefill ensure deferred %d of %d "
                     "candidates (hot half protected)",
                     self._tag, len(cand) - len(plan), len(cand))
+        self._fire_mutate_hooks()
         return len(plan)
 
     def mark_need_only(self, layers=None) -> int:
@@ -1878,6 +1965,25 @@ def mark_seen(seen_row, ids):
         seen_row.index_add_(0, ids, torch.ones_like(ids, dtype=seen_row.dtype))
     else:
         seen_row.index_fill_(0, ids, 1)
+
+
+# P10: promotion ranking mode. "step_w" (default since the [O] 07-31
+# Faza-1 paired campaign: GPQA r1 == anchor 142/198 exact, p=1, flips
+# 9/9; GSM8K 194/200; self-flip band unchanged; A/B telemetry showed
+# capped-fire precision +1.4pp and fires −12.8%) = THIS window's max
+# routing weight primary, need as tie-break — cap-bound fires promote
+# the experts that carry the most weight for the very token that fired.
+# "need" = the pre-07-31 decayed-recidivism-only ranking (A/B fallback).
+# Constant for the process (read at import; the forward's scatter is
+# compiled/captured against it).
+_RANK_MODE = os.getenv("VLLM_MOE_W2_DELTA_RANK", "step_w")
+STEP_W = _RANK_MODE == "step_w"
+
+
+def mark_seen_w(w_row, ids, weights):
+    """Scatter the window's max routing weight per expert (P10, step_w mode).
+    In-place amax on a persistent buffer, fixed shapes — capture-safe."""
+    w_row.scatter_reduce_(0, ids, weights, reduce="amax", include_self=True)
 
 
 _TIER: DeltaTier | None = None
@@ -2338,7 +2444,19 @@ def get_tier(n_layers=None, n_experts=256, dev=None,
         # pool would duplicate the base tier's hot set at 2x the read bytes.
         # An explicit VLLM_MOE_W2_DELTA_POLICY still wins.
         policy = None
-        if base_enabled():
+        _exl3_base = False
+        try:
+            from vllm.model_executor.layers.quantization.utils import (
+                moe_w2_cubit as _mc)
+            _exl3_base = bool(_mc._EXL3_BASE)
+        except Exception:  # noqa: BLE001 - offline tools without the cubit env
+            _exl3_base = False
+        if base_enabled() or _exl3_base:
+            # EXL3 v2: the resident EXL3 trellis base has NO 2-bit base cache
+            # (base_enabled() is False), but the FP4 need-pool over it is the
+            # same gate-driven QUALITY tier — default to "need" so the
+            # background freq manager never fills it (only the confidence
+            # gate's force_promote does). An explicit env still wins.
             policy = os.getenv("VLLM_MOE_W2_DELTA_POLICY", "need")
         # Split quintal slots have a DIFFERENT geometry than full-FP4
         # slots; a distinct pack tag ("fp4q"; the superseded 2-bit

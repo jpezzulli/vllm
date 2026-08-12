@@ -4866,6 +4866,25 @@ class GPUModelRunner(
                             f": {decision_error}" if decision_error else "")
                         fire = False
                     fire = _or_tp(fire)
+                    # P9 dump (VLLM_MOE_W2_GATE_DUMP): snapshot the pre-replay
+                    # per-row argmax so the post-loop comparison yields flip
+                    # labels. GPU-side argmax here; the sync happens once in
+                    # dump_step. Disabled => zero extra work.
+                    _dump_pre = None
+                    _gate_promoted_total = 0
+                    if fire and moe_w2_gate.dump_enabled():
+                        _dump_pre = logits.argmax(dim=-1)
+                        if moe_w2_gate.hcap_enabled():
+                            # 9b: decision-time h_l snapshot (pre-FP-loop —
+                            # replays must not overwrite the signal the
+                            # gate saw). Keyed by the gate step counter,
+                            # matching the dump row written below.
+                            from vllm.model_executor.layers.quantization \
+                                .utils import moe_w2_cubit
+                            _h = moe_w2_cubit.hcap_snapshot()
+                            if _h is not None:
+                                moe_w2_gate.hcap_store(
+                                    moe_w2_gate.stats()["steps"], _h)
                     if fire:
                         # FIXED-POINT fire (2026-07-13): a single replay is
                         # only FIRST-order — upgraded early layers re-route
@@ -4894,6 +4913,13 @@ class GPUModelRunner(
                                 group=_tp.device_group)
                             return local, int(t.item())
 
+                        # P11 fire-stall decomposition (measurement mode,
+                        # VLLM_MOE_W2_GATE_FIRE_TIMING=1 + DUMP): host wall
+                        # clock per promote->replay iteration, explicit syncs
+                        # at the phase boundaries. TP/single-GPU inline path
+                        # only (the PP worker-driven replay is out of scope).
+                        _fire_timing = moe_w2_gate.fire_timing_enabled()
+                        _fire_t = [] if _fire_timing else None
                         while _gate_iters < moe_w2_gate.fire_fp_max():
                             # Promote this rank's COLD routed experts
                             # (per-rank shard side effect, never a per-rank
@@ -4904,6 +4930,13 @@ class GPUModelRunner(
                             # 64+64+48 promotions in ONE step = the whole
                             # pool cycled per fire, [pinned 204, free 0]
                             # refusals, 12% pool hit-rate = pure churn).
+                            if _fire_timing:
+                                # Drain queued work (the decision sync already
+                                # emptied the stream; this catches the dump
+                                # argmax) so promote/replay attribute cleanly.
+                                moe_w2_delta.LAST_FORCE_TIMING = None
+                                torch.cuda.synchronize()
+                                _ft_t0 = time.perf_counter()
                             promote_error = None
                             try:
                                 n_promoted = moe_w2_gate.force_promote_step(
@@ -4911,6 +4944,9 @@ class GPUModelRunner(
                             except BaseException as e:
                                 promote_error = e
                                 n_promoted = 0
+                            if _fire_timing:
+                                _ft_prom_ms = (time.perf_counter()
+                                               - _ft_t0) * 1e3
                             if not _and_tp(promote_error is None):
                                 logger.error(
                                     "moe_w2 TP gate promotion failed on at "
@@ -4922,6 +4958,7 @@ class GPUModelRunner(
                             if _step_budget is not None:
                                 _step_budget = max(
                                     _step_budget - n_promoted, 0)
+                            _gate_promoted_total += n_promoted
                             # Replay only if SOME rank upgraded a cold
                             # expert -> the result can actually change; if
                             # everything routed was already FP4 the replay
@@ -4931,6 +4968,13 @@ class GPUModelRunner(
                             # replays cannot change the result either.
                             if not (_or_tp(n_promoted > 0)
                                     and moe_w2_gate.reforward_enabled()):
+                                if _fire_timing:
+                                    # terminal pass: promote cost paid, no
+                                    # replay follows (n==0 or budget spent)
+                                    _fire_t.append(dict(
+                                        promote_ms=round(_ft_prom_ms, 3),
+                                        n=int(n_promoted), replay_ms=0.0,
+                                        delta=moe_w2_delta.LAST_FORCE_TIMING))
                                 break
                             _gate_iters += 1
                             gate_collective_active = True
@@ -5035,6 +5079,23 @@ class GPUModelRunner(
                                 moe_w2_delta.gate_validate_base_clean(
                                     _gate_miss)
                             gate_collective_active = False
+                            if _fire_timing:
+                                torch.cuda.synchronize()
+                                _fire_t.append(dict(
+                                    promote_ms=round(_ft_prom_ms, 3),
+                                    n=int(n_promoted),
+                                    replay_ms=round(
+                                        (time.perf_counter() - _ft_t0) * 1e3
+                                        - _ft_prom_ms, 3),
+                                    delta=moe_w2_delta.LAST_FORCE_TIMING))
+                        if _dump_pre is not None:
+                            # post-loop logits are the final (possibly
+                            # re-decided) step logits; equal pre/post is a
+                            # no-flip label, not skipped.
+                            moe_w2_gate.dump_step(
+                                _dump_pre, logits.argmax(dim=-1),
+                                _gate_promoted_total, _gate_iters,
+                                timing=_fire_t)
             except Exception as e:
                 if gate_collective_active:
                     logger.exception(
