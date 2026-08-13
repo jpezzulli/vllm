@@ -47,6 +47,26 @@ logger = init_logger(__name__)
 _GB_RAW = os.getenv("VLLM_MOE_W2_DELTA_GB", "2.0").strip().lower()
 _AUTO = _GB_RAW in ("auto", "-1", "-1.0")
 _GB = 0.0 if _AUTO else float(_GB_RAW)
+# Optional layer-level exclusion for mixed target/draft stacks. Excluded
+# layers retain their W2 base path but never stage into or dispatch through
+# the shared FP4 correction tier.
+_EXCLUDE_LAYERS_RAW = os.getenv(
+    "VLLM_MOE_W2_DELTA_EXCLUDE_LAYERS", "").strip()
+try:
+    _EXCLUDE_LAYERS = frozenset(
+        int(item.strip())
+        for item in _EXCLUDE_LAYERS_RAW.split(",")
+        if item.strip()
+    )
+except ValueError as exc:
+    raise ValueError(
+        "VLLM_MOE_W2_DELTA_EXCLUDE_LAYERS must be a comma-separated "
+        "list of non-negative integers"
+    ) from exc
+if any(layer < 0 for layer in _EXCLUDE_LAYERS):
+    raise ValueError(
+        "VLLM_MOE_W2_DELTA_EXCLUDE_LAYERS cannot contain negative layers"
+    )
 # Auto-mode knobs: VRAM to leave free for capture/workspaces, and an optional
 # cap on the auto-sized pool (0 = uncapped).
 _RESERVE_GB = float(os.getenv("VLLM_MOE_W2_DELTA_RESERVE_GB", "3.0"))
@@ -2201,6 +2221,11 @@ def enabled() -> bool:
         # after-KV sizing belongs to the base pool math, not this tier).
         return _GB_EXPLICIT and _GB > 0
     return _GB > 0 or _AUTO
+
+
+def layer_enabled(layer_key: int) -> bool:
+    """Whether ``layer_key`` may use the shared FP4 correction tier."""
+    return enabled() and layer_key not in _EXCLUDE_LAYERS
 
 
 def base_enabled() -> bool:

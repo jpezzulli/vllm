@@ -123,6 +123,32 @@ def test_planes_cache_shutdown_clears_checkpoint_identity(monkeypatch):
     assert moe_w2_planes_cache._ckpt_id() == "checkpoint-b"
 
 
+def test_delta_layer_exclusions_gate_shared_fp4_tier(monkeypatch):
+    sentinel = object()
+    get_tier = mock.Mock(return_value=sentinel)
+    monkeypatch.setattr(moe_w2_delta, "_EXCLUDE_LAYERS", frozenset({43, 44, 45}))
+    monkeypatch.setattr(moe_w2_delta, "enabled", lambda: True)
+    monkeypatch.setattr(moe_w2_delta, "base_enabled", lambda: False)
+    monkeypatch.setattr(moe_w2_delta, "split_enabled", lambda: False)
+    monkeypatch.setattr(moe_w2_delta, "get_tier", get_tier)
+
+    assert moe_w2_delta.layer_enabled(42)
+    assert not moe_w2_delta.layer_enabled(43)
+    assert moe_w2_cubit._fp4_tier_for_build(43, 256, "cuda", 64, 32) is None
+    get_tier.assert_not_called()
+
+    assert (
+        moe_w2_cubit._fp4_tier_for_build(42, 256, "cuda", 64, 32)
+        is sentinel
+    )
+    get_tier.assert_called_once_with(
+        n_experts=256,
+        dev="cuda",
+        w13_bytes=32,
+        w2_bytes=16,
+    )
+
+
 def test_invalid_zero_mode_fails_at_startup(pack_env, monkeypatch):
     monkeypatch.setenv("VLLM_MOE_W2_ZERO_MODE", "typo")
     with pytest.raises(ValueError, match="ZERO_MODE"):
