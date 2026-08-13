@@ -585,7 +585,9 @@ def _require_kernels(K13: int, K2: int, need_w4: bool) -> None:
             f"{missing} (dir {_DIR}; set VLLM_MOE_W2_CUBIT_DIR)")
 
 
-def _fp4_tier_for_build(E: int, dev, n13k13: int, n2k2: int):
+def _fp4_tier_for_build(
+    layer_key: int, E: int, dev, n13k13: int, n2k2: int
+):
     """FP4 delta tier sized for this model's PER-RANK shapes (n13k13 =
     N13*K13, n2k2 = N2*K2 elements). Over the base cache the FP4 slots must
     carry their OWN block-32 scale sections ([fp4_13|sc13|fp4_2|sc2]) — the
@@ -596,6 +598,8 @@ def _fp4_tier_for_build(E: int, dev, n13k13: int, n2k2: int):
     over the base cache — the quintal kernel reads class/sign/scales from
     the base slot the refinement is residency-coupled to."""
     from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+    if not moe_w2_delta.layer_enabled(layer_key):
+        return None
     split = moe_w2_delta.split_enabled()
     sc13, sc2 = ((n13k13 // 32, n2k2 // 32)
                  if moe_w2_delta.base_enabled() and not split else (0, 0))
@@ -885,7 +889,7 @@ def plan_pack_skip(layer, *, allow_direct_delta: bool = False) -> bool:
         direct = (
             allow_direct_delta
             and os.getenv("VLLM_MOE_W2_FAST_LOAD", "0") == "1"
-            and moe_w2_delta.enabled()
+            and moe_w2_delta.layer_enabled(key)
             and not moe_w2_delta.split_enabled()
         )
         if direct:
@@ -912,7 +916,7 @@ def plan_pack_skip(layer, *, allow_direct_delta: bool = False) -> bool:
                     workers, batch_layers)
             _fast_loader.add_layer(key, files, base_sizes)
             layer._moe_w2_direct_cache = True
-        elif moe_w2_delta.enabled():
+        elif moe_w2_delta.layer_enabled(key):
             # Preserve the original serial cache path for configurations that
             # keep FP4 parts alongside the base planes.
             full_sizes = _pc.expected_sizes(
@@ -1099,7 +1103,7 @@ def _try_skip_requant(layer, layer_key: int, E: int, N13: int, K13: int,
         w13_bytes=c13len + s13len, w2_bytes=c2len + s2len)
     if layer_key not in btier._store:
         return False
-    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
+    tier = _fp4_tier_for_build(layer_key, E, dev, N13 * K13, N2 * K2)
     if tier is not None and layer_key not in tier._store:
         return False
     from vllm.model_executor.layers.quantization.utils import (
@@ -1529,7 +1533,7 @@ def build_layer_planes(layer, layer_key: int) -> None:
     # Pass the PER-RANK FP4 plane sizes (N*K//2 bytes/expert) so the delta tier's
     # slots, host store, and pool indexing match the (TP-sharded) planes. On TP1
     # these equal the module constants -> the single-GPU path is unchanged.
-    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
+    tier = _fp4_tier_for_build(layer_key, E, dev, N13 * K13, N2 * K2)
     fp13 = fp2 = None
     if tier is not None:
         # full nibble planes (w4) or quintal planes (w4q, split)
@@ -1639,7 +1643,7 @@ def build_layer_planes_fp8(layer, layer_key: int,
     planes2 = torch.empty(E, N2 * K2 // 4, dtype=torch.uint8, device=dev)
     sc2 = torch.empty(E, N2 * K2 // 32, dtype=torch.uint8, device=dev)
 
-    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
+    tier = _fp4_tier_for_build(layer_key, E, dev, N13 * K13, N2 * K2)
     fp13 = fp2 = None
     if tier is not None:
         # full nibble planes (w4) or quintal planes (w4q, split)
@@ -1698,7 +1702,7 @@ def _consume_planes_cache(layer, layer_key: int, dev,
     lidx = planes_cache.layer_idx_from_name(getattr(layer, "layer_name", ""))
     if not planes_cache.enabled() or lidx is None:
         return False
-    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
+    tier = _fp4_tier_for_build(layer_key, E, dev, N13 * K13, N2 * K2)
     direct = getattr(layer, "_moe_w2_direct_cache", False)
     if direct:
         if _fast_loader is None:
@@ -1845,7 +1849,7 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
     from vllm.model_executor.layers.quantization.utils import (
         moe_w2_planes_cache as planes_cache)
     lidx = planes_cache.layer_idx_from_name(getattr(layer, "layer_name", ""))
-    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
+    tier = _fp4_tier_for_build(layer_key, E, dev, N13 * K13, N2 * K2)
 
     planes13 = torch.empty(E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
     sc13 = torch.empty(E, N13 * K13 // 32, dtype=torch.uint8, device=dev)
@@ -3569,7 +3573,8 @@ def _moe_w2_forward_timed(
         # (delta tier over the base cache, gate-filled) coexists on the
         # decode path: FP4-resident pairs divert to the w4 tier.
         btier = moe_w2_delta._BASE_TIER
-        tier = moe_w2_delta._TIER        # FP4 need-pool (None unless opted in)
+        tier = (moe_w2_delta._TIER
+                if moe_w2_delta.layer_enabled(layer_key) else None)
         use_pf4 = (_PREFILL_FP4 and prefill and tier is not None
                    and tier.n_slots > 0)
         if torch.cuda.is_current_stream_capturing():
@@ -3715,7 +3720,8 @@ def _moe_w2_forward_timed(
         if not use_fp4 and not use_pf4:
             tier = None      # downstream w4 launches key off `tier`
     else:
-        tier = moe_w2_delta._TIER       # peek only; created by the plane builder
+        tier = (moe_w2_delta._TIER
+                if moe_w2_delta.layer_enabled(layer_key) else None)
         # prefill consumes the FP4 tier too (quality lever, see _PREFILL_FP4)
         use_pf4 = (_PREFILL_FP4 and prefill and tier is not None
                    and tier.n_slots > 0)
